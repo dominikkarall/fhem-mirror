@@ -103,14 +103,12 @@ sub new {
 sub startServer() {
     my ($self) = shift;
     $self->{socket} = new IO::Socket (
-        LocalHost => '127.0.0.1',
-        LocalPort => '404040',
-        Proto => 'tcp',
-        Listen => 5,
-        Reuse => 1
+        PeerHost => '127.0.0.1',
+        PeerPort => '404040',
+        Proto => 'tcp'
     );
-    $self->{read_set} = new IO::Select();
-    $self->{read_set}->add($socket);
+    $self->{socket_reader} = new IO::Select();
+    $self->{socket_reader}->add($socket);
 }
 
 sub connect() {
@@ -126,19 +124,11 @@ sub connect() {
         Mojo::IOLoop->one_tick;
         
         #check if there is something to receive
-        my ($rh_set) = IO::Select->select($self->{read_set}, undef, undef, 0);
+        my ($rh_set) = IO::Select->select($self->{socket_reader}, undef, undef, 0);
         foreach my $rh (@$rh_set) {
-            if($rh == $self->{socket}) {
-                $ns = $rh->accept();
-                $self->{read_set}->add($ns);
-            } else {
-                my $buf = <$rh>;
-                if($buf) {
-                    #TODO process $buf
-                } else {
-                    $self->{read_set}->remove($rh);
-                    close($rh);
-                }
+            my $buf = <$rh>;
+            if($buf) {
+                #TODO process $buf (IP update)
             }
         }
     }
@@ -148,6 +138,7 @@ sub send($) {
     my ($self, $msg) = @_;
     $self->{requestId}++;
     $self->{websocketTx}->send($msg);
+    return undef;
 }
 
 sub _callback($$) {
@@ -156,16 +147,17 @@ sub _callback($$) {
     $tx->on(message => sub { $self->_receivedMessage(@_) });
     $tx->on(finish => sub { $self->_connectionClosed(@_) });
     Mojo::IOLoop->recurring(19 => sub { $self->_ping });
+    return undef;
 }
 
 sub _receivedMessage($$) {
     my ($self, $tx, $msg) = @_;
     my $xml = XMLin($msg, KeepRoot => 1, ForceArray => 0, KeyAttr => []);
-    $self->{websocketReceiverQueue}->enqueue($xml);
-    #FIXME send xml using socket
+    #send xml using socket
     $self->{socket}->send($xml);
     shutdown($socket, 1);
     $tx->resume;
+    return undef;
 }
 
 sub _connectionClosed($$$) {
@@ -188,6 +180,14 @@ sub _ping() {
 
 package main;
 
+sub BOSEST_startDiscoveryProcess($) {
+    my ($hash) = @_;
+    
+    if (!defined($hash->{helper}{DISCOVERY_PID})) {
+        $hash->{helper}{DISCOVERY_PID} = BlockingCall("BOSEST_Discovery", $hash->{NAME}."|".$hash, "BOSEST_finishedDiscovery");
+    }
+}
+
 sub BOSEST_Discovery($) {
     my ($string) = @_;
     my ($name, $hash) = split("\\|", $string);
@@ -195,11 +195,9 @@ sub BOSEST_Discovery($) {
     
     my $res = Net::Bonjour->new('soundtouch');
     $res->discover;
-    my @foundDevices = ();
     foreach my $device ($res->entries) {
         my $info = BOSEST_HTTPGET($hash, $device->address, "/info");
         next if (!defined($info->{deviceID}));
-        push(@foundDevices, $info->{deviceID});
             
         #create new device
         if(!defiend($defs{"BOSE_$info->{deviceID}"}) {
@@ -220,6 +218,8 @@ sub BOSEST_finishedDiscovery($) {
     my $name = $commands[0];
     my $hash = $defs{$name};
     my $i = 0;
+    
+    $hash->{helper}{DISCOVERY_PID} = undef;
 
     for($i = 1; $i < @commands; $i = $i+2) {
         my $command = $commands[$i];
@@ -234,6 +234,9 @@ sub BOSEST_finishedDiscovery($) {
             BOSEST_updateIP($hash, $deviceID, $ip);
         }
     }
+    
+    #start discovery again after 60s
+    InternalTimer(gettimeofday()+60, "BOSEST_startDiscoveryProcess", $hash, 1);
 }
 
 sub BOSEST_updateInfo($$) {
@@ -255,6 +258,7 @@ sub BOSEST_parseAndUpdateInfo($$) {
 
 sub BOSEST_updateNowPlaying($$) {
     my ($hash, $deviceID) = @_;
+    #FIXME use BlockingCall for BOSEST_HTTPGET
     my $nowPlaying = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/now_playing");
     BOSEST_parseAndUpdateNowPlaying($hash, $nowPlaying);
     return undef;
@@ -327,10 +331,23 @@ sub BOSEST_updateIP($$$) {
         #get now_playing
         BOSEST_updateNowPlaying($deviceHash, $deviceID);
         #connect websocket
-        if(!defined($deviceHash->{helper}{WEBSOCKET_PID})) {
-            $deviceHash->{helper}{WEBSOCKET_PID} = BlockingCall("BOSEST_WebSocket", "$deviceHash->{NAME}|$deviceID");
+        if(defined($deviceHash->{helper}{WEBSOCKET_PID})) {
+            BlockingKill($deviceHash->{helper}{WEBSOCKET_PID});
+        } else {
+            $deviceHash->{helper}{WEBSOCKET_PID} = BlockingCall("BOSEST_StartWebSocket", "$deviceHash->{NAME}|$deviceID");
         }
     }
+    return undef;
+}
+
+sub BOSEST_StartWebSocket($) {
+    my ($string) = @_;
+    
+    #create websocket object
+    my $websocket = 
+    
+    #connect to IP address
+    
     return undef;
 }
 
@@ -379,14 +396,17 @@ sub BOSEST_Define($$) {
     }
     
     if (int(@a) < 3) {
-        #start discovery thread
-        #wait with InternalTimer and start Discovery after 5s (repeat every 60s)
-        if (!defined($hash->{helper}{DISCOVERY_PID})) {
-            $hash->{helper}{DISCOVERY_PID} = BlockingCall("BOSEST_Discovery", $hash->{NAME}."|".$hash, "BOSEST_finishedDiscovery");
-        }
+        #start discovery process
+        BOSEST_startDiscoveryProcess($hash);
+        #start process which can receive messages and update readings
     }
     
     return undef;
+}
+
+sub BOSEST_startBoseSTServer($) {
+    my ($hash) = @_;
+    
 }
 
 sub BOSEST_Set($@) {
@@ -394,8 +414,6 @@ sub BOSEST_Set($@) {
     my $name = shift(@params);
     my $workType = shift(@params);
 
-    Log3 $hash, 5, "BOSEST: ".$data{WorkType}.", deviceID: ".$data{DeviceID}.", IP: ".ReadingsVal($hash->{NAME}, "IP", "unknown");
-    
     # check parameters for set function
     #DEVELOPNEWFUNCTION-1
     if($workType eq "?") {
@@ -407,29 +425,27 @@ sub BOSEST_Set($@) {
         }
     } elsif($workType eq "volume") {
         return "BOSEST: volume requires volume as additional parameter" if(int(@params) < 1);
-    } elsif($data{WorkType} eq "channel") {
+        #params[0] = volume value
+        BOSEST_setVolume($deviceHash, $params[0]);
+    } elsif($workType eq "channel") {
         return "BOSEST: channel requires preset id as additional parameter" if(int(@params) < 1);
-    } elsif($data{WorkType} eq "play") {
-        #no additional parameters needed
-    } elsif($data{WorkType} eq "stop") {
-        #no additional parameters needed
-    } elsif($data{WorkType} eq "pause") {
-        #no additional parameters needed
-    } elsif($data{WorkType} eq "power") {
-        #no additional parameters needed
-    } elsif($data{WorkType} eq "on") {
-        push(@params, ReadingsVal($hash->{NAME}, "source", "STANDBY"));
-    } elsif($data{WorkType} eq "off") {
-        push(@params, ReadingsVal($hash->{NAME}, "source", "STANDBY"));
+        #params[0] = preset channel
+        BOSEST_setPreset($deviceHash, $params[0]);
+    } elsif($workType eq "play") {
+        BOSEST_play($deviceHash);
+    } elsif($workType eq "stop") {
+        BOSEST_stop($deviceHash);
+    } elsif($workType eq "pause") {
+        BOSEST_pause($deviceHash);
+    } elsif($workType eq "power") {
+        BOSEST_power($deviceHash);
+    } elsif($workType eq "on") {
+        BOSEST_on($deviceHash);
+    } elsif($workType eq "off") {
+        BOSEST_off($deviceHash);
     } else {
-        return "BOSEST: Unknown argument $data{WorkType}";
+        return "BOSEST: Unknown argument $workType";
     }
-
-    $hash->{helper}{SETBLOCKING_PID} = BlockingCall();
-    
-    push(@params, ReadingsVal($hash->{NAME}, "IP", "unknown"));
-    $data{Params} = \@params;
-    #FIXME call blocking call
     
     return undef;
 }
@@ -450,37 +466,13 @@ sub BOSEST_WebSocketClient($) {
         $socket->recv($msg, 1024);
         #process received message
         Log3 $hash, 3, "BOSEST: Received from WebSocket:\n$msg";
-
-        #check worktype and call worktype specific function
-        #DEVELOPNEWFUNCTION-2
-        if($workType eq "volume") {
-            my $volume = $params[0];
-            BOSEST_setVolume($deviceHash, $volume);
-        } elsif($workType eq "channel") {
-            my $preset = $params[0];
-            #FIXME check preset value (1-6)
-            BOSEST_setPreset($deviceHash, $preset);
-        } elsif($workType eq "play") {
-            BOSEST_play($deviceHash);
-        } elsif($workType eq "stop") {
-            BOSEST_stop($deviceHash);
-        } elsif($workType eq "pause") {
-            BOSEST_pause($deviceHash);
-        } elsif($workType eq "power") {
-            BOSEST_power($deviceHash);
-        } elsif($workType eq "on") {
-            my $sourceState = $params[0];
-            BOSEST_on($deviceHash, $sourceState);
-        } elsif($workType eq "off") {
-            my $sourceState = $params[0];
-            BOSEST_off($deviceHash, $sourceState);
-        }
     }
 }
 
 #DEVELOPNEWFUNCTION-3 (create own function)
 sub BOSEST_on($$) {
     my ($hash, $sourceState) = @_;
+    my $sourceState = ReadingsVal($hash->{NAME}, "source", "STANDBY");
     if($sourceState eq "STANDBY") {
         BOSEST_power($hash);
     }
@@ -488,6 +480,7 @@ sub BOSEST_on($$) {
 
 sub BOSEST_off($$) {
     my ($hash, $sourceState) = @_;
+    my $sourceState = ReadingsVal($hash->{NAME}, "source", "STANDBY");
     if($sourceState ne "STANDBY") {
         BOSEST_power($hash);
     }
@@ -539,6 +532,8 @@ sub BOSEST_power($) {
 
 sub BOSEST_Undef($) {
     my $hash = @_;
+    #FIXME kill blocking
+    #FIXME remove internal timer
     return undef;
 }
 
@@ -640,18 +635,6 @@ sub BOSEST_Check($) {
                 #BOSE SoundTouch team says that it's not necessary to handle this one
             } else {
                 Log3 $hash, 3, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
-            }
-        }
-    }
-
-    $updates = 0;
-                if(defined($deviceHash->{WebSocket})) {
-                    $deviceHash->{WebSocketInputQueue}->enqueue($params[0]);
-                    Log3 $hash, 3, "BOSEST: Update IP $params[0] for BOSE_$deviceID";
-                } else {
-                    $deviceHash->{WebSocket} = BOSEST_WebSocket->new($params[0], $deviceHash->{WebSocketReceiverQueue}, $deviceID, $deviceHash->{WebSocketInputQueue});
-                    Log3 $hash, 3, "BOSEST: New IP ".$params[0]." for BOSE_$deviceID";
-                }
             }
         }
     }
