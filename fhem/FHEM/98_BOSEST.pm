@@ -48,6 +48,8 @@
 #  - change preset via /key
 #
 # TODO
+#  - fix deviceid in ping/pong procedure
+#  - shutdown threads on main undef
 #  - support setExtension on-for-timer, ...
 #  - use BlockingCall instead of threads
 #  - use frame ping to keep connection alive
@@ -80,7 +82,7 @@ use Encode;
 
 package BOSEST_WebSocket;
 use IO::Select;
-use IO::Socket;
+use IO::Socket::INET;
 
 BEGIN {
     $ENV{MOJO_REACTOR} = "Mojo::Reactor::Poll";
@@ -97,18 +99,20 @@ sub new {
     $self->{ip} = shift;
     $self->{deviceID} = shift;
     
+    $self->startServer();
+    
     return $self;
 }
 
 sub startServer() {
     my ($self) = shift;
-    $self->{socket} = new IO::Socket (
+    $self->{socket} = new IO::Socket::INET (
         PeerHost => '127.0.0.1',
         PeerPort => '404040',
         Proto => 'tcp'
     );
     $self->{socket_reader} = new IO::Select();
-    $self->{socket_reader}->add($socket);
+    $self->{socket_reader}->add($self->{socket});
 }
 
 sub connect() {
@@ -128,7 +132,7 @@ sub connect() {
         foreach my $rh (@$rh_set) {
             my $buf = <$rh>;
             if($buf) {
-                #TODO process $buf (IP update)
+                #TODO process $buf (e.g. IP update)
             }
         }
     }
@@ -152,10 +156,9 @@ sub _callback($$) {
 
 sub _receivedMessage($$) {
     my ($self, $tx, $msg) = @_;
-    my $xml = XMLin($msg, KeepRoot => 1, ForceArray => 0, KeyAttr => []);
     #send xml using socket
-    $self->{socket}->send($xml);
-    shutdown($socket, 1);
+    $msg = Encode::encode('UTF-8',$msg);
+    $self->{socket}->send($self->{deviceID}."\r\r\r".$msg."\n\n\n");
     $tx->resume;
     return undef;
 }
@@ -180,6 +183,19 @@ sub _ping() {
 
 package main;
 
+sub BOSEST_startWebSocketConnection($) {
+    my ($string) = @_;
+    my @params = split("\\|", $string);
+    my $deviceName = shift(@params);
+    my $deviceID = shift(@params);
+    my $deviceIP = shift(@params);
+    
+    my $ws = BOSEST_WebSocket->new($deviceIP, $deviceID);
+    #connect to websocket and wait for messages (blocking)
+    $ws->connect();
+    return undef;
+}
+
 sub BOSEST_startDiscoveryProcess($) {
     my ($hash) = @_;
     
@@ -200,14 +216,14 @@ sub BOSEST_Discovery($) {
         next if (!defined($info->{deviceID}));
             
         #create new device
-        if(!defiend($defs{"BOSE_$info->{deviceID}"}) {
+        if(!defined($defs{"BOSE_$info->{deviceID}"})) {
             $info->{name} = Encode::encode('UTF-8',$info->{name});
             Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
             $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
         }
             
         #update IP address of the device if it's different to the previous one
-        $return = $return."|updateIP|$info->{deviceID},$device->address";
+        $return = $return."|updateIP|".$info->{deviceID}.",".$device->address;
     }
     return $return;
 }
@@ -219,7 +235,7 @@ sub BOSEST_finishedDiscovery($) {
     my $hash = $defs{$name};
     my $i = 0;
     
-    $hash->{helper}{DISCOVERY_PID} = undef;
+    delete($hash->{helper}{DISCOVERY_PID});
 
     for($i = 1; $i < @commands; $i = $i+2) {
         my $command = $commands[$i];
@@ -249,10 +265,10 @@ sub BOSEST_updateInfo($$) {
 
 sub BOSEST_parseAndUpdateInfo($$) {
     my ($hash, $info) = @_;
-    readingsSingleUpdate($hash, $info->{deviceID}, "deviceName", $info->{name}, 1);
-    readingsSingleUpdate($hash, $info->{deviceID}, "type", $info->{type}, 1);
-    readingsSingleUpdate($hash, $info->{deviceID}, "deviceID", $info->{deviceID}, 1);
-    readingsSingleUpdate($hash, $info->{deviceID}, "softwareVersion", $info->{components}->{component}[0]->{softwareVersion}, 1);
+    readingsSingleUpdate($hash, "deviceName", $info->{name}, 1);
+    readingsSingleUpdate($hash, "type", $info->{type}, 1);
+    readingsSingleUpdate($hash, "deviceID", $info->{deviceID}, 1);
+    readingsSingleUpdate($hash, "softwareVersion", $info->{components}->{component}[0]->{softwareVersion}, 1);
     return undef;
 }
 
@@ -266,6 +282,10 @@ sub BOSEST_updateNowPlaying($$) {
 
 sub BOSEST_parseAndUpdateNowPlaying($$) {
     my ($hash, $nowPlaying) = @_;
+    Log3 $hash, 5, "BOSEST: parseAndUpdateNowPlaying";
+
+    readingsBeginUpdate($hash);
+
     BOSEST_XMLUpdate($hash, "stationName", $nowPlaying->{stationName});
     BOSEST_XMLUpdate($hash, "track", $nowPlaying->{track});
     BOSEST_XMLUpdate($hash, "source", $nowPlaying->{source});
@@ -312,6 +332,8 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
         }
     }
     
+    readingsEndUpdate($hash, 1);   
+    
     return undef;
 }
 
@@ -333,21 +355,10 @@ sub BOSEST_updateIP($$$) {
         #connect websocket
         if(defined($deviceHash->{helper}{WEBSOCKET_PID})) {
             BlockingKill($deviceHash->{helper}{WEBSOCKET_PID});
-        } else {
-            $deviceHash->{helper}{WEBSOCKET_PID} = BlockingCall("BOSEST_StartWebSocket", "$deviceHash->{NAME}|$deviceID");
         }
+        
+        $deviceHash->{helper}{WEBSOCKET_PID} = BlockingCall("BOSEST_startWebSocketConnection", "$deviceHash->{NAME}|$deviceID|$ip");
     }
-    return undef;
-}
-
-sub BOSEST_StartWebSocket($) {
-    my ($string) = @_;
-    
-    #create websocket object
-    my $websocket = 
-    
-    #connect to IP address
-    
     return undef;
 }
 
@@ -399,14 +410,80 @@ sub BOSEST_Define($$) {
         #start discovery process
         BOSEST_startDiscoveryProcess($hash);
         #start process which can receive messages and update readings
+        InternalTimer(gettimeofday()+5, "BOSEST_startWebSocketReceiver", $hash, 0);
     }
     
     return undef;
 }
 
-sub BOSEST_startBoseSTServer($) {
+sub BOSEST_startWebSocketReceiver($) {
     my ($hash) = @_;
     
+    if(!defined($hash->{helper}{websocket})) {
+        $hash->{helper}{read_set} = new IO::Select();
+        $hash->{helper}{websocket} = new IO::Socket::INET(LocalHost => '127.0.0.1',
+                                                    LocalPort => '404040',
+                                                    Proto => 'tcp',
+                                                    Listen => 5,
+                                                    Reuse => 1);
+        $hash->{helper}{read_set}->add($hash->{helper}{websocket});
+    }
+    my ($rcvselect) = IO::Select->select($hash->{helper}{read_set}, undef, undef, 0);
+    foreach my $rh (@$rcvselect) {
+        if($rh == $hash->{helper}{websocket}) {
+            my $ns = $rh->accept();
+            $hash->{helper}{read_set}->add($ns);
+        } else {
+            my $buf = "";
+            $rh->recv($buf, 4069);
+            if($buf) {
+                #process XML file
+                my @splitxml = split("\n\n\n", $buf);
+                while(my $xmlpart = shift(@splitxml)) {
+                    Log3 $hash, 5, "BOSEST: Message $xmlpart";
+                    my @splitdevidxml = split("\r\r\r", $xmlpart);
+                    my $xml = XMLin($splitdevidxml[1], KeepRoot => 1, ForceArray => 0, KeyAttr => []);
+                    my $deviceHash = BOSEST_getBosePlayerByDeviceID($hash, $splitdevidxml[0]);
+                    Log3 $hash, 3, "BOSEST: Received message for deviceId: $splitdevidxml[0]";
+                    BOSEST_processWebSocketXML($deviceHash, $xml);
+                }
+            } else {
+                $hash->{helper}{read_set}->remove($rh);
+                close($rh);
+            }
+        }
+    }
+    
+    InternalTimer(gettimeofday()+0.5, "BOSEST_startWebSocketReceiver", $hash, 1);
+    
+    return undef;
+}
+
+sub BOSEST_processWebSocketXML($$) {
+    my ($hash, $wsxml) = @_;
+    
+    if($wsxml->{updates}) {
+        if($wsxml->{updates}->{nowPlayingUpdated}) {
+            if($wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying}) {
+                BOSEST_parseAndUpdateNowPlaying($hash, $wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying});
+            }
+        } elsif ($wsxml->{updates}->{volumeUpdated}) {
+            my $volumeUpdated = $wsxml->{updates}->{volumeUpdated};
+            BOSEST_XMLUpdate($hash, "volume", $volumeUpdated->{volume}->{actualvolume});
+        } elsif ($wsxml->{updates}->{nowSelectionUpdated}) {
+            #Log3 $hash, 3, "BOSEST: Event not implemented (nowSelectionUpdated):\n".Dumper($wsxml);
+            #TODO implement now selection updated event
+        } elsif ($wsxml->{updates}->{recentsUpdated}) {
+            #Log3 $hash, 3, "BOSEST: Event not implemented (recentsUpdated):\n".Dumper($wsxml);
+            #TODO implement recent channel event
+        } elsif ($wsxml->{updates}->{connectionStateUpdated}) {
+            #BOSE SoundTouch team says that it's not necessary to handle this one
+        } else {
+            Log3 $hash, 3, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
+        }
+    }
+    
+    return undef;
 }
 
 sub BOSEST_Set($@) {
@@ -426,23 +503,23 @@ sub BOSEST_Set($@) {
     } elsif($workType eq "volume") {
         return "BOSEST: volume requires volume as additional parameter" if(int(@params) < 1);
         #params[0] = volume value
-        BOSEST_setVolume($deviceHash, $params[0]);
+        BOSEST_setVolume($hash, $params[0]);
     } elsif($workType eq "channel") {
         return "BOSEST: channel requires preset id as additional parameter" if(int(@params) < 1);
         #params[0] = preset channel
-        BOSEST_setPreset($deviceHash, $params[0]);
+        BOSEST_setPreset($hash, $params[0]);
     } elsif($workType eq "play") {
-        BOSEST_play($deviceHash);
+        BOSEST_play($hash);
     } elsif($workType eq "stop") {
-        BOSEST_stop($deviceHash);
+        BOSEST_stop($hash);
     } elsif($workType eq "pause") {
-        BOSEST_pause($deviceHash);
+        BOSEST_pause($hash);
     } elsif($workType eq "power") {
-        BOSEST_power($deviceHash);
+        BOSEST_power($hash);
     } elsif($workType eq "on") {
-        BOSEST_on($deviceHash);
+        BOSEST_on($hash);
     } elsif($workType eq "off") {
-        BOSEST_off($deviceHash);
+        BOSEST_off($hash);
     } else {
         return "BOSEST: Unknown argument $workType";
     }
@@ -450,36 +527,17 @@ sub BOSEST_Set($@) {
     return undef;
 }
 
-sub BOSEST_WebSocketClient($) {
-    my ($hash) = @_;
-    my $exit = 0;
-    
-    my $socket = new IO::Socket (
-        PeerHost => $hash->{helper}{IP},
-        PeerPort => '404040',
-        Proto => 'tcp'
-    );
-    
-    #connect to server and check for input (recv)
-    while(!$exit) {
-        my $msg = "";
-        $socket->recv($msg, 1024);
-        #process received message
-        Log3 $hash, 3, "BOSEST: Received from WebSocket:\n$msg";
-    }
-}
-
 #DEVELOPNEWFUNCTION-3 (create own function)
-sub BOSEST_on($$) {
-    my ($hash, $sourceState) = @_;
+sub BOSEST_on($) {
+    my ($hash) = @_;
     my $sourceState = ReadingsVal($hash->{NAME}, "source", "STANDBY");
     if($sourceState eq "STANDBY") {
         BOSEST_power($hash);
     }
 }
 
-sub BOSEST_off($$) {
-    my ($hash, $sourceState) = @_;
+sub BOSEST_off($) {
+    my ($hash) = @_;
     my $sourceState = ReadingsVal($hash->{NAME}, "source", "STANDBY");
     if($sourceState ne "STANDBY") {
         BOSEST_power($hash);
@@ -490,7 +548,7 @@ sub BOSEST_setVolume($$) {
     my ($hash, $volume) = @_;
     my $postXml = '<volume>'.$volume.'</volume>';
     if(BOSEST_HTTPPOST($hash, '/volume', $postXml) == 0) {
-        BOSEST_readingsSingleUpdate($hash, $hash->{DEVICEID}, "volume", $volume);
+        readingsSingleUpdate($hash, "volume", $volume, 1);
     }
     #FIXME error handling
     return undef;
@@ -499,28 +557,28 @@ sub BOSEST_setVolume($$) {
 sub BOSEST_setPreset($$) {
     my ($hash, $preset) = @_;
     BOSEST_sendKey($hash, "PRESET_".$preset);
-    BOSEST_readingsSingleUpdate($hash, $hash->{DEVICEID}, "channel", $preset);
+    readingsSingleUpdate($hash, "channel", $preset, 1);
     return undef;
 }
 
 sub BOSEST_play($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "PLAY");
-    BOSEST_readingsSingleUpdate($hash, $hash->{DEVICEID}, "playStatus", "playing");
+    readingsSingleUpdate($hash, "playStatus", "playing", 1);
     return undef;
 }
 
 sub BOSEST_stop($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "STOP");
-    BOSEST_readingsSingleUpdate($hash, $hash->{DEVICEID}, "playStatus", "stopped");
+    readingsSingleUpdate($hash, "playStatus", "stopped", 1);
     return undef;
 }
 
 sub BOSEST_pause($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "PAUSE");
-    BOSEST_readingsSingleUpdate($hash, $hash->{DEVICEID}, "playStatus", "paused");
+    readingsSingleUpdate($hash, "playStatus", "paused", 1);
     return undef;
 }
 
@@ -531,9 +589,15 @@ sub BOSEST_power($) {
 }
 
 sub BOSEST_Undef($) {
-    my $hash = @_;
-    #FIXME kill blocking
-    #FIXME remove internal timer
+    my ($hash) = @_;
+
+    #remove internal timer
+    RemoveInternalTimer($hash);
+
+    #kill blocking
+    BlockingKill($hash->{helper}{DISCOVERY_PID}) if(defined($hash->{helper}{DISCOVERY_PID}));
+    BlockingKill($hash->{helper}{WEBSOCKET_PID}) if(defined($hash->{helper}{WEBSOCKET_PID}));
+    
     return undef;
 }
 
@@ -574,7 +638,7 @@ sub BOSEST_HTTPGET($$$) {
 sub BOSEST_HTTPPOST($$$) {
     my ($hash, $postURI, $postXml) = @_;
     my $ua = LWP::UserAgent->new();
-    my $ip = $hash->{IP};
+    my $ip = $hash->{helper}{IP};
     my $req = HTTP::Request->new(POST => 'http://'.$ip.':8090'.$postURI);
     Log3 $hash, 5, "BOSEST: set ".$postURI." => ".$postXml;
     $req->content($postXml);
@@ -597,52 +661,18 @@ sub BOSEST_XMLUpdate($$$) {
 
     if(ref $xmlItem eq ref {}) {
         if(keys %{$xmlItem}) {
-            readingsSingleUpdate($hash, $readingName, $xmlItem, 1);
+            readingsBulkUpdate($hash, $readingName, $xmlItem);
         } else {
-            readingsSingleUpdate($hash, $readingName, "", 1);
+            readingsBulkUpdate($hash, $readingName, "");
         }
     } elsif($xmlItem) {
-        readingsSingleUpdate($hash, $readingName, $xmlItem, 1);
+        readingsBulkUpdate($hash, $readingName, $xmlItem);
     } else {
-        readingsSingleUpdate($hash, $readingName, "", 1);
+        readingsBulkUpdate($hash, $readingName, "");
     }
     return undef;
 }
 
-sub BOSEST_Check($) {
-    my ($hash) = @_;
-    my $maxupdates = 5;
-    my $updates = 0;
-
-    while($hash->{WebSocketReceiverQueue}->pending() && $updates < $maxupdates) {
-    	my $wsxml = $hash->{WebSocketReceiverQueue}->dequeue_nb();
-        $updates++;
-        if($wsxml->{updates}) {
-            if($wsxml->{updates}->{nowPlayingUpdated}) {
-                if($wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying}) {
-                    BOSEST_parseAndUpdateNowPlaying($hash, $wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying});
-                }
-            } elsif ($wsxml->{updates}->{volumeUpdated}) {
-                my $volumeUpdated = $wsxml->{updates}->{volumeUpdated};
-                BOSEST_XMLUpdate($hash, "volume", $volumeUpdated->{volume}->{actualvolume});
-            } elsif ($wsxml->{updates}->{nowSelectionUpdated}) {
-                #Log3 $hash, 3, "BOSEST: Event not implemented (nowSelectionUpdated):\n".Dumper($wsxml);
-                #TODO implement now selection updated event
-            } elsif ($wsxml->{updates}->{recentsUpdated}) {
-                #Log3 $hash, 3, "BOSEST: Event not implemented (recentsUpdated):\n".Dumper($wsxml);
-                #TODO implement recent channel event
-            } elsif ($wsxml->{updates}->{connectionStateUpdated}) {
-                #BOSE SoundTouch team says that it's not necessary to handle this one
-            } else {
-                Log3 $hash, 3, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
-            }
-        }
-    }
-    
-    InternalTimer(gettimeofday()+1, "BOSEST_Check", $hash, 1);
-    
-    return undef;
-}
 
 1;
 
