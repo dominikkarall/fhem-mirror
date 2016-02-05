@@ -67,93 +67,25 @@
 #
 #############################################################
 
-package main;
-
-use strict;
-use warnings;
-
-use LWP::UserAgent;
-use XML::Simple;
-use Data::Dumper;
-use Net::Bonjour;
-use Encode;
-
-############ WEBSOCKET #############
-
-#package BOSEST_WebSocket;
-use IO::Select;
-use IO::Socket::INET;
 
 BEGIN {
     $ENV{MOJO_REACTOR} = "Mojo::Reactor::Poll";
 }
 
-use Mojo::UserAgent;
+package main;
+
+use strict;
+use warnings;
+
+use Blocking;
+use LWP::UserAgent;
 use XML::Simple;
-
-# sub new {
-    # my $class = shift;
-    # my $self = {};
-    # bless $self, $class;
-    
-    # $self->{hash} = shift;
-    # $self->{ip} = shift;
-    # $self->{deviceID} = shift;
-    
-    # $self->{tick_ready} = 0;
-    
-    # $self->startServer();
-    
-    # return $self;
-# }
-
-# sub startServer() {
-    # my ($self) = shift;
-    # $self->{socket} = new IO::Socket::INET (
-        # PeerHost => '127.0.0.1',
-        # PeerPort => '404040',
-        # Proto => 'tcp'
-    # );
-    # $self->{socket_reader} = new IO::Select();
-    # $self->{socket_reader}->add($self->{socket});
-# }
-
-# sub BOSEST_webSocketConnect() {
-    # my $self = shift;
-    # my $exit = 0;
-    
-    # $self->{requestId} = 1;
-    
-    # $self->{useragent} = Mojo::UserAgent->new();
-    # $self->{websocket} = $self->{useragent}->websocket('ws://'.$self->{ip}.':8080' => ['gabbo'] => sub { $self->_callback(@_) });
-    
-    # $self->{useragent}->inactivity_timeout(20);
-    # $self->{useragent}->request_timeout(5);
-    # $self->{tick_ready} = 1;
-
-    # while (!$exit) {
-       # Mojo::IOLoop->one_tick;
-       
-       #check if there is something to receive
-       # my ($rh_set) = IO::Select->select($self->{socket_reader}, undef, undef, 0);
-       # foreach my $rh (@$rh_set) {
-           # my $buf = <$rh>;
-           # if($buf) {
-               #TODO process $buf (e.g. IP update)
-           # }
-       # }
-    # }
-# }
-
-# sub oneTick() {
-    # my $self = shift;
-    # my $hash = shift;
-    
-    # if($self->{tick_ready} == 1) {
-        # Log3 $hash, 3, "BOSEST: oneTick";
-        # Mojo::IOLoop->one_tick;
-    # }
-# }
+use Data::Dumper;
+use Net::Bonjour;
+use Encode;
+use IO::Select;
+use IO::Socket::INET;
+use Mojo::UserAgent;
 
 # sub send($) {
     # my ($self, $msg) = @_;
@@ -198,22 +130,6 @@ use XML::Simple;
         # '"><info type="new"/></request></header></msg>');
 # }
 
-############ MAIN #############
-
-#package main;
-
-sub BOSEST_startWebSocketConnectionBlocking($) {
-    my ($string) = @_;
-    my @params = split("\\|", $string);
-    my $deviceName = shift(@params);
-    my $deviceID = shift(@params);
-    my $deviceIP = shift(@params);
-    
-    my $ws = BOSEST_WebSocket->new($deviceIP, $deviceID);
-    #connect to websocket and wait for messages (blocking)
-    $ws->connect();
-    return undef;
-}
 
 sub BOSEST_webSocketCallback() {
     my ($hash, $ua, $tx) = @_;
@@ -228,22 +144,41 @@ sub BOSEST_webSocketCallback() {
 sub BOSEST_startWebSocketConnection($) {
     my ($hash) = @_;
     
+    Log3 $hash, 3, "BOSEST: Start WebSocket connection for $hash->{NAME}";
+    
     $hash->{helper}{requestId} = 1;
     
     $hash->{helper}{useragent} = Mojo::UserAgent->new();
     $hash->{helper}{bosewebsocket} = $hash->{helper}{useragent}->websocket('ws://'.$hash->{helper}{ip}.':8080' => ['gabbo'] => sub {
-                                                                                                                                  my ($ua, $tx) = @_;
-                                                                                                                                  $hash->{helper}{websocketTx} = $tx;
-                                                                                                                                  Log3 $hash, 3, "BOSEST: Callback called.";
-                                                                                                                                  
-                                                                                                                                  $tx->on(message => sub {
-                                                                                                                                        my ($tx, $msg) = @_;
-                                                                                                                                        Log3 $hash, 3, "BOSEST: Msg: $msg";
-                                                                                                                                        });
-                                                                                                                                  });
+                                                                                        my ($ua, $tx) = @_;
+                                                                                        Log3 $hash, 3, "BOSEST: Callback called.";
+                                                                                        
+                                                                                        $tx->on(message => sub {
+                                                                                            my ($tx2, $msg) = @_;
+                                                                                            Log3 $hash, 3, "BOSEST: Msg: $msg";
+                                                                                            $tx2->resume;
+                                                                                            Log3 $hash, 3, "BOSEST: on message END";
+                                                                                        });
+                                                                                        
+                                                                                        $tx->on(finish => sub { Log3 $hash, 3, "BOSEST: finish"; });
+                                                                                        
+                                                                                        $tx->send('<msg><header deviceID="'.$hash->{DEVICEID}.'
+                                                                                            " url="webserver/pingRequest" method="GET"><request requestID="'.$hash->{helper}{requestId}.
+                                                                                            '"><info type="new"/></request></header></msg>');
+                                                                                        
+                                                                                        Log3 $hash, 3, "BOSEST: Callback called.";
+                                                                                        return undef;
+                                                                                    });
     
-    $hash->{helper}{useragent}->inactivity_timeout(20);
-    $hash->{helper}{useragent}->request_timeout(5);
+    $hash->{helper}{useragent}->inactivity_timeout(60);
+    $hash->{helper}{useragent}->request_timeout(60);
+    
+    my $i = 0;
+    while($i<100) {
+        $i++;
+        Mojo::IOLoop->one_tick;
+        select(undef, undef, undef, .01);
+    }
     
     Log3 $hash, 3, "BOSEST: WebSocket connected for $hash->{NAME}";
     
@@ -252,8 +187,14 @@ sub BOSEST_startWebSocketConnection($) {
 
 sub BOSEST_checkWebSocketConnection($) {
     my ($hash) = @_;
+    Log3 $hash, 3, "BOSEST: one tick START";
+    if(defined($hash->{helper}{bosewebsocket})) {
+        Log3 $hash, 3, "BOSEST: one tick1";
+        Mojo::IOLoop->one_tick;
+        Log3 $hash, 3, "BOSEST: one tick2";
+    }
     
-    Mojo::IOLoop->one_tick if(defined($hash->{helper}{bosewebsocket}));
+    InternalTimer(gettimeofday()+0.5, "BOSEST_checkWebSocketConnection", $hash, 1);
     
     return undef;
 }
@@ -474,7 +415,7 @@ sub BOSEST_Define($$) {
         #start discovery process
         BOSEST_startDiscoveryProcess($hash);
         #start process which can receive messages and update readings
-        InternalTimer(gettimeofday()+5, "BOSEST_startWebSocketReceiver", $hash, 0);
+        #InternalTimer(gettimeofday()+5, "BOSEST_startWebSocketReceiver", $hash, 0);
     }
     
     return undef;
@@ -482,8 +423,6 @@ sub BOSEST_Define($$) {
 
 sub BOSEST_startWebSocketReceiver($) {
     my ($hash) = @_;
-    
-    BOSEST_checkWebSocketConnection($hash);
     
     if(!defined($hash->{helper}{websocket})) {
         $hash->{helper}{read_set} = new IO::Select();
@@ -520,7 +459,7 @@ sub BOSEST_startWebSocketReceiver($) {
         }
     }
     
-    InternalTimer(gettimeofday()+0.5, "BOSEST_startWebSocketReceiver", $hash, 1);
+    #InternalTimer(gettimeofday()+0.5, "BOSEST_startWebSocketReceiver", $hash, 1);
     
     return undef;
 }
