@@ -51,6 +51,7 @@
 #  - change preset via /key
 #
 # TODO
+#  - use processXml for all XML messages (websocket, httpget)
 #  - fix deviceid in ping/pong procedure
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
@@ -166,10 +167,13 @@ sub BOSEST_startWebSocketConnection($) {
 sub BOSEST_checkWebSocketConnection($) {
     my ($hash) = @_;
     if(defined($hash->{helper}{bosewebsocket})) {
+        #run mojo loop not longer than 0.5ms
+        my $id = Mojo::IOLoop->timer(0.0005 => sub {});
         Mojo::IOLoop->one_tick;
+        Mojo::IOLoop->remove($id);
     }
     
-    InternalTimer(gettimeofday()+2, "BOSEST_checkWebSocketConnection", $hash, 1);
+    InternalTimer(gettimeofday()+0.8, "BOSEST_checkWebSocketConnection", $hash, 1);
     
     return undef;
 }
@@ -236,6 +240,21 @@ sub BOSEST_finishedDiscovery($) {
     
     #start discovery again after 60s
     InternalTimer(gettimeofday()+60, "BOSEST_startDiscoveryProcess", $hash, 1);
+}
+
+sub BOSEST_updateVolume($$) {
+    my ($hash, $deviceID) = @_;
+    my $volume = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/volume");
+    BOSEST_parseVolume($hash, $volume);
+    return undef;    
+}
+
+sub BOSEST_parseVolume($$) {
+    my ($hash, $volume) = @_;
+    readingsBeginUpdate($hash);
+    BOSEST_XMLUpdate($hash, "volume", $volume->{actualvolume});
+    readingsEndUpdate($hash, 1);
+    return undef;
 }
 
 sub BOSEST_updateInfo($$) {
@@ -337,6 +356,8 @@ sub BOSEST_updateIP($$$) {
         BOSEST_updateInfo($deviceHash, $deviceID);
         #get now_playing
         BOSEST_updateNowPlaying($deviceHash, $deviceID);
+        #get current volume
+        BOSEST_updateVolume($deviceHash, $deviceID);
         #connect websocket
         Log3 $hash, 4, "BOSEST: $deviceHash->{NAME}, start new WebSocket.";
         BOSEST_startWebSocketConnection($deviceHash);
