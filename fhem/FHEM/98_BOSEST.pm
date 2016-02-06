@@ -10,7 +10,7 @@
 #
 #############################################################
 #
-# v0.9.4 - 20160216
+# v0.9.4 - 20160206
 #  - CHANGE: completely drop ithreads (reduces memory usage)
 #  - CHANGE: search for new devices every 60s (BlockingCall)
 #  - CHANGE: check presence status based on websocket connection
