@@ -15,6 +15,7 @@
 #  - CHANGE: search for new devices every 60s (BlockingCall)
 #  - CHANGE: check presence status based on websocket connection
 #  - BUGFIX: removed arguments and readings for main BOSEST
+#  - FEATURE: read volume on startup
 #
 # v0.9.3 - 20160125
 #  - BUGFIX: fix "EV does not work with ithreads."
