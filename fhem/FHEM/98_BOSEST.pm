@@ -53,7 +53,6 @@
 #
 # TODO
 #  - use processXml for all XML messages (websocket, httpget)
-#  - fix deviceid in ping/pong procedure
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
 #  - implement preset change updates
