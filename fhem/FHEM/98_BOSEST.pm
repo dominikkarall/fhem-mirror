@@ -52,6 +52,7 @@
 #  - change preset via /key
 #
 # TODO
+#  - handle aborted blockingcalls
 #  - use processXml for all XML messages (websocket, httpget)
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
@@ -105,6 +106,7 @@ sub BOSEST_webSocketFinished($$) {
     $hash->{helper}{IP} = "unknown";
     
     #set presence & state to offline due to connection drop
+    readingsSingleUpdate($hash, "IP", "unknown", 1);
     readingsSingleUpdate($hash, "presence", "offline", 1);
     readingsSingleUpdate($hash, "state", "offline", 1);
     
@@ -196,22 +198,29 @@ sub BOSEST_Discovery($) {
     my ($name, $hash) = split("\\|", $string);
     my $return = "$name";
     
-    my $res = Net::Bonjour->new('soundtouch');
-    $res->discover;
-    foreach my $device ($res->entries) {
-        my $info = BOSEST_HTTPGET($hash, $device->address, "/info");
-        next if (!defined($info->{deviceID}));
+    eval {
+        my $res = Net::Bonjour->new('soundtouch');
+        $res->discover;
+        foreach my $device ($res->entries) {
+            my $info = BOSEST_HTTPGET($hash, $device->address, "/info");
+            next if (!defined($info->{deviceID}));
             
-        #create new device if it doesn't exist
-        if(!defined($defs{"BOSE_$info->{deviceID}"})) {
-            $info->{name} = Encode::encode('UTF-8',$info->{name});
-            Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
-            $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
+            #create new device if it doesn't exist
+            if(!defined($defs{"BOSE_$info->{deviceID}"})) {
+                $info->{name} = Encode::encode('UTF-8',$info->{name});
+                Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
+                $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
+            }
+            
+            #update IP address of the device
+            $return = $return."|updateIP|".$info->{deviceID}.",".$device->address;
         }
-            
-        #update IP address of the device
-        $return = $return."|updateIP|".$info->{deviceID}.",".$device->address;
+    };
+
+    if($@) {
+        Log3 $hash, 3, "BOSEST: Discovery failed with: $@";
     }
+
     return $return;
 }
 
@@ -296,8 +305,18 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
     BOSEST_XMLUpdate($hash, "artist", $nowPlaying->{artist});
     BOSEST_XMLUpdate($hash, "playStatus", $nowPlaying->{playStatus});
     BOSEST_XMLUpdate($hash, "stationLocation", $nowPlaying->{stationLocation});
+    BOSEST_XMLUpdate($hash, "trackID", $nowPlaying->{trackID});
+    BOSEST_XMLUpdate($hash, "artistID", $nowPlaying->{artistID});
+    BOSEST_XMLUpdate($hash, "rating", $nowPlaying->{rating});
     #description could be very long, therefore skip it for readings
     #BOSEST_XMLUpdate($hash, "description", $nowPlaying->{description});
+    if($nowPlaying->{time}) {
+        BOSEST_XMLUpdate($hash, "time", $nowPlaying->{time}->{content});
+        BOSEST_XMLUpdate($hash, "timeTotal", $nowPlaying->{time}->{total});
+    } else {
+        BOSEST_XMLUpdate($hash, "time", "");
+        BOSEST_XMLUpdate($hash, "timeTotal", "");
+    }
     if($nowPlaying->{art}) {
         BOSEST_XMLUpdate($hash, "art", $nowPlaying->{art}->{content});
         BOSEST_XMLUpdate($hash, "artStatus", $nowPlaying->{art}->{artImageStatus});
@@ -311,12 +330,14 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
         BOSEST_XMLUpdate($hash, "contentItemSourceAccount", $nowPlaying->{ContentItem}->{sourceAccount});
         BOSEST_XMLUpdate($hash, "contentItemSource", $nowPlaying->{ContentItem}->{source});
         BOSEST_XMLUpdate($hash, "contentItemIsPresetable", $nowPlaying->{ContentItem}->{isPresetable});
+        BOSEST_XMLUpdate($hash, "contentItemType", $nowPlaying->{ContentItem}->{type});
     } else {
         BOSEST_XMLUpdate($hash, "contentItemItemName", "");
         BOSEST_XMLUpdate($hash, "contentItemLocation", "");
         BOSEST_XMLUpdate($hash, "contentItemSourceAccount", "");
         BOSEST_XMLUpdate($hash, "contentItemSource", "");
         BOSEST_XMLUpdate($hash, "contentItemIsPresetable", "");
+        BOSEST_XMLUpdate($hash, "contentItemType", "");
     }
     #handle state based on play status and standby state
     if($nowPlaying->{source} eq "STANDBY") {
@@ -350,8 +371,8 @@ sub BOSEST_updateIP($$$) {
     #if update is needed, get info/now_playing
     if($currentIP ne $ip) {
         $deviceHash->{helper}{IP} = $ip;
-        Log3 $hash, 3, "BOSEST: $deviceHash->{NAME}, new IP ($ip)";
         readingsSingleUpdate($deviceHash, "IP", $ip, 1);
+        Log3 $hash, 3, "BOSEST: $deviceHash->{NAME}, new IP ($ip)";
         #get info
         BOSEST_updateInfo($deviceHash, $deviceID);
         #get now_playing
@@ -583,6 +604,12 @@ sub BOSEST_sendKey($$) {
 
 sub BOSEST_HTTPGET($$$) {
     my ($hash, $ip, $getURI) = @_;
+
+    if($ip eq "unknown") {
+        Log3 $hash, 3, "BOSEST: $hash->{NAME}, Can't HTTP GET as long as IP is unknown.";
+        return undef;
+    }
+
     my $ua = LWP::UserAgent->new();
     my $req = HTTP::Request->new(GET => 'http://'.$ip.':8090'.$getURI);
     my $response = $ua->request($req);
