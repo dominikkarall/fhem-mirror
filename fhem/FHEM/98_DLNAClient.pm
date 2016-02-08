@@ -10,12 +10,12 @@ package main;
 
 use strict;
 use warnings;
-use threads;
-use Thread::Queue;
+
 use Net::UPnP::ControlPoint;
+use Net::UPnP::Device;
 use Net::UPnP::AV::MediaRenderer;
-use Net::UPnP::ActionResponse;
-use Net::UPnP::AV::MediaServer;
+
+my %DLNAClient_deviceList = {};
 
 ###################################
 sub
@@ -28,143 +28,97 @@ DLNAClient_Initialize($)
   $hash->{UndefFn}   = "DLNAClient_Undef";
 }
 
-###################################
 sub
-DLNAClient_ScanDevicesThread ($)
+DLNAClient_startUPnPScan($)
 {
-  my ($hash) = @_;  
-  my @dev_list = ();
-  my $retry_cnt = 0;
-  my $input = "";
-  my $currentDevice = undef;
+  my ($hash) = @_;
+
+  if(!defined($hash->{helper}{SCAN_PID})) {
+    $hash->{helper}{SCAN_PID} = BlockingCall("DLNAClient_startUPnPScanBlocking", $hash->{NAME}."|".$hash, "DLNAClient_finishedUPnPScan");
+  }
+
+  return undef;
+}
+
+sub
+DLNAClient_startUPnPScanBlocking($)
+{
+  my ($string) = @_;
+  my ($name, $hash) = split("\\|", $string);
+  my $return = "$name";
   
-  my $scanQueue = $hash->{scanQueue};
-  my $threadInput = $hash->{threadInput};
+  my $obj = Net::UPnP::ControlPoint->new();
+  my @dev_list = $obj->search(st =>'urn:schemas-upnp-org:device:MediaRenderer:1', mx => 3);
   
-  #dequeue blocks the thread till next input
-  while ($input = $threadInput->dequeue()) {
-    Log3 $hash, 5, "DLNAClient: thread input: ".$input;
+  foreach my $dev (@dev_list) {
+    Log3 $hash, 3, "DLNAClient: Found device ".$dev->getfriendlyname();
+    push(@($DLNAClient_deviceList->{$name}{devices}), $dev);
+    #$return = $return."|".$dev->getssdp()."|".$dev->getdescription();
+  }
+  
+  Log3 $hash, 3, "DLNAClient: Return from search: $return";
+  
+  return $return;
+}
+
+sub
+DLNAClient_finishedUPnPScan($)
+{
+  my ($name) = @_;
+  my $hash = $defs{$name};
+
+  delete($hash->{helper}{SCAN_PID});
+  
+  foreach my $dev (@($DLNAClient_deviceList->{$name}{devices})) {
+    Log3 $hash, 3, "DLNAClient: Finished Search, found device ".$dev->getfriendlyname();
     
-    if ($input eq "stopScan") {
-      #stop thread immediately
-      return undef;
-    } elsif ($input eq "scanNow") {
-      #start scan process now
-      
-      #empty scanQueue
-      while ($scanQueue->pending()) {
-        $scanQueue->dequeue_nb();
-      }
-      
-      $retry_cnt = 0;
-      @dev_list = ();
-      while (@dev_list <= 0) {
-        Log3 $hash, 4,  "DLNAClient: Searching for renderers...";
-        my $obj = Net::UPnP::ControlPoint->new();
-        @dev_list = $obj->search(st =>'urn:schemas-upnp-org:device:MediaRenderer:1', mx => 5);
-        $retry_cnt++;
-        if ($retry_cnt >= 3) {
-          Log3 $hash, 4, "DLNAClient: [!] No renderers found.";
-          last;
-        }
-      }
-
-      my $devNum = 0;
-      my $dev;
-      my $foundDevice = 0;
-      
-      foreach $dev (@dev_list) {
-        my $device_type = $dev->getdevicetype();
-        my $friendlyname = $dev->getfriendlyname(); 
-        Log3 $hash, 4, "DLNAClient: found [$devNum] : device name: " . $friendlyname;
-        
-        if ($device_type ne 'urn:schemas-upnp-org:device:MediaRenderer:1') {
-          next;
-        }
-        
-        $devNum++;
-        if ($friendlyname ne $hash->{DEVNAME}) {
-          Log3 $hash, 5,  "DLNAClient: skipping this device.";
-          next;
-        } else {
-          Log3 $hash, 5, "DLNAClient: matching device.";
-          
-          #add new device to scanQueue
-          $scanQueue->enqueue($dev);
-          $currentDevice = $dev;
-          $foundDevice = 1;
-          last;
-        }
-      }
-      if ($foundDevice==0) {
-        Log3 $hash, 4, "DLNAClient: device offline.";
-        if (!defined($currentDevice)) {
-          $scanQueue->enqueue("offline");
-        }
-      }
-    } else {
-      #streamURI received
-      my $streamURI = $input;
-      Log3 $hash, 5, "DLNAClient: start play for ".$streamURI;
-      my $renderer = Net::UPnP::AV::MediaRenderer->new();
-      $renderer->setdevice($currentDevice);
-      
-      #more testing required to enable streammetadata
-      
-      #Windows Media Player:
-      #<res size="57691" duration="0:00:01.440" bitrate="40000" protocolInfo="http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"
-      #sampleFrequency="48000" bitsPerSample="16" nrAudioChannels="2">http://192.168.1.215:10246/MDEServer/3A255347-F53C-47DD-9570-A327F58B3D69/1000.mp3</res>
-      my $DIDLHeader = '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">';
-      my $DIDLFooter = '</DIDL-Lite>';
-      my $streamMetaData = $DIDLHeader.'<item id="1000" parentID="0" restricted="1"><dc:title>'.$streamURI.'</dc:title><res protocolInfo="http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000">'.$streamURI.'</res></item>'.$DIDLFooter;
-
-      Log3 $hash, 5, "DLNAClient: setAVTransportURI Start";
-      $renderer->setAVTransportURI(CurrentURI => $streamURI); #, CurrentURIMetaData => $streamMetaData);
-      Log3 $hash, 5, "DLNAClient: setAVTransportURI End";
-      $renderer->play();
-      Log3 $hash, 5, "DLNAClient: play started";
-      
-      #FIXME readingsSingleUpdate doesn't work from separate thread
-      #readingsSingleUpdate($hash,"stream",$streamURI,1);
-      #readingsSingleUpdate($hash,"state","on",1);
+    if($dev->getfriendlyname() eq $hash->{DEVNAME}) {
+      #set device
+      $hash->{helper}{device} = $dev;
+      Log3 $hash, 3, "DLNAClient: Found device \"".$dev->getfriendlyname()."\".";
     }
   }
+
+  InternalTimer(gettimeofday() + 60, 'DLNAClient_startUPnPScan', $hash, 0);
+  
   return undef;
 }
 
 ###################################
 sub
-DLNAClient_StartScanThread($)
+DLNAClient_setAVTransport($)
 {
-  my ($hash) = @_;
-  my $scanQueue = $hash->{scanQueue};
-  my $threadInput = $hash->{threadInput};
+  my ($string) = @_;
+  my ($name, $hash, $streamURI) = split("|", $string);
+  my $return = "$name|$streamURI";
+
+  #streamURI received
+  Log3 $hash, 5, "DLNAClient: start play for ".$streamURI;
+  my $renderer = Net::UPnP::AV::MediaRenderer->new();
+  $renderer->setdevice($hash->{helper}{device});
+
+  Log3 $hash, 5, "DLNAClient: setAVTransportURI Start";
+  $renderer->setAVTransportURI(CurrentURI => $streamURI);
+  Log3 $hash, 5, "DLNAClient: setAVTransportURI End";
+  $renderer->play();
+  Log3 $hash, 5, "DLNAClient: play started";
+
+  return $return;
+}
+
+###################################
+sub
+DLNAClient_finishedSetAVTransport($)
+{
+  my ($string) = @_;
+  my @params = split("\\|", $string);
+  my $name = $params[0];
+  my $hash = $defs{$name};
   
-  #take new device from queue
-  if ($scanQueue->pending()) {
-    $hash->{dlnaDevice} = $scanQueue->dequeue_nb();
-    
-    if ($hash->{dlnaDevice} eq "offline") {
-      $hash->{dlnaDevice} = undef;
-      readingsSingleUpdate($hash, "state", "offline", 1);
-    } else {
-      if ($hash->{READINGS}{state}{VAL} eq "offline") {
-        readingsSingleUpdate($hash, "state", "off", 1);
-      }
-    }
-  }
+  readingsSingleUpdate($hash,"stream",$params[1],1);
+  readingsSingleUpdate($hash,"state","on",1);
   
-  if (!defined($hash->{scanThread})) {
-    #set device state offline at startup
-    readingsSingleUpdate($hash, "state", "offline", 1);
-    $hash->{scanThread} = threads->create(\&DLNAClient_ScanDevicesThread, $hash);
-    $hash->{scanThread}->detach();
-  }
-  $hash->{threadInput}->enqueue("scanNow");
-  
-  InternalTimer(gettimeofday() + 120, 'DLNAClient_StartScanThread', $hash, 0);
-  
-  return undef;  
+  return undef;
 }
 
 ###################################
@@ -174,11 +128,6 @@ DLNAClient_Define($$)
   my ($hash, $def) = @_;
   my @param = split("[ \t][ \t]*", $def);
   
-  if (!defined($hash->{scanQueue})) {
-    $hash->{scanQueue} = Thread::Queue->new();
-    $hash->{threadInput} = Thread::Queue->new();
-  }
-
   return "too few parameters: define <name> DLNAClient <DLNAName>" if(int(@param) < 3);
   
   my $name            = shift @param;
@@ -186,12 +135,8 @@ DLNAClient_Define($$)
   my $clientName      = join(" ", @param);
   $hash->{DEVNAME} = $clientName;
   
-  if (!defined($hash->{scanThread})) {
-    DLNAClient_StartScanThread($hash);
-  }
+  InternalTimer(gettimeofday() + 10, 'DLNAClient_startUPnPScan', $hash, 0);
   
-  $hash->{threadInput}->enqueue("scanNow");
-
   return undef;
 }
 
@@ -200,10 +145,9 @@ sub
 DLNAClient_Undef($)
 {
   my ($hash) = @_;
-  my $threadInput = $hash->{threadInput};
   
-  #send stopScan
-  $threadInput->enqueue("stopScan");
+  #stop blocking call
+  BlockingKill($hash->{helper}{SCAN_PID}) if(defined($hash->{helper}{SCAN_PID}));
   
   RemoveInternalTimer($hash);
   return undef;
@@ -214,9 +158,7 @@ DLNAClient_Set($@)
 {
   my ($hash, @param) = @_;
   my $deviceName = $hash->{DEVNAME};
-  my $dev = $hash->{dlnaDevice};
-  my $scanQueue = $hash->{scanQueue};
-  my $threadInput = $hash->{threadInput};
+  my $dev = $hash->{helper}{device};
   my $streamURI = "";
   
   # check parameters
@@ -229,7 +171,6 @@ DLNAClient_Set($@)
     
   # check device presence
   if (!defined($dev)) {
-    $threadInput->enqueue("scanNow");
     return "DLNAClient: Currently searching for device $hash->{DEVNAME}...";
   }
   
@@ -292,25 +233,14 @@ DLNAClient_Set($@)
   }
   
   # set streamURI
-  if (!$streamURI) {
-    if($ctrlParam eq "stream"){
-      $streamURI = $param[2];
-    } elsif ($ctrlParam ne "on" or $ctrlParam ne "play") {
-      $streamURI = $ctrlParam;
-    } else {
-      return "use set <device> stream <URI> first";
-    }
+  if (!$streamURI && $ctrlParam eq "stream") {
+    $streamURI = $param[2];
   }
-  
-  Log3 $hash, 5, "DLNAClient: start Thread with ".$streamURI;
-  $threadInput->enqueue($streamURI);
-  readingsSingleUpdate($hash,"stream",$streamURI,1);
-  readingsSingleUpdate($hash,"state","on",1);
+
+  readingsSingleUpdate($hash, "state", "buffering", 1);
+  BlockingCall('DLNAClient_setAVTransport', $hash->{NAME}."|".$hash."|".$streamURI, 'DLNAClient_finishedSetAVTransport');
   
   return undef;
-  
-  #planned for next release
-  #return "Unknown argument, use \"set <device> stream URI\" instead";
 }
 
 1;
