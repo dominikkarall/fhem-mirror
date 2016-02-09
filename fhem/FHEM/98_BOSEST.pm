@@ -6,9 +6,15 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 0.9.4
+# Version: 0.9.5
 #
 #############################################################
+#
+# v0.9.5 - 20160209
+#  - BUGFIX: reconnect websocket if handshake fails
+#  - BUGFIX: presence reading fixed
+#  - CHANGE: websocket request timeout changed to 10s (prev. 5s)
+#  - CHANGE: clockDisplayUpdated message handled now
 #
 # v0.9.4 - 20160206
 #  - CHANGE: completely drop ithreads (reduces memory usage)
@@ -89,6 +95,15 @@ use XML::Simple;
 sub BOSEST_webSocketCallback($$$) {
     my ($hash, $ua, $tx) = @_;
     Log3 $hash, 5, "BOSEST: Callback called";
+
+    if(!$tx->is_websocket) {
+        Log3 $hash, 3, "BOSEST: $hash->{NAME}, WebSocket failed, retry.";
+        BOSEST_startWebSocketConnection($hash);
+        return undef;
+    } else {
+        Log3 $hash, 3, "BOSEST: $hash->{NAME}, WebSocket connection succeed.";
+    }
+
     #register on message method
     $tx->on(message => sub { my ($tx2, $msg) = @_; BOSEST_webSocketReceivedMsg($hash, $tx2, $msg); });
     #register on finish method
@@ -100,7 +115,7 @@ sub BOSEST_webSocketCallback($$$) {
 
 sub BOSEST_webSocketFinished($$) {
     my ($hash, $ws) = @_;
-    Log3 $hash, 3, "BOSEST: $hash->{NAME}, WebSocket connection dropped.";
+    Log3 $hash, 3, "BOSEST: $hash->{NAME}, WebSocket connection dropped - try reconnect.";
     
     #set IP to unknown due to connection drop
     $hash->{helper}{IP} = "unknown";
@@ -159,7 +174,7 @@ sub BOSEST_startWebSocketConnection($) {
     });
     
     $hash->{helper}{useragent}->inactivity_timeout(25);
-    $hash->{helper}{useragent}->request_timeout(5);
+    $hash->{helper}{useragent}->request_timeout(10);
     
     Log3 $hash, 4, "BOSEST: $hash->{NAME}, WebSocket connected.";
     
@@ -372,6 +387,7 @@ sub BOSEST_updateIP($$$) {
     if($currentIP ne $ip) {
         $deviceHash->{helper}{IP} = $ip;
         readingsSingleUpdate($deviceHash, "IP", $ip, 1);
+        readingsSingleUpdate($deviceHash, "presence", "online", 1);
         Log3 $hash, 3, "BOSEST: $deviceHash->{NAME}, new IP ($ip)";
         #get info
         BOSEST_updateInfo($deviceHash, $deviceID);
@@ -460,6 +476,8 @@ sub BOSEST_processWebSocketXML($$) {
             #TODO implement recent channel event
         } elsif ($wsxml->{updates}->{connectionStateUpdated}) {
             #BOSE SoundTouch team says that it's not necessary to handle this one
+        } elsif ($wsxml->{updates}->{clockDisplayUpdated}) {
+            #TODO handle clockDisplayUpdated (feature currently unknown)
         } else {
             Log3 $hash, 3, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
         }
@@ -479,7 +497,7 @@ sub BOSEST_Set($@) {
         if($hash->{DEVICEID} eq "0") {
             return ""; #no arguments for server
         } else {
-            return "Unknown argument, choose one of on off power:noArg play:noArg 
+            return "Unknown argument, choose one of on:noArg off:noArg power:noArg play:noArg 
                     stop:noArg pause:noArg channel:1,2,3,4,5,6 volume:slider,0,1,100";
         }
     } elsif($workType eq "volume") {
