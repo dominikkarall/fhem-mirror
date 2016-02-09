@@ -15,8 +15,6 @@ use Net::UPnP::ControlPoint;
 use Net::UPnP::Device;
 use Net::UPnP::AV::MediaRenderer;
 
-my %DLNAClient_deviceList = {};
-
 ###################################
 sub
 DLNAClient_Initialize($)
@@ -46,14 +44,17 @@ DLNAClient_startUPnPScanBlocking($)
   my ($string) = @_;
   my ($name, $hash) = split("\\|", $string);
   my $return = "$name";
+  $hash = $main::defs{$name};
   
   my $obj = Net::UPnP::ControlPoint->new();
   my @dev_list = $obj->search(st =>'urn:schemas-upnp-org:device:MediaRenderer:1', mx => 3);
   
   foreach my $dev (@dev_list) {
     Log3 $hash, 3, "DLNAClient: Found device ".$dev->getfriendlyname();
-    push(@($DLNAClient_deviceList->{$name}{devices}), $dev);
-    #$return = $return."|".$dev->getssdp()."|".$dev->getdescription();
+    if($dev->getfriendlyname() eq $hash->{DEVNAME}) {
+      $return = $return."|".$dev->getdescription()."|";
+      $return =~ s{\n}{ }g;
+    }
   }
   
   Log3 $hash, 3, "DLNAClient: Return from search: $return";
@@ -64,22 +65,46 @@ DLNAClient_startUPnPScanBlocking($)
 sub
 DLNAClient_finishedUPnPScan($)
 {
-  my ($name) = @_;
-  my $hash = $defs{$name};
-
-  delete($hash->{helper}{SCAN_PID});
+  my ($string) = @_;
+  my ($name, $ssdp_res_msg) = split("\\|", $string);
+  my $hash = $main::defs{$name};
   
-  foreach my $dev (@($DLNAClient_deviceList->{$name}{devices})) {
-    Log3 $hash, 3, "DLNAClient: Finished Search, found device ".$dev->getfriendlyname();
-    
-    if($dev->getfriendlyname() eq $hash->{DEVNAME}) {
-      #set device
-      $hash->{helper}{device} = $dev;
-      Log3 $hash, 3, "DLNAClient: Found device \"".$dev->getfriendlyname()."\".";
-    }
-  }
-
+  delete($hash->{helper}{SCAN_PID});
   InternalTimer(gettimeofday() + 60, 'DLNAClient_startUPnPScan', $hash, 0);
+  
+  if(!defined($ssdp_res_msg)) {
+    Log3 $hash, 3, "DLNAClient: DLNA device not found.";
+    return undef;
+  }
+  
+  Log3 $hash, 3, "DLNAClient: Called finished scan";
+
+  
+  #same implementation as Net::UPnP due to issues with BlockingCall
+  ### START
+  unless ($ssdp_res_msg =~ m/LOCATION[ :]+(.*)\r/i) {
+    next;
+  }		
+  my $dev_location = $1;
+  unless ($dev_location =~ m/http:\/\/([0-9a-z.]+)[:]*([0-9]*)\/(.*)/i) {
+    next;
+  }
+  my $dev_addr = $1;
+  my $dev_port = $2;
+  my $dev_path = '/' . $3;
+  
+  my $http_req = Net::UPnP::HTTP->new();
+  my $post_res = $http_req->post($dev_addr, $dev_port, "GET", $dev_path, "", "");
+  my $post_content = $post_res->getcontent();
+  ### END
+
+  my $dev = Net::UPnP::Device->new();
+  $dev->setssdp($ssdp_res_msg);
+  $dev->setdescription($post_content);
+  
+  $hash->{helper}{device} = $dev;
+  
+  Log3 $hash, 3, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
   
   return undef;
 }
