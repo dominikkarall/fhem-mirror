@@ -10,7 +10,9 @@
 #
 #############################################################
 #
-# v0.9.5 - 20160209
+# v0.9.5 - 20160210
+#  - FEATURE: update channel based on websocket events
+#  - BUGFIX: specify minimum libmojolicious-perl version
 #  - BUGFIX: reconnect websocket if handshake fails
 #  - BUGFIX: presence reading fixed
 #  - CHANGE: websocket request timeout changed to 10s (prev. 5s)
@@ -58,11 +60,11 @@
 #  - change preset via /key
 #
 # TODO
+#  - check if Mojolicious::Lite can be used
 #  - handle aborted blockingcalls
 #  - use processXml for all XML messages (websocket, httpget)
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
-#  - implement preset change updates
 #  - implement all update msgs from websocket
 #  - add attribute to ignore deviceID in main
 #  - define own presets with attr
@@ -88,7 +90,7 @@ use Encode;
 
 use Data::Dumper;
 use LWP::UserAgent;
-use Mojo::UserAgent;
+use Mojolicious 5.54;
 use Net::Bonjour;
 use XML::Simple;
 
@@ -469,8 +471,9 @@ sub BOSEST_processWebSocketXML($$) {
             BOSEST_XMLUpdate($hash, "volume", $volumeUpdated->{volume}->{actualvolume});
             readingsEndUpdate($hash, 1);
         } elsif ($wsxml->{updates}->{nowSelectionUpdated}) {
-            #Log3 $hash, 3, "BOSEST: Event not implemented (nowSelectionUpdated):\n".Dumper($wsxml);
-            #TODO implement now selection updated event
+            readingsBeginUpdate($hash);
+            BOSEST_XMLUpdate($hash, "channel", $wsxml->{updates}->{nowSelectionUpdated}->{preset}->{id});
+            readingsEndUpdate($hash, 1);
         } elsif ($wsxml->{updates}->{recentsUpdated}) {
             #Log3 $hash, 3, "BOSEST: Event not implemented (recentsUpdated):\n".Dumper($wsxml);
             #TODO implement recent channel event

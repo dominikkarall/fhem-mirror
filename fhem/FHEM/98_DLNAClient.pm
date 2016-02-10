@@ -1,6 +1,9 @@
 ##############################################
-# 2016-01-05, v1.11, dominik $
-#   v1.11: - FIXED: support all versions of RenderingControl UPnP service (by MichaelT)
+# 2016-02-10, v1.20, dominik $
+#
+# v1.20
+# - CHANGED: removed all iThreads
+# - CHANGED: use BlockingCall for upnp search
 #
 # DLNA Module to play given URLs on a DLNA Renderer
 # and control their volume
@@ -11,6 +14,7 @@ package main;
 use strict;
 use warnings;
 
+use MIME::Base64;
 use Net::UPnP::ControlPoint;
 use Net::UPnP::Device;
 use Net::UPnP::AV::MediaRenderer;
@@ -50,14 +54,12 @@ DLNAClient_startUPnPScanBlocking($)
   my @dev_list = $obj->search(st =>'urn:schemas-upnp-org:device:MediaRenderer:1', mx => 3);
   
   foreach my $dev (@dev_list) {
-    Log3 $hash, 3, "DLNAClient: Found device ".$dev->getfriendlyname();
+    Log3 $hash, 5, "DLNAClient: Found device ".$dev->getfriendlyname();
     if($dev->getfriendlyname() eq $hash->{DEVNAME}) {
-      $return = $return."|".$dev->getdescription()."|";
-      $return =~ s{\n}{ }g;
+      $return = $return."|".encode_base64($dev->getssdp(), "")."|".encode_base64($dev->getdescription(), "");
+      Log3 $hash, 4, "DLNAClient: Found specified device ".$dev->getfriendlyname();
     }
   }
-  
-  Log3 $hash, 3, "DLNAClient: Return from search: $return";
   
   return $return;
 }
@@ -66,45 +68,27 @@ sub
 DLNAClient_finishedUPnPScan($)
 {
   my ($string) = @_;
-  my ($name, $ssdp_res_msg) = split("\\|", $string);
+  my ($name, $ssdp, $description) = split("\\|", $string);
   my $hash = $main::defs{$name};
+  
+  $ssdp = decode_base64($ssdp);
+  $description = decode_base64($description);
   
   delete($hash->{helper}{SCAN_PID});
   InternalTimer(gettimeofday() + 60, 'DLNAClient_startUPnPScan', $hash, 0);
   
-  if(!defined($ssdp_res_msg)) {
-    Log3 $hash, 3, "DLNAClient: DLNA device not found.";
+  if(!defined($ssdp)) {
+    Log3 $hash, 4, "DLNAClient: DLNA device not found.";
     return undef;
   }
-  
-  Log3 $hash, 3, "DLNAClient: Called finished scan";
-
-  
-  #same implementation as Net::UPnP due to issues with BlockingCall
-  ### START
-  unless ($ssdp_res_msg =~ m/LOCATION[ :]+(.*)\r/i) {
-    next;
-  }		
-  my $dev_location = $1;
-  unless ($dev_location =~ m/http:\/\/([0-9a-z.]+)[:]*([0-9]*)\/(.*)/i) {
-    next;
-  }
-  my $dev_addr = $1;
-  my $dev_port = $2;
-  my $dev_path = '/' . $3;
-  
-  my $http_req = Net::UPnP::HTTP->new();
-  my $post_res = $http_req->post($dev_addr, $dev_port, "GET", $dev_path, "", "");
-  my $post_content = $post_res->getcontent();
-  ### END
 
   my $dev = Net::UPnP::Device->new();
-  $dev->setssdp($ssdp_res_msg);
-  $dev->setdescription($post_content);
+  $dev->setssdp($ssdp);
+  $dev->setdescription($description);
   
   $hash->{helper}{device} = $dev;
   
-  Log3 $hash, 3, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
+  Log3 $hash, 4, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
   
   return undef;
 }
@@ -114,11 +98,12 @@ sub
 DLNAClient_setAVTransport($)
 {
   my ($string) = @_;
-  my ($name, $hash, $streamURI) = split("|", $string);
+  my ($name, $streamURI) = split("\\|", $string);
+  my $hash = $main::defs{$name};
   my $return = "$name|$streamURI";
 
   #streamURI received
-  Log3 $hash, 5, "DLNAClient: start play for ".$streamURI;
+  Log3 $hash, 4, "DLNAClient: start play for ".$streamURI;
   my $renderer = Net::UPnP::AV::MediaRenderer->new();
   $renderer->setdevice($hash->{helper}{device});
 
@@ -263,7 +248,7 @@ DLNAClient_Set($@)
   }
 
   readingsSingleUpdate($hash, "state", "buffering", 1);
-  BlockingCall('DLNAClient_setAVTransport', $hash->{NAME}."|".$hash."|".$streamURI, 'DLNAClient_finishedSetAVTransport');
+  BlockingCall('DLNAClient_setAVTransport', $hash->{NAME}."|".$streamURI, 'DLNAClient_finishedSetAVTransport');
   
   return undef;
 }
