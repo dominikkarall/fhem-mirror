@@ -1,4 +1,4 @@
-# $Id: 98_MaxScanner.pm 10453 2016-01-11 00:00:00Z john $
+# $Id$
 ####################################################################################################
 #
 #   98_MaxScanner.pm
@@ -42,7 +42,10 @@
 #      *  change. scanTemp substitues scnEnabled
 #   11.01.16 - 1.0.0.0
 #      *  change: limit logging, when window open detected
-#
+#   13.01.16 - 1.0.0.1
+#      *  change: FIND, minor changes
+#   15.01.16 - 1.0.0.2
+#      *  fixed : Work- check of external change of desired was incorrect
 ####################################################################################################
 package main;
 use strict;
@@ -52,7 +55,7 @@ use vars qw(%defs);
 use vars qw($readingFnAttributes);
 use vars qw(%attr);
 use vars qw(%modules);
-my $MaxScanner_Version   = "1.0.0.1 - 11.01.2016";
+my $MaxScanner_Version   = "1.0.0.2 - 14.01.2016";
 my $MaxScanner_ModulName = "MaxScanner";
 
 # minimal poll-rate for thermostat in minutes given by firmware
@@ -424,24 +427,32 @@ sub MaxScanner_Find($)
   foreach my $aaa ( sort keys %{ $modules{MAX}{defptr} } )
   {
     my $hash = $modules{MAX}{defptr}{$aaa};
-
+    
+    # type must exist
+    # it seems, that maxlan environment holds some foreign entries
+    # see http://forum.fhem.de/index.php/topic,11624.msg390975.html#msg390975
+    if ( !defined( $hash->{type} ) )
+    {
+      MaxScanner_Log $modHash, 5, 'missing property type for device: ' . $aaa;
+      next;
+    }
+    
+    # exit if it is not a HeatingThermostat
+    next if $hash->{type} !~ m/^HeatingThermostat.*/;
+    
     # basic properties  are reqired
     if ( !defined( $hash->{IODev} )
-      || !defined( $hash->{NAME} )
-      || !defined( $hash->{type} ) )
+      || !defined( $hash->{NAME} ) )
     {
-      MaxScanner_Log $modHash, 1, 'missing basic property for device: ' . $aaa;
+      MaxScanner_Log $modHash, 1, 'missing property IODEV or NAME for device: ' . $aaa;
       next;
     }
 
     #.
     # name of the max device
     my $name = $hash->{NAME};
-    MaxScanner_Log $modHash, 5, "$name has type " . $hash->{type};
 
-    # exit if it is not a HeatingThermostat
-    next if $hash->{type} !~ m/^HeatingThermostat.*/;
-    MaxScanner_Log $modHash, 5, $name . " is HeatingThermostat";
+    # MaxScanner_Log $modHash, 5, $name . " is HeatingThermostat";
 
     # thermostat must be enabled for the scanner
     if ( AttrVal( $name, $MaxScanner_AttrEnabled, '?' ) ne '1' )
@@ -451,7 +462,7 @@ sub MaxScanner_Find($)
       next;
     }
 
-    MaxScanner_Log $modHash, 5, $name . ' is enabled for scanner';
+    # MaxScanner_Log $modHash, 5, $name . ' is enabled for scanner';
 
     # check special user attributes, if not exists, create them
     my $xattr = AttrVal( $name, 'userattr', '' );
@@ -682,7 +693,7 @@ sub MaxScanner_Work($$$)
 {
   my $reUINT = '^([\\+]?\\d+)$';    # uint without whitespaces
   my ( $modHash, $thermi_sort, $numWorkIntervall ) = @_;
-  my $scanDynamic = '';
+  my $isCul = '';
   my $settingDone = '';             # end loop if a set command was performed
   my @scan_time;
   my $modName = $modHash->{NAME};
@@ -779,7 +790,7 @@ sub MaxScanner_Work($$$)
       $numCulCredits = ReadingsVal( $strCulName, 'credit10ms', 0 );
 
       # force dynamic scanning for CUL
-      $scanDynamic = 1;
+      $isCul = 1;
     }
 
     # because cube not knows msgcnt, we fix the timestamp
@@ -878,8 +889,8 @@ sub MaxScanner_Work($$$)
       . $numCulCredits
       . ' Credits:'
       . int($numCredit)
-      . ' scanDynamic:'
-      . $scanDynamic
+      . ' isCul:'
+      . $isCul
       . ' CreditThreshold:'
       . $numCreditThreshold;
 
@@ -890,7 +901,7 @@ sub MaxScanner_Work($$$)
     my $nextPlan = $sdNextScan;
 
     # if dynamic scanning
-    if ($scanDynamic)
+    if ($isCul)
     {
       # 17 secs before next scan time
       $nextPlan = $sdTempTime + $numWorkIntervall * 60 - 17;
@@ -921,7 +932,7 @@ sub MaxScanner_Work($$$)
       $hash->{helper}{desiredOffset} = ($boolDesiChange) ? $numDesiTemp - $normDesiTemp : 0;
       $hash->{helper}{switchDate}    = undef;
       $hash->{helper}{LastCmdDate}   = $sdCurTime;
-      $hash->{helper}{gotTempTS}     = 0;
+      $hash->{helper}{gotTempTS}     = '';
     }
 
     # gather the timestamp for next profile switch
@@ -934,7 +945,7 @@ sub MaxScanner_Work($$$)
     # if switchDate is changed, then adjust leading desired
     if ( $hash->{helper}{switchDate} != $switchDate )
     {
-      $hash->{helper}{gotTempTS}          = 0;
+      $hash->{helper}{gotTempTS}          = '';
       $hash->{helper}{switchDate}         = $switchDate;
       $hash->{helper}{leadDesiTemp}       = $normDesiTemp;
       $hash->{helper}{TempBeforeWindOpen} = $normDesiTemp;    # MrHeat
@@ -963,7 +974,7 @@ sub MaxScanner_Work($$$)
     }
 
     # determine nextScan for CUL-like devices
-    if ($scanDynamic)
+    if ($isCul)
     {
       # if temperature time is younger than old time, then determine nextScan
       if ( $sdTempTime != $hash->{helper}{TemperatureTime} )
@@ -1058,8 +1069,9 @@ sub MaxScanner_Work($$$)
         MaxScanner_Log $hash, 4, "normDesiTemp:$normDesiTemp desiredOffset:" . $hash->{helper}{desiredOffset};
 
         # if the expected value does not match, than desired was changed outside
-        # but only, if we got temperature after a desired change by w-profile
-        if ( $expectedDesiTemp != $numDesiTemp && $hash->{helper}{gotTempTS} == 1 )
+        # but when CUL than only, if we got temperature after a desired change by w-profile
+        if ( $expectedDesiTemp != $numDesiTemp 
+           && ( ($hash->{helper}{gotTempTS} && $isCul) || !$isCul) )
         {
           $hash->{helper}{leadDesiTemp}  = $numDesiTemp;
           $hash->{helper}{desiredOffset} = 0;
@@ -1185,7 +1197,7 @@ sub MaxScanner_Work($$$)
         }
 
         # if we are using CUL, then dynamic scanning
-        if ($scanDynamic)
+        if ($isCul)
         {
           $hash->{helper}{NextScan} = int( $sdCurTime + 60 );
         } else    # if CUBE

@@ -190,6 +190,7 @@ sub MilightDevice_Define($$)
   }
 
   $hash->{helper}->{GAMMAMAP} = MilightDevice_CreateGammaMapping($hash, 1.0);
+  $hash->{helper}->{COLORMAP} = MilightDevice_ColorConverter($hash, split(',', "0,0,0,0,0,0"));
 
     
   # Define devStateIcon
@@ -237,7 +238,7 @@ sub MilightDevice_Init($)
   if (($hash->{LEDTYPE} eq 'RGBW') || ($hash->{LEDTYPE} eq 'RGB'))
   {
     my @a = split(',', "0,0,0,0,0,0");
-    if ( defined($hash->{".colorCast"} ) )
+    if ( defined( $attr{$name}{colorCast} ) )
     {
       @a = split(',', AttrVal($hash->{NAME}, "colorCast", "0,0,0,0,0,0"));
       @a = split(',', "0,0,0,0,0,0") unless (@a == 6);  
@@ -281,6 +282,7 @@ sub MilightDevice_Set(@)
   if ($hash->{IODev}->{STATE} ne "ok" && $hash->{IODev}->{STATE} ne "Initialized") {
     readingsSingleUpdate($hash, "state", "error", 1);
     $flags = "q";
+    $args[2] = "" if(!defined($args[2]));
     $args[2] .= "q" if ($args[2] !~ m/.*[qQ].*/);
     # return SetExtensions($hash, $hash->{helper}->{COMMANDSET}, $name, $cmd, @args);
     # IO error, we need to keep our current state settings!
@@ -1071,9 +1073,11 @@ sub MilightDevice_RGBW_SetHSV(@)
   
   $repeat = 1 if (!defined($repeat));
 
-  my $cv = 0;
-  $cv = $hash->{helper}->{COLORMAP}[$hue % 360];
-  $cv = 0 if(!defined($cv));
+  my $cv = $hash->{helper}->{COLORMAP}[$hue % 360];
+
+  #check dim levels to decide wether to change color or brightness first
+  my $dimup = 0;
+  $dimup = 1 if($val > ReadingsVal($hash->{NAME}, "brightness", 100));
 
   # apply gamma correction
   my $gammaVal = $hash->{helper}->{GAMMAMAP}[$val];
@@ -1094,7 +1098,7 @@ sub MilightDevice_RGBW_SetHSV(@)
     $sat = 100;
   }
   
-  Log3 ($hash, 5, "MilightDevice_RGBW_SetHSV: wl: $wl; cl: $cl; cv: $cv");
+  Log3 ($hash, 5, "MilightDevice_RGBW_SetHSV:  h:$hue s:$sat v:$val / cv:$cv wl:$wl cl:$cl ");
   # Set readings in FHEM
   MilightDevice_SetHSV_Readings($hash, $hue, $sat, $val);
 
@@ -1124,12 +1128,24 @@ sub MilightDevice_RGBW_SetHSV(@)
     elsif ($cl > 0) # color
     {
       IOWrite($hash, @RGBWCmdsOn[$hash->{SLOTID} -5]."\x00".$RGBWCmdEnd) if (($wl > 0) || ($cl > 0)); # group on
+      if($dimup)
+      {
       IOWrite($hash, $RGBWCmdCol.chr($cv).$RGBWCmdEnd); # color
       IOWrite($hash, $RGBWCmdBri.chr($cl).$RGBWCmdEnd); # brightness
+      } else {
+        IOWrite($hash, $RGBWCmdBri.chr($cl).$RGBWCmdEnd); # brightness
+        IOWrite($hash, $RGBWCmdCol.chr($cv).$RGBWCmdEnd); # color
+      }
       if ($repeat eq 1) {
         IOWrite($hash, @RGBWCmdsOn[$hash->{SLOTID} -5]."\x00".$RGBWCmdEnd) if (($wl > 0) || ($cl > 0)); # group on
+        if($dimup)
+        {
         IOWrite($hash, $RGBWCmdCol.chr($cv).$RGBWCmdEnd); # color
         IOWrite($hash, $RGBWCmdBri.chr($cl).$RGBWCmdEnd); # brightness
+        } else {
+          IOWrite($hash, $RGBWCmdBri.chr($cl).$RGBWCmdEnd); # brightness
+          IOWrite($hash, $RGBWCmdCol.chr($cv).$RGBWCmdEnd); # color
+        }
       }
     }
 
@@ -1741,15 +1757,19 @@ sub MilightDevice_HSV_Transition(@)
     $maxSteps = MilightDevice_DimSteps($hash);
   }
   
+  # Calculate number of steps, limit to max number (no point running more if they are the same)
+  $steps = int($ramp * 1000 / $stepWidth);
+  if ($steps > $maxSteps)
+  {
+    $stepWidth *= ($steps/$maxSteps);
+    $steps = $maxSteps;
+  }
+
   # Calculate minimum stepWidth
   # Min bridge delay as specified by Bridge * 3 (eg. 100*3=300ms).
   # On average min 3 commands need to be sent per step (eg. Group On; Mode; Brightness;) so this gets it approximately right
   my $minStepWidth = $hash->{IODev}->{INTERVAL} * 3;
   $stepWidth = $minStepWidth if ($stepWidth < $minStepWidth); # Make sure we have min stepWidth
-  
-  # Calculate number of steps, limit to max number (no point running more if they are the same)
-  $steps = int($ramp * 1000 / $stepWidth);
-  $steps = $maxSteps if ($steps > $maxSteps);
   
   Log3 ($hash, 4, "$hash->{NAME}_HSV_Transition: Steps: $steps; Step Interval(ms): $stepWidth");  
   

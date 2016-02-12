@@ -1,7 +1,6 @@
-# $Id: 57_CALVIEW.pm 7015 2015-12-23 13:30:00Z chris1284 $
+# $Id$
 ###########################
 #	CALVIEW
-#	
 #	needs a defined Device 57_Calendar
 ###########################
 package main;
@@ -21,7 +20,7 @@ sub CALVIEW_Initialize($)
 	$hash->{AttrList} = "do_not_notify:1,0 " . 
 						"maxreadings " .
 						"oldStyledReadings:1,0 " .
-						"modes:multiple,all,modeAlarm,modeAlarmOrStart,modeAlarmed,modeChanged,modeEnd,modeEnded,modeStart,modeStarted,modeUpcoming,stateChanged,stateDeleted,stateNew,stateUpdated ".
+						"modes:next ".
 						$readingFnAttributes; 
 }
 sub CALVIEW_Define($$){
@@ -43,9 +42,9 @@ sub CALVIEW_Define($$){
 	$hash->{STATE}	= "Initialized";
 	$hash->{INTERVAL} = $inter;
 	$modes = 1 if (!defined($modes));
-	if($modes == 1)	{$attr{$name}{modes} = "modeAlarm,modeStart,modeStarted,modeUpcoming";}
-	elsif($modes == 0){$attr{$name}{modes} = "modeAlarm,modeStart,modeStarted";}
-	elsif($modes == 2){$attr{$name}{modes} = "all";}
+	if($modes == 1)	{$attr{$name}{modes} = "next";}
+	elsif($modes == 0){$attr{$name}{modes} = "next";}
+	elsif($modes == 2){$attr{$name}{modes} = "next";}
 	else {return "invalid mode \"$modes\", use 0,1 or 2!"}
 	InternalTimer(gettimeofday()+2, "CALVIEW_GetUpdate", $hash, 0);
 	return undef;
@@ -138,18 +137,18 @@ sub CALVIEW_GetUpdate($){
 				readingsBulkUpdate($hash, "today_".sprintf ('%03d', $todaycounter)."_mode", $termin->{mode}); 
 				$todaycounter ++;}
 			elsif ($date eq $termin->{bdate} && $termin->{mode} eq "modeStart"){
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_bdate", "heute"); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_btime", $termin->{btime}); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_summary", $termin->{summary}); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_source", $termin->{source}); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_location", $termin->{location});
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_edate", $termin->{edate}); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_etime", $termin->{etime}); 
-				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $todaycounter)."_mode", $termin->{mode});
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_bdate", "heute"); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_btime", $termin->{btime}); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_summary", $termin->{summary}); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_source", $termin->{source}); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_location", $termin->{location});
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_edate", $termin->{edate}); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_etime", $termin->{etime}); 
+				readingsBulkUpdate($hash, "started_".sprintf ('%03d', $runningcounter)."_mode", $termin->{mode});
 				$runningcounter ++;}
 			#check ob termin morgen
 			elsif ($datenext eq $termin->{bdate}){
-				readingsBulkUpdate($hash, "tomorrow_".sprintf ('%03d', $tomorrowcounter)."_btime", "morgen"); 
+				readingsBulkUpdate($hash, "tomorrow_".sprintf ('%03d', $tomorrowcounter)."_bdate", "morgen"); 
 				readingsBulkUpdate($hash, "tomorrow_".sprintf ('%03d', $tomorrowcounter)."_btime", $termin->{btime}); 
 				readingsBulkUpdate($hash, "tomorrow_".sprintf ('%03d', $tomorrowcounter)."_summary", $termin->{summary}); 
 				readingsBulkUpdate($hash, "tomorrow_".sprintf ('%03d', $tomorrowcounter)."_source", $termin->{source});
@@ -191,22 +190,39 @@ sub getsummery($)
 	my @terminliste ;
 	my $name = $hash->{NAME};
 	# my $calendername  = $hash->{KALENDER};
-	my @calendernamen = split( ",", $hash->{KALENDER});
+	my @calendernamen = split( ",", $hash->{KALENDER}); 
 	my $modi = $attr{$name}{modes};
 	my @modes = split(/,/,$modi);
 	foreach my $calendername (@calendernamen){
-		foreach my $mode (@modes){
-			my $all = ReadingsVal($calendername, $mode, "");
-			my @uids=split(/;/,$all);
+		#foreach my $mode (@modes){
+			my $all = CallFn($calendername, "GetFn", $defs{$calendername},(" ","full", "next"));
+			my @termine=split(/\n/,$all);
 			
-			foreach my $uid (@uids){
-				my $terminstart = CallFn($calendername, "GetFn", $defs{$calendername},(" ","start", $uid));
-				my $termintext = CallFn($calendername, "GetFn", $defs{$calendername}, (" ","summary", $uid));
-				my $terminend = CallFn($calendername, "GetFn", $defs{$calendername}, (" ","end", $uid));
-				my $terminort = CallFn($calendername, "GetFn", $defs{$calendername}, (" ","location", $uid));
-				push(@terminliste, [$terminstart, $termintext, $terminend, $calendername, $terminort, $mode]);
+			foreach my $termin (@termine){
+				my @uid=split(/\s+/,$termin);
+		
+				#für jedes event die einzelnen infos holen
+				my $tmpstarts = CallFn($calendername, "GetFn", $defs{$calendername},(" ","start", $uid[0]));
+				my @starts  = split(/\n/,$tmpstarts);
+				#my $tmptexts = CallFn($calendername, "GetFn", $defs{$calendername},(" ","text", $uid[0]));
+				#my @texts  = split(/\n/,$tmptexts);
+				my $tmpends = CallFn($calendername, "GetFn", $defs{$calendername},(" ","end", $uid[0]));
+				my @ends  = split(/\n/,$tmpends);
+				my $tmpsummarys = CallFn($calendername, "GetFn", $defs{$calendername},(" ","summary", $uid[0]));
+				my @summarys  = split(/\n/,$tmpsummarys);
+				my $tmplocations = CallFn($calendername, "GetFn", $defs{$calendername},(" ","location", $uid[0]));
+				my @locations = split(/\n/,$tmplocations);
+				
+				for(my $i = 1; $i <= (scalar(@starts)); $i++) {
+					my $internali = $i-1;
+					my $terminstart = $starts[$internali];
+					my $termintext = $summarys[$internali];
+					my $terminend = $ends[$internali];
+					my $terminort = $locations[$internali];
+					push(@terminliste, [$terminstart, $termintext, $terminend, $calendername, $terminort, "next"]);
+				}
 			};
-		};
+		#};
 	};
 	return @terminliste;
 }

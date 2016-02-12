@@ -450,7 +450,8 @@ E:  while (@$a > 0) {
     $element = substr ($element, 0, length($element)-1);
     my @t = split(/\|/, $element);
     my $anzahl = @t;
-    if ( $anzahl >= 2 && $anzahl <= 3) {
+    
+    if ( ($anzahl == 2 || $anzahl == 3) && $t[0] gt "" && $t[1] gt "" ) {
       Log3 $hash, 4, "[$name] $element - accepted";
       push(@switchingtimes, $element);
     } else {
@@ -832,6 +833,7 @@ sub WeekdayTimer_FensterOffen ($$$) {
   my %contacts =  ( "CUL_FHTTK"       => { "READING" => "Window",          "STATUS" => "(Open)",        "MODEL" => "r" },
                     "CUL_HM"          => { "READING" => "state",           "STATUS" => "(open|tilted)", "MODEL" => "r" },
                     "EnOcean"         => { "READING" => "state",           "STATUS" => "(open)",        "MODEL" => "r" },
+                    "ZWave"           => { "READING" => "state",           "STATUS" => "(open)",        "MODEL" => "r" },
                     "MAX"             => { "READING" => "state",           "STATUS" => "(open.*)",      "MODEL" => "r" },
                     "WeekdayTimer"    => { "READING" => "delayedExecution","STATUS" => "^1\$",          "MODEL" => "a" },
                     "Heating_Control" => { "READING" => "delayedExecution","STATUS" => "^1\$",          "MODEL" => "a" }

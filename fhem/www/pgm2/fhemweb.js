@@ -387,6 +387,7 @@ FW_replaceLink(el)
     ma = attr.match(new RegExp("^"+FW_root)); // Avoid "Connection lost" @iOS
     if(ma) {
       $(el).click(function(e) {
+        e.preventDefault();
         // Open link in window/tab, Forum #39154
         if(e.shiftKey || e.ctrlKey || e.metaKey || e.button == 1)
           return;
@@ -394,7 +395,6 @@ FW_replaceLink(el)
         if($(el).attr("target") == "_blank") {
           window.open(url, '_blank').focus();
         } else {
-          $(el).attr(href,'');
           location.href = attr;
         }
       });

@@ -25,6 +25,7 @@ my $updArg;
 my $mainPgm = "/fhem.pl\$";
 my %upd_connecthash;
 my $upd_needJoin;
+my $upd_nChanged;
 
 
 ########################################
@@ -64,11 +65,11 @@ CommandUpdate($$)
         if($arg =~ m/^[-\?\*]/ || $ret);
   $arg = lc($arg) if($arg =~ m/^(check|all|force)$/i);
 
-  $updateInBackground = AttrVal("global","updateInBackground",undef);
+  $updateInBackground = AttrVal("global","updateInBackground",1);
   $updateInBackground = 0 if($arg ne "all");                                   
   $updArg = $arg;
   if($updateInBackground) {
-    CallFn($cl->{NAME}, "ActivateInformFn", $cl, "global");
+    CallFn($cl->{NAME}, "ActivateInformFn", $cl, "log");
     BlockingCall("doUpdateInBackground", {src=>$src,arg=>$arg});
     return "Executing the update the background.";
 
@@ -167,7 +168,6 @@ update_Log2Event($$)
   return if($inLog || $level > $attr{global}{verbose});
   $inLog = 1;
   $text =~ s/\n/ /g; # Multiline text causes havoc in Analyze
-  BlockingInformParent("DoTrigger", ["global", $text, 1], 0);
   BlockingInformParent("Log", [$level, $text], 0);
   $inLog = 0;
 }
@@ -189,6 +189,7 @@ doUpdateLoop($$)
   my ($src, $arg) = @_;
 
   $upd_needJoin = 0;
+  $upd_nChanged = 0;
   if($src =~ m/^http.*/) {
     doUpdate(1,1, $src, $arg);
     HttpUtils_Close(\%upd_connecthash);
@@ -217,6 +218,14 @@ doUpdateLoop($$)
     doUpdate(++$curr, $max, $srcLine, $arg);
     HttpUtils_Close(\%upd_connecthash);
   }
+  
+  if($upd_nChanged) {
+    if($updateInBackground) {
+      BlockingInformParent("DoTrigger", ["global", "UPDATE", 0 ], 0)
+    } else {
+      DoTrigger("global","UPDATE", 0);
+    }
+  }
 }
 
 sub
@@ -233,7 +242,8 @@ doUpdate($$$$)
   $ctrlFileName =~ m/controls_(.*).txt/;
   my $srcName = $1;
 
-  if(AttrVal("global", "backup_before_update", 0) && $arg ne "check" && $curr==1) {
+  if(AttrVal("global", "backup_before_update", 0) &&
+     $arg ne "check" && $curr==1) {
     my $cmdret = AnalyzeCommand(undef, "backup");
     if ($cmdret !~ m/backup done.*/) {
       uLog 1, "Something went wrong during backup: $cmdret";
@@ -384,14 +394,15 @@ doUpdate($$$$)
 
   if($canJoin && $upd_needJoin && $curr == $max) {
     chdir($root);
-    uLog(1, "Calling $^X $cj, this may take a while");
-    my $ret = `$^X $cj`;
+    uLog(1, "Calling $^X $cj -noWarnings, this may take a while");
+    my $ret = `$^X $cj -noWarnings`;
     foreach my $l (split(/[\r\n]+/, $ret)) {
       uLog(1, $l);
     }
   }
 
-  return "" if(!$nChanged);
+  $upd_nChanged += $nChanged;
+  return "" if(!$upd_nChanged);
 
   uLog(1, "");
   if($curr == $max) {
@@ -609,6 +620,7 @@ upd_initRestoreDirs($)
 1;
 
 =pod
+=item command
 =begin html
 
 <a name="update"></a>
@@ -623,7 +635,8 @@ upd_initRestoreDirs($)
   Update the FHEM installation. Technically this means update will download
   the controlfile(s) first, compare it to the local version of the file in the
   moddir/FHEM directory, and download each file where the attributes (timestamp
-  and filelength) are different.
+  and filelength) are different. Upon completion it triggers the global:UPDATE
+  event.
   <br>
   With the commands add/delete/list/reset you can manage the list of
   controlfiles, e.g. for thirdparty packages.
@@ -657,7 +670,7 @@ upd_initRestoreDirs($)
         If this attribute is set (to 1), the update will be executed in a
         background process. The return message is communicated via events, and
         in telnet the inform command is activated, in FHEMWEB the Event
-        Monitor.
+        Monitor. Default is set. Set it to 0 to switch it off.
         </li><br>
 
     <a name="updateNoFileCheck"></a>
@@ -721,7 +734,8 @@ upd_initRestoreDirs($)
   Kontroll-Datei(en) heruntergeladen, und mit der lokalen Version dieser Datei
   in moddir/FHEM verglichen. Danach werden alle in der  Kontroll-Datei
   spezifizierten Dateien heruntergeladen, deren Gr&ouml;&szlig;e oder
-  Zeitstempel sich unterscheidet.
+  Zeitstempel sich unterscheidet. Wenn dieser Ablauf abgeschlossen ist, wird
+  das globale UPDATE Ereignis ausgel&ouml;st.
   <br>
   Mit den Befehlen add/delete/list/reset kann man die Liste der Kontrolldateien 
   pflegen.
@@ -759,7 +773,8 @@ upd_initRestoreDirs($)
         Wenn dieses Attribut gesetzt ist, wird das update Befehl in einem
         separaten Prozess ausgef&uuml;hrt, und alle Meldungen werden per Event
         &uuml;bermittelt. In der telnet Sitzung wird inform, in FHEMWEB wird
-        das Event Monitor aktiviert.
+        das Event Monitor aktiviert. Die Voreinstellung ist an, zum
+        Deaktivieren bitte Attribut auf 0 setzen.
         </li><br>
 
     <a name="updateNoFileCheck"></a>

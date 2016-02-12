@@ -52,6 +52,13 @@
 # V 1.0.0.6
 #  12.11.2015   Fix: wrong evaluation of Sensor String, when value was 0 than sensor timeout was detected
 #               Feature: added <Internal> VERSION
+# V 1.0.0.7     Feature: new attribute pidActorCallBeforeSetting for user specific callback 
+#               before setting a new value to actor
+# V 1.0.0.8     Feature: attribute handling accelerates some actions
+#               Fix:     update of state triggers force a notify
+#               Fix:     adjust commandref 
+# V 1.0.0.9     Feature: new attribute pidIPortionCallBeforeSetting for user specific callback 
+#               before setting a new value to p-portion
 ####################################################################################################
 package main;
 
@@ -63,7 +70,7 @@ use vars qw($readingFnAttributes);
 use vars qw(%attr);
 use vars qw(%modules);
 
-my $PID20_Version = "1.0.0.6";
+my $PID20_Version = "1.0.0.9";
 sub PID20_Calc($);
 ########################################
 sub PID20_Log($$$)
@@ -80,40 +87,55 @@ sub PID20_Log($$$)
 sub PID20_Initialize($)
 {
   my ($hash) = @_;
-  $hash->{DefFn}    = "PID20_Define";
-  $hash->{UndefFn}  = "PID20_Undef";
-  $hash->{SetFn}    = "PID20_Set";
-  $hash->{GetFn}    = "PID20_Get";
-  $hash->{NotifyFn} = "PID20_Notify";
+  $hash->{DefFn}    = 'PID20_Define';
+  $hash->{UndefFn}  = 'PID20_Undef';
+  $hash->{SetFn}    = 'PID20_Set';
+  $hash->{GetFn}    = 'PID20_Get';
+  $hash->{NotifyFn} = 'PID20_Notify';
+  $hash->{AttrFn}   = 'PID20_Attr';
   $hash->{AttrList} =
-      "pidActorValueDecPlaces:0,1,2,3,4,5 "
-    . "pidActorInterval "
-    . "pidActorTreshold "
-    . "pidActorErrorAction:freeze,errorPos "
-    . "pidActorErrorPos "
-    . "pidActorKeepAlive "
-    . "pidActorLimitLower "
-    . "pidActorLimitUpper "
-    . "pidCalcInterval "
-    . "pidDeltaTreshold "
-    . "pidDesiredName "
-    . "pidFactor_P "
-    . "pidFactor_I "
-    . "pidFactor_D "
-    . "pidMeasuredName "
-    . "pidSensorTimeout "
-    . "pidReverseAction "
-    . "pidUpdateInterval "
-
-    #    . "pidDebugEnable:0,1 ";
-    . "pidDebugSensor:0,1 "
-    . "pidDebugActuation:0,1 "
-    . "pidDebugCalc:0,1 "
-    . "pidDebugDelta:0,1 "
-    . "pidDebugUpdate:0,1 "
-    . "pidDebugNotify:0,1 "
-    . "disable:0,1 "
+      'pidActorValueDecPlaces:0,1,2,3,4,5 '
+    . 'pidActorInterval '
+    . 'pidActorTreshold '
+    . 'pidActorErrorAction:freeze,errorPos '
+    . 'pidActorErrorPos '
+    . 'pidActorKeepAlive '
+    . 'pidActorLimitLower '
+    . 'pidActorLimitUpper '
+    . 'pidActorCallBeforeSetting '
+    . 'pidIPortionCallBeforeSetting '
+    . 'pidCalcInterval '
+    . 'pidDeltaTreshold '
+    . 'pidDesiredName '
+    . 'pidFactor_P '
+    . 'pidFactor_I '
+    . 'pidFactor_D '
+    . 'pidMeasuredName '
+    . 'pidSensorTimeout '
+    . 'pidReverseAction '
+    . 'pidUpdateInterval '
+    . 'pidDebugSensor:0,1 '
+    . 'pidDebugActuation:0,1 '
+    . 'pidDebugCalc:0,1 '
+    . 'pidDebugDelta:0,1 '
+    . 'pidDebugUpdate:0,1 '
+    . 'pidDebugNotify:0,1 '
+    . 'disable:0,1 '
     . $readingFnAttributes;
+}
+
+##########################
+sub PID20_RestartTimer($$)
+{
+  my ( $hash, $seconds ) = @_;
+  my $name           = $hash->{NAME};
+
+  $seconds = 1 if ( $seconds <= 0 );
+  RemoveInternalTimer($name);
+
+  my $sdNextScan = gettimeofday() + $seconds;
+  InternalTimer( $sdNextScan, 'PID20_Calc', $name, 0 );
+  PID20_Log $hash, 5, 'name:'.$name.' seconds:'.$seconds;
 }
 ########################################
 sub PID20_TimeDiff($)
@@ -159,6 +181,7 @@ sub PID20_Define($$$)
   }
   $hash->{helper}{sensor} = $sensor;
   $hash->{VERSION} = $PID20_Version;
+
   # defaults for regexp
   if ( !$regexp )
   {
@@ -335,13 +358,14 @@ sub PID20_Set($@)
       return 'Set start needs a <value> parameter'
         if ( @a != 2 );
       $hash->{helper}{stopped} = 0;
+      PID20_RestartTimer($hash,1);
     }
     when ('stop')
     {
       return 'Set stop needs a <value> parameter'
         if ( @a != 2 );
       $hash->{helper}{stopped} = 1;
-      PID20_Calc($name);
+      PID20_RestartTimer($hash,1);
     }
     when ('restart')
     {
@@ -355,6 +379,7 @@ sub PID20_Set($@)
         if ( !defined($value) );
       $hash->{helper}{stopped} = 0;
       $hash->{helper}{adjust}  = $value;
+      PID20_RestartTimer($hash,1);
       PID20_Log $hash, 3, "set $name $cmd $value";
     }
     when ("calc")    # inofficial function, only for debugging purposes
@@ -467,7 +492,7 @@ sub PID20_Calc($)
     $stateStr = "alarm - no $reading yet for $sensor" if ( $sensorStr eq '' && $stateStr eq '' );
 
     # sensor alive
-    if ( $sensorStr ne ''  && $sensorTS )
+    if ( $sensorStr ne '' && $sensorTS )
     {
       my $timeDiff = PID20_TimeDiff($sensorTS);
       $sensorIsAlive = 1 if ( $timeDiff <= $hash->{helper}{sensorTimeout} );
@@ -535,6 +560,17 @@ sub PID20_Calc($)
       }
 
       $hash->{helper}{isWindUP} = $isWindup;
+
+      # check callback for iPortion
+      my $iportionCallBeforeSetting = AttrVal( $name, 'pidIPortionCallBeforeSetting', undef );
+      if ( defined($iportionCallBeforeSetting) && exists &$iportionCallBeforeSetting )
+      {
+        PID20_Log $hash, 5, 'start callback ' . $iportionCallBeforeSetting . ' with iPortion:' . $iPortion;
+        no strict "refs";
+        $iPortion = &$iportionCallBeforeSetting( $name, $iPortion );
+        use strict "refs";
+        PID20_Log $hash, 5, 'return value of ' . $iportionCallBeforeSetting . ':' . $iPortion;
+      }
 
       # calc actuation
       $actuationCalc = $pPortion + $iPortion + $dPortion;
@@ -644,15 +680,21 @@ sub PID20_Calc($)
     if ($actuationReq)
     {
       $readingUpdateReq = 1;         # update the readings
+      
+      # check calback for actuation
+      my $actorCallBeforeSetting = AttrVal( $name, 'pidActorCallBeforeSetting', undef );
+      if ( defined($actorCallBeforeSetting) && exists &$actorCallBeforeSetting )
+      {
+        PID20_Log $hash, 5, 'start callback ' . $actorCallBeforeSetting . ' with actuation:' . $actuation;
+        no strict "refs";
+        $actuation = &$actorCallBeforeSetting( $name, $actuation );
+        use strict "refs";
+        PID20_Log $hash, 5, 'return value of ' . $actorCallBeforeSetting . ':' . $actuation;
+      }
 
       #build command for fhem
-      PID20_Log $hash, 5,
-          'actor:'
-        . $hash->{helper}{actor}
-        . ' actorCommand:'
-        . $hash->{helper}{actorCommand}
-        . ' actuation:'
-        . $actuation;
+      PID20_Log $hash, 5, 'actor:' . $hash->{helper}{actor} . ' actorCommand:' . $hash->{helper}{actorCommand}
+        . ' actuation:' . $actuation;
       my $cmd = sprintf( "set %s %s %g", $hash->{helper}{actor}, $hash->{helper}{actorCommand}, $actuation );
 
       # execute command
@@ -692,9 +734,9 @@ sub PID20_Calc($)
   }    # end while
 
   # ........ update statePID.
-  $stateStr = 'idle'      if ( $stateStr eq ''  && !$calcReq );
+  $stateStr = 'idle'       if ( $stateStr eq '' && !$calcReq );
   $stateStr = 'processing' if ( $stateStr eq '' && $calcReq );
-  readingsSingleUpdate( $hash, 'state', $stateStr, 0 );
+  readingsSingleUpdate( $hash, 'state', $stateStr, 1 );
   PID20_Log $hash, 2, "C1 stateStr:$stateStr calcReq:$calcReq" if ($DEBUG_Calc);
 
   #......... timer setup
@@ -705,6 +747,27 @@ sub PID20_Calc($)
   #PID20_Log $hash, 2, "InternalTimer next:".FmtDateTime($next)." PID20_Calc name:$name DEBUG_Calc:$DEBUG_Calc";
   return;
 }
+
+
+########################################
+# attribute handling
+sub PID20_Attr($$$$)
+{
+  my ( $command, $name, $attribute, $value ) = @_;
+  my $msg    = undef;
+  my $hash   = $defs{$name};
+  my $reUINT = '^([\\+]?\\d+)$';
+ 
+  PID20_Log $hash, 5, 'name:' . $name . ' attribute:' . $attribute . ' value:' . $value . ' command:' . $command;
+  
+  if ( $attribute eq 'disable' )
+  {
+   # PID20_Log $hash, 5, 'disable'; 
+    PID20_RestartTimer($hash,2);
+  }
+  return $msg;
+}
+
 1;
 
 =pod
@@ -792,7 +855,36 @@ sub PID20_Calc($)
 		<li><b>pidSensorTimeout</b> - number of seconds to wait before sensor will be recognized n/a; default: 3600</li>
 		<li><b>pidReverseAction</b> - reverse PID operation mode, possible values: 0,1; default: 0</li>
 		<li><b>pidUpdateInterval</b> - number of seconds to wait before an update will be forced for plotting; default: 300</li>
-
+		<li><b>pidActorCallBeforeSetting</b> - an optional callback-function,which can manipulate the actorValue; default: not defined
+        <pre>
+        # Exampe for callback-function
+        # 1. argument = name of PID20
+        # 2. argument = current actor value
+          sub PIDActorSet($$)
+          {
+              my ( $name, $actValue ) = @_;
+              if ($actValue>70)
+              {
+                $actValue=100;
+              }
+              return $actValue;
+          }</pre>
+		  </li>
+		<li><b>pidIPortionCallBeforeSetting</b> - an optional callback-function, which can manipulate the value of I-Portion; default: not defined
+        <pre>
+        # Exampe for callback-function
+        # 1. argument = name of PID20
+        # 2. argument = current i-portion value
+          sub PIDIPortionSet($$)
+          {
+              my ( $name, $actValue ) = @_;
+              if ($actValue>70)
+              {
+                $actValue=70;
+              }
+              return $actValue;
+          }</pre>
+		  </li>
 	</ul>
 	<br/><br/>
 

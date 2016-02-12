@@ -49,6 +49,7 @@ FB_CALLMONITOR_Initialize($)
     $hash->{GetFn}     = "FB_CALLMONITOR_Get";
     $hash->{SetFn}     = "FB_CALLMONITOR_Set";
     $hash->{DefFn}     = "FB_CALLMONITOR_Define";
+    $hash->{RenameFn}  = "FB_CALLMONITOR_Rename";    
     $hash->{UndefFn}   = "FB_CALLMONITOR_Undef";
     $hash->{AttrFn}    = "FB_CALLMONITOR_Attr";
     $hash->{NotifyFn}  = "FB_CALLMONITOR_Notify";
@@ -112,7 +113,26 @@ FB_CALLMONITOR_Undef($$)
     return undef;
 }
 
-
+#####################################
+# If Device is renamed, copy the password data
+sub
+FB_CALLMONITOR_Rename($$)
+{
+    my ($new, $old) = @_;  
+    
+    my $old_index = "FB_CALLMONITOR_".$old."_passwd";
+    my $new_index = "FB_CALLMONITOR_".$new."_passwd";
+    
+    my $old_key =getUniqueId().$old_index;
+    my $new_key =getUniqueId().$new_index;
+    
+    my ($err, $old_pwd) = getKeyValue($old_index);
+    
+    return undef unless(defined($old_pwd));
+    
+    setKeyValue($new_index, FB_CALLMONITOR_encrypt(FB_CALLMONITOR_decrypt($old_pwd,$old_key), $new_key));
+    setKeyValue($old_index, undef);
+}
 
 #####################################
 # Get function for returning a reverse search name
@@ -154,10 +174,11 @@ FB_CALLMONITOR_Get($@)
             $number_width = length($number) if($number_width < length($number));
             $name_width = length($hash->{helper}{PHONEBOOK}{$number}) if($name_width < length($hash->{helper}{PHONEBOOK}{$number}));
         }
+        
         my $head = sprintf("%-".$number_width."s   %s" ,"Number", "Name"); 
+        
         foreach my $number (sort { lc($hash->{helper}{PHONEBOOK}{$a}) cmp lc($hash->{helper}{PHONEBOOK}{$b}) } keys %{$hash->{helper}{PHONEBOOK}})
         {
-            
             my $string = sprintf("%-".$number_width."s - %s" , $number,$hash->{helper}{PHONEBOOK}{$number}); 
             $table .= $string."\n";
         }
@@ -176,10 +197,11 @@ FB_CALLMONITOR_Get($@)
             $number_width = length($number) if($number_width < length($number));
             $name_width = length($hash->{helper}{CACHE}{$number}) if($name_width < length($hash->{helper}{CACHE}{$number}));
         }
+        
         my $head = sprintf("%-".$number_width."s   %s" ,"Number", "Name"); 
+        
         foreach my $number (sort { lc($hash->{helper}{CACHE}{$a}) cmp lc($hash->{helper}{CACHE}{$b}) } keys %{$hash->{helper}{CACHE}})
-        {
-            
+        { 
             my $string = sprintf("%-".$number_width."s - %s" , $number,$hash->{helper}{CACHE}{$number}); 
             $table .= $string."\n";
         }
@@ -198,10 +220,11 @@ FB_CALLMONITOR_Get($@)
             $number_width = length($number) if($number_width < length($number));
             $name_width = length($hash->{helper}{TEXTFILE}{$number}) if($name_width < length($hash->{helper}{TEXTFILE}{$number}));
         }
+        
         my $head = sprintf("%-".$number_width."s   %s" ,"Number", "Name"); 
+        
         foreach my $number (sort { lc($hash->{helper}{TEXTFILE}{$a}) cmp lc($hash->{helper}{TEXTFILE}{$b}) } keys %{$hash->{helper}{TEXTFILE}})
         {
-            
             my $string = sprintf("%-".$number_width."s - %s" , $number,$hash->{helper}{TEXTFILE}{$number}); 
             $table .= $string."\n";
         }
@@ -267,26 +290,21 @@ FB_CALLMONITOR_Read($)
     my ($hash) = @_;
 
     my %connection_type = (
-        0 => "0",
-        1 => "FON1",
-        2 => "FON2",
-        3 => "FON3",
+        0 => "FON1",
+        1 => "FON2",
+        2 => "FON3",
+        3 => "Callthrough",
         4 => "ISDN",
         5 => "FAX",
-        6 => "not_defined",
-        7 => "not_defined",
-        8 => "not_defined",
-        9 => "not_defined",
+        6 => "Answering_Machine",
+        
         10 => "DECT_1",
         11 => "DECT_2",
         12 => "DECT_3",
         13 => "DECT_4",
         14 => "DECT_5",
         15 => "DECT_6",
-        16 => "FRITZMini_1",
-        17 => "FRITZMini_2",
-        18 => "FRITZMini_3",
-        19 => "FRITZMini_4",
+        
         20 => "VoIP_1",
         21 => "VoIP_2",
         22 => "VoIP_3",
@@ -297,6 +315,10 @@ FB_CALLMONITOR_Read($)
         27 => "VoIP_8",
         28 => "VoIP_9",
         29 => "VoIP_10",
+        
+        36 => "ISDN_data",
+        37 => "FAX_data",
+        
         40 => "Answering_Machine_1",
         41 => "Answering_Machine_2",
         42 => "Answering_Machine_3",
@@ -316,7 +338,7 @@ FB_CALLMONITOR_Read($)
     my $country_code = AttrVal($name, "country-code", "0049");
     my $external_number = undef;
   
-    foreach $data (split(/^/m, $buf))
+    foreach $data (split(/;\r\n/m, $buf))
     {
         chomp $data;
         
@@ -509,6 +531,7 @@ FB_CALLMONITOR_Notify($$)
   
     FB_CALLMONITOR_readPhonebook($hash);
 }
+
 ############################################################################################################
 #
 #   Begin of helper functions
@@ -731,6 +754,7 @@ sub FB_CALLMONITOR_html2txt($)
 
     $string =~ s/&nbsp;/ /g;
     $string =~ s/&amp;/&/g;
+    $string =~ s/&pos;/'/g;
     $string =~ s/(\xe4|&auml;|\\u00e4|\\u00E4)/ä/g;
     $string =~ s/(\xc4|&Auml;|\\u00c4|\\u00C4)/Ä/g;
     $string =~ s/(\xf6|&ouml;|\\u00f6|\\u00F6)/ö/g;
@@ -738,10 +762,12 @@ sub FB_CALLMONITOR_html2txt($)
     $string =~ s/(\xfc|&uuml;|\\u00fc|\\u00FC)/ü/g;
     $string =~ s/(\xdc|&Uuml;|\\u00dc|\\u00DC)/Ü/g;
     $string =~ s/(\xdf|&szlig;)/ß/g;
-    $string =~ s/<.+?>//g;
-    $string =~ s/(^\s+|\s+$)//g;
+    $string =~ s/<[^>]+>//g;
+    $string =~ s/&lt;/</g;
+    $string =~ s/&gt;/>/g;
+    $string =~ s/(?:^\s+|\s+$)//g;
 
-    return trim($string);
+    return $string;
 }
 
 #####################################
@@ -921,7 +947,7 @@ sub FB_CALLMONITOR_parsePhonebook($$)
     my $number;
     my $count_contacts = 0;
     
-    if($phonebook =~ /<phonebooks>/ and $phonebook =~ /<phonebook[^>]+>/ and $phonebook =~ m,</phonebook>, and $phonebook =~ m,</phonebooks>,) 
+    if($phonebook =~ /<phonebook/ and $phonebook =~ m,</phonebook>,) 
     {
         if($phonebook =~ /<contact/ and $phonebook =~ /<realName>/ and $phonebook =~ /<number/)
         {
@@ -1094,7 +1120,7 @@ sub FB_CALLMONITOR_readRemotePhonebookViaTelnet($;$)
 
     unless($rc)
     {
-        return "Error loading Net::Telnet. May be this module is not installed.";
+        return "Error loading Net::Telnet. Maybe this module is not installed?";
     }
     
     my $phonebook_file = "/var/flash/phonebook";
@@ -1109,7 +1135,7 @@ sub FB_CALLMONITOR_readRemotePhonebookViaTelnet($;$)
     delete($hash->{helper}{READ_PWD}) if(exists($hash->{helper}{READ_PWD}));
     return "no password available to access FritzBox" unless(defined($fb_pw));
     
-    my $telnet = new Net::Telnet ( Timeout=>10, Errmode=>'return');
+    my $telnet = Net::Telnet->new(Timeout => 10, Errmode => 'return');
     
     unless($telnet->open($fb_ip))
     {
@@ -1130,6 +1156,7 @@ sub FB_CALLMONITOR_readRemotePhonebookViaTelnet($;$)
     {
         Log3 $name, 4, "FB_CALLMONITOR ($name) - setting user to FritzBox: $fb_user";
         $telnet->print($fb_user);
+        
         unless($telnet->waitfor('/password:\s*$/i'))
         {
             $telnet->close;
@@ -1223,8 +1250,8 @@ sub FB_CALLMONITOR_identifyPhoneBooksViaTR064($;$)
     </h:InitChallenge >
   </s:Header>
   <s:Body>
-    <u:SetEnable xmlns:u="urn:dslforum-org:service:X_AVM-DE_OnTel:1">
-    </u:SetEnable>
+   <u:$TR064_service_command xmlns:u="$TR064_service_type">
+   </u:$TR064_service_command>
   </s:Body>
 </s:Envelope>
 EOD
@@ -1242,7 +1269,7 @@ EOD
     
     my ($err, $data)    = HttpUtils_BlockingGet($param);
 
-    if ($err ne "")
+    if($err ne "")
     {
         Log3 $name, 3, "FB_CALLMONITOR ($name) - error while requesting phonebooks: $err";
         return "error while requesting phonebooks: $err";
@@ -1255,7 +1282,13 @@ EOD
     }
     
     Log3 $name, 5, "FB_CALLMONITOR ($name) - received TR-064 challenge response:\n$data";
-
+      
+    unless($data =~ /<Nonce>/i and $data =~ /<Realm>/i)
+    {
+        Log3 $name, 3, "FB_CALLMONITOR ($name) - received no valid TR-064 challenge response. aborting";
+        return  "received no valid TR-064 challenge response. aborting";
+    }
+    
     my ($nonce, $realm);
     
     if($data =~ m,<Nonce>(.+?)</Nonce>,i)
@@ -1348,7 +1381,7 @@ EOD
 
     my $phb_id;
 
-    $TR064_service_command = "GetPhonebook"; # TR-064 Support � X_AVM-DE_OnTel: GetPhonebook Urls
+    $TR064_service_command = "GetPhonebook"; # TR-064 Support - X_AVM-DE_OnTel: GetPhonebook Urls
     $param->{header} = "SOAPACTION: $TR064_service_type#$TR064_service_command\r\nContent-Type: text/xml; charset=utf-8";
 
     # request name and FritzBox phone id for each list item
@@ -1612,20 +1645,7 @@ sub FB_CALLMONITOR_storePassword($$)
     my $index = $hash->{TYPE}."_".$hash->{NAME}."_passwd";
     my $key = getUniqueId().$index;
     
-    my $enc_pwd = "";
-    
-    if(eval "use Digest::MD5;1")
-    {
-        $key = Digest::MD5::md5_hex(unpack "H*", $key);
-        $key .= Digest::MD5::md5_hex($key);
-    }
-    
-    for my $char (split //, $password)
-    {
-        my $encode=chop($key);
-        $enc_pwd.=sprintf("%.2x",ord($char)^ord($encode));
-        $key=$encode.$key;
-    }
+    my (undef, $enc_pwd) = FB_CALLMONITOR_encrypt($password, $key);
     
     my $err = FB_CALLMONITOR_readPhonebook($hash, $enc_pwd);
     
@@ -1668,20 +1688,7 @@ sub FB_CALLMONITOR_readPassword($;$)
     
     if(defined($password))
     {
-        if(eval "use Digest::MD5;1")
-        {
-            $key = Digest::MD5::md5_hex(unpack "H*", $key);
-            $key .= Digest::MD5::md5_hex($key);
-        }
-
-        my $dec_pwd = '';
-        
-        for my $char (map { pack('C', hex($_)) } ($password =~ /(..)/g))
-        {
-            my $decode=chop($key);
-            $dec_pwd.=chr(ord($char)^ord($decode));
-            $key=$decode.$key;
-        }
+        my (undef, $dec_pwd) = FB_CALLMONITOR_decrypt($password, $key);
         
         return $dec_pwd if($hash->{helper}{READ_PWD});
     }
@@ -1697,18 +1704,17 @@ sub FB_CALLMONITOR_readPassword($;$)
 # normalizes a formated phone number
 sub FB_CALLMONITOR_normalizePhoneNumber($$)
 {
-
     my ($hash, $number) = @_;
     my $name = $hash->{NAME};
     
     my $area_code = AttrVal($name, "local-area-code", "");
     my $country_code = AttrVal($name, "country-code", "0049");
     
-    $number =~ s/\s//g;                             # Remove spaces
-    $number =~ s/^(\#[0-9]{1,10}\#)//g;             # Remove phone control codes
-    $number =~ s/^\+/00/g;                          # Convert leading + to 00 country extension
-    $number =~ s/[^*\d]//g if(not $number =~ /@/);  # Remove anything else isn't a number if it is no VoIP number
-    $number =~ s/^$country_code/0/g;                # Replace own country code with leading 0
+    $number =~ s/\s//g;                         # Remove spaces
+    $number =~ s/^(\#[0-9]{1,10}\#)//g;         # Remove phone control codes
+    $number =~ s/^\+/00/g;                      # Convert leading + to 00 country extension
+    $number =~ s/\D//g if(not $number =~ /@/);  # Remove anything else isn't a number if it is no VoIP number
+    $number =~ s/^$country_code/0/g;            # Replace own country code with leading 0
 
     if(not $number =~ /^0/ and not $number =~ /@/ and $area_code =~ /^0[1-9]\d+$/) 
     {
@@ -1718,9 +1724,62 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     return $number;
 }
 
+#####################################
+# decrypt an encrypted password
+sub FB_CALLMONITOR_decrypt($$)
+{
+    my ($password, $key) = @_;
+    
+    return undef unless(defined($password));
+    
+    if(eval "use Digest::MD5;1")
+    {
+        $key = Digest::MD5::md5_hex(unpack "H*", $key);
+        $key .= Digest::MD5::md5_hex($key);
+    }
+
+    my $dec_pwd = '';
+    
+    for my $char (map { pack('C', hex($_)) } ($password =~ /(..)/g))
+    {
+        my $decode=chop($key);
+        $dec_pwd.=chr(ord($char)^ord($decode));
+        $key=$decode.$key;
+    }
+    
+    return (undef, $dec_pwd);
+}
+
+#####################################
+# encrypts a password
+sub FB_CALLMONITOR_encrypt($$)
+{
+    my ($password, $key) = @_;
+   
+    return undef unless(defined($password));
+    
+    if(eval "use Digest::MD5;1")
+    {
+        $key = Digest::MD5::md5_hex(unpack "H*", $key);
+        $key .= Digest::MD5::md5_hex($key);
+    }
+    
+    my $enc_pwd = '';
+    
+    for my $char (split //, $password)
+    {
+        my $encode=chop($key);
+        $enc_pwd.=sprintf("%.2x",ord($char)^ord($encode));
+        $key=$encode.$key;
+    }
+    
+    return (undef, $enc_pwd);
+}
+
 1;
 
 =pod
+=item helper
 =begin html
 
 <a name="FB_CALLMONITOR"></a>
@@ -1782,7 +1841,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     <li><a name="FB_CALLMONITOR_disable">disable</a> 0,1</li>
 	Optional attribute to disable the Callmonitor. When disabled, no phone events can be detected.
 	<br><br>
-	Possible values: 0 => Callmonitor is activated, 1 => Callmonitor is deactivated.<br>
+	Possible values: 0 =&gt; Callmonitor is activated, 1 =&gt; Callmonitor is deactivated.<br>
     Default Value is 0 (activated)<br><br>
     <li><a name="FB_CALLMONITOR_disabledForIntervals">disabledForIntervals</a> HH:MM-HH:MM HH:MM-HH-MM...</li>
     Optional attribute to disable FB_CALLMONITOR during specific time intervals. The attribute contains a space separated list of HH:MM tupels.
@@ -1794,7 +1853,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     <li><a name="FB_CALLMONITOR_answMachine-is-missed-call">answMachine-is-missed-call</a> 0,1</li>
     If activated, a incoming call, which is answered by an answering machine, will be treated as missed call (see <a href="#FB_CALLMONITOR_events">Generated Events</a>).
     <br><br>
-    Possible values: 0 => disabled, 1 => enabled (answering machine calls will be treated as "missed call").<br>
+    Possible values: 0 =&gt; disabled, 1 =&gt; enabled (answering machine calls will be treated as "missed call").<br>
     Default Value is 0 (disabled)<br><br>
     <li><a name="FB_CALLMONITOR_reverse-search">reverse-search</a> (phonebook,textfile,klicktel.de,dasoertliche.de,search.ch,dasschnelle.at)</li>
     Enables the reverse searching of the external number (at dial and call receiving).
@@ -1804,7 +1863,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     <li><a name="FB_CALLMONITOR_reverse-search-cache">reverse-search-cache</a> 0,1</li>
     If this attribute is activated each reverse-search result from an internet provider is saved in an internal cache
     and will be used instead of requesting each internet provider every time with the same number. The cache only contains reverse-search results from internet providers.<br><br>
-    Possible values: 0 => off , 1 => on<br>
+    Possible values: 0 =&gt; off , 1 =&gt; on<br>
     Default Value is 0 (off)<br><br>
     <li><a name="FB_CALLMONITOR_reverse-search-cache-file">reverse-search-cache-file</a> &lt;file&gt;</li>
     Write the internal reverse-search-cache to the given file and use it next time FHEM starts.
@@ -1825,11 +1884,11 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     Default value is /var/flash/phonebook (phonebook filepath on FritzBox)<br><br>
     <li><a name="FB_CALLMONITOR_remove-leading-zero">remove-leading-zero</a> 0,1</li>
     If this attribute is activated, a leading zero will be removed from the external number (e.g. in telefon systems).<br><br>
-    Possible values: 0 => off , 1 => on<br>
+    Possible values: 0 =&gt; off , 1 =&gt; on<br>
     Default Value is 0 (off)<br><br>
     <li><a name="FB_CALLMONITOR_unique-call-ids">unique-call-ids</a> 0,1</li>
     If this attribute is activated, each call will use a biunique call id. So each call can be separated from previous calls in the past.<br><br>
-    Possible values: 0 => off , 1 => on<br>
+    Possible values: 0 =&gt; off , 1 =&gt; on<br>
     Default Value is 0 (off)<br><br>
     <li><a name="FB_CALLMONITOR_local-area-code">local-area-code</a> &lt;number&gt;</li>
     Use the given local area code for reverse search in case of a local call (e.g. 0228 for Bonn, Germany)<br><br>
@@ -1838,7 +1897,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     Default Value is 0049 (Germany)<br><br>
     <li><a name="FB_CALLMONITOR_fritzbox-remote-phonebook">fritzbox-remote-phonebook</a> 0,1</li>
     If this attribute is activated, the phonebook should be obtained direct from the FritzBox via remote network connection (in case FHEM is not running on a FritzBox). This is only possible if a password (and depending on configuration a username as well) is configured.<br><br>
-    Possible values: 0 => off , 1 => on (use remote telnet connection to obtain FritzBox phonebook)<br>
+    Possible values: 0 =&gt; off , 1 =&gt; on (use remote telnet connection to obtain FritzBox phonebook)<br>
     Default Value is 0 (off)<br><br>
     <li><a name="FB_CALLMONITOR_fritzbox-remote-phonebook-via">fritzbox-remote-phonebook-via</a> tr064,web,telnet</li>
     Set the method how the phonebook should be requested via network. When set to "web", the phonebook is obtained from the web interface via HTTP. When set to "telnet", it uses a telnet connection to login and retrieve the phonebook (telnet must be activated via dial shortcode #96*7*). When set to "tr064" the phonebook is obtained via TR-064 SOAP request.<br><br>
@@ -1861,7 +1920,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
   <li><b>external_name</b> - The result of the reverse lookup of the external_number via internet. Is only available if reverse-search is activated. Special values are "unknown" (no search results found) and "timeout" (got timeout while search request). In case of an timeout and activated caching, the number will be searched again next time a call occurs with the same number</li>
   <li><b>internal_number</b> - The internal number (fixed line, VoIP number, ...) on which the participant is calling (event: ring) or is used for calling (event: call)</li>
   <li><b>internal_connection</b> - The internal connection (FON1, FON2, ISDN, DECT, ...) which is used to take or perform the call</li>
-  <li><b>external_connection</b> - The external connection (fixed line, VoIP account) which is used to take or perform the call</li>
+  <li><b>external_connection</b> - The external connection ("POTS" =&gt; fixed line, "SIPx" =&gt; VoIP account, "ISDN", "GSM" =&gt; mobile call via GSM/UMTS stick) which is used to take or perform the call</li>
   <li><b>call_duration</b> - The call duration in seconds. Is only generated at a disconnect event. The value 0 means, the call was not taken by anybody.</li>
   <li><b>call_id</b> - The call identification number to separate events of two or more different calls at the same time. This id number is equal for all events relating to one specific call.</li>
   <li><b>missed_call</b> - This event will be raised in case of a incoming call, which is not answered. If available, also the name of the calling number will be displayed.</li>
@@ -1935,7 +1994,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     <li><a name="FB_CALLMONITOR_disable">disable</a> 0,1</li>
 	Optionales Attribut zur Deaktivierung des Callmonitors. Es k&ouml;nnen dann keine Anruf-Events mehr erkannt und erzeugt werden.
 	<br><br>
-	M&ouml;gliche Werte: 0 => Callmonitor ist aktiv, 1 => Callmonitor ist deaktiviert.<br>
+	M&ouml;gliche Werte: 0 =&gt; Callmonitor ist aktiv, 1 =&gt; Callmonitor ist deaktiviert.<br>
     Standardwert ist 0 (aktiv)<br><br>
     <li><a name="FB_CALLMONITOR_disabledForIntervals">disabledForIntervals</a> HH:MM-HH:MM HH:MM-HH-MM...</li>
     Optionales Attribut zur Deaktivierung des Callmonitors innerhalb von bestimmten Zeitintervallen.
@@ -1948,7 +2007,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     <li><a name="FB_CALLMONITOR_answMachine-is-missed-call">answMachine-is-missed-call</a> 0,1</li>
     Sofern aktiviert, werden Anrufe, welche durch einen internen Anrufbeantworter beantwortet werden, als "unbeantworteter Anruf" gewertet (siehe Reading "missed_call" unter <a href="#FB_CALLMONITOR_events">Generated Events</a>).
     <br><br>
-    M&ouml;gliche Werte: 0 => deaktiviert, 1 => aktiviert (Anrufbeantworter gilt als "unbeantworteter Anruf").<br>
+    M&ouml;gliche Werte: 0 =&gt; deaktiviert, 1 =&gt; aktiviert (Anrufbeantworter gilt als "unbeantworteter Anruf").<br>
     Standardwert ist 0 (deaktiviert)<br><br>
     <li><a name="FB_CALLMONITOR_reverse-search">reverse-search</a> (phonebook,klicktel.de,dasoertliche.de,search.ch,dasschnelle.at)</li>
     Aktiviert die R&uuml;ckw&auml;rtssuche der externen Rufnummer (bei eingehenden/ausgehenden Anrufen).
@@ -1963,7 +2022,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     Wenn dieses Attribut gesetzt ist, werden alle Ergebisse von Internetanbietern in einem modul-internen Cache gespeichert
     und alle existierenden Ergebnisse aus dem Cache genutzt anstatt eine erneute Anfrage bei einem Internet-Anbieter durchzuf&uuml;hren. 
     Der Cache ist immer an die Internetanbieter gekoppelt und speichert nur Ergebnisse von Internetanbietern.<br><br>
-    M&ouml;gliche Werte: 0 => deaktiviert , 1 => aktiviert<br>
+    M&ouml;gliche Werte: 0 =&gt; deaktiviert , 1 =&gt; aktiviert<br>
     Standardwert ist 0 (deaktiviert)<br><br>
     <li><a name="FB_CALLMONITOR_reverse-search-cache-file">reverse-search-cache-file</a> &lt;Dateipfad&gt;</li>
     Da der Cache nur im Arbeitsspeicher existiert, ist er nicht persistent und geht beim stoppen von FHEM verloren.
@@ -1987,11 +2046,11 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     Standardwert ist /var/flash/phonebook (entspricht dem Pfad auf einer FritzBox)<br><br>
     <li><a name="FB_CALLMONITOR_remove-leading-zero">remove-leading-zero</a> 0,1</li>
     Wenn dieses Attribut aktiviert ist, wird die f&uuml;hrende Null aus der externen Rufnummer (bei eingehenden & abgehenden Anrufen) entfernt. Dies ist z.B. notwendig bei Telefonanlagen.<br><br>
-    M&ouml;gliche Werte: 0 => deaktiviert , 1 => aktiviert<br>
+    M&ouml;gliche Werte: 0 =&gt; deaktiviert , 1 =&gt; aktiviert<br>
     Standardwert ist 0 (deaktiviert)<br><br>
     <li><a name="FB_CALLMONITOR_unique-call-ids">unique-call-ids</a> 0,1</li>
     Wenn dieses Attribut aktiviert ist, wird f&uuml;r jedes Gespr&auml;ch eine eineindeutige Identifizierungsnummer verwendet. Dadurch lassen sich auch bereits beendete Gespr&auml;che voneinander unterscheiden. Dies ist z.B. notwendig bei der Verarbeitung der Events durch eine Datenbank.<br><br>
-    M&ouml;gliche Werte: 0 => deaktiviert , 1 => aktiviert<br>
+    M&ouml;gliche Werte: 0 =&gt; deaktiviert , 1 =&gt; aktiviert<br>
     Standardwert ist 0 (deaktiviert)<br><br>
     <li><a name="FB_CALLMONITOR_local-area-code">local-area-code</a> &lt;Ortsvorwahl&gt;</li>
     Verwendet die gesetze Vorwahlnummer bei R&uuml;ckw&auml;rtssuchen von Ortsgespr&auml;chen (z.B. 0228 f&uuml;r Bonn)<br><br>
@@ -2000,7 +2059,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
     Standardwert ist 0049 (Deutschland)<br><br>
     <li><a name="FB_CALLMONITOR_fritzbox-remote-phonebook">fritzbox-remote-phonebook</a> 0,1</li>
     Wenn dieses Attribut aktiviert ist, wird das FritzBox Telefonbuch direkt von der FritzBox gelesen. Dazu ist das FritzBox Passwort und je nach FritzBox Konfiguration auch ein Username notwendig, der in den entsprechenden Attributen konfiguriert sein muss.<br><br>
-    M&ouml;gliche Werte: 0 => deaktiviert , 1 => aktiviert<br>
+    M&ouml;gliche Werte: 0 =&gt; deaktiviert , 1 =&gt; aktiviert<br>
     Standardwert ist 0 (deaktiviert)<br><br>  
     <li><a name="FB_CALLMONITOR_fritzbox-remote-phonebook-via">fritzbox-remote-phonebook-via</a> tr064,web,telnet</li>
     Setzt die Methode mit der das Telefonbuch von der FritzBox abgefragt werden soll. Bei der Methode "web", werden alle verf&uuml;gbaren Telefonb&uuml;cher (lokales sowie alle konfigurierten Online-Telefonb&uuml;cher) &uuml;ber die Web-Oberfl&auml;che eingelesen. Bei der Methode "telnet" wird eine Telnet-Verbindung zur FritzBox aufgebaut um das lokale Telefonbuch abzufragen (keine Online-Telefonb&uuml;cher). Dazu muss die Telnet-Funktion aktiviert sein (Telefon Kurzwahl: #96*7*). Bei der Methode "tr064" werden alle verf&uuml;gbaren Telefonb&uuml;cher &uuml;ber die TR-064 SOAP Schnittstelle ausgelesen. <br><br>
@@ -2023,7 +2082,7 @@ sub FB_CALLMONITOR_normalizePhoneNumber($$)
   <li><b>external_name</b> - Das Ergebniss der R&uuml;ckw&auml;rtssuche (sofern aktiviert). Im Fehlerfall kann diese Reading auch den Inhalt "unknown" (keinen Eintrag gefunden) enthalten. Im Falle einer Zeit&uuml;berschreitung bei der R&uuml;ckw&auml;rtssuche und aktiviertem Caching, wird die Rufnummer beim n&auml;chsten Mal erneut gesucht.</li>
   <li><b>internal_number</b> - Die interne Rufnummer (Festnetz, VoIP-Nummer, ...) auf welcher man angerufen wird (event: ring) oder die man gerade nutzt um jemanden anzurufen (event: call)</li>
   <li><b>internal_connection</b> - Der interne Anschluss an der Fritz!Box welcher genutzt wird um das Gespr&auml;ch durchzuf&uuml;hren (FON1, FON2, ISDN, DECT, ...)</li>
-  <li><b>external_connection</b> - Der externe Anschluss welcher genutzt wird um das Gespr&auml;ch durchzuf&uuml;hren  (Festnetz, VoIP Nummer, ...)</li>
+  <li><b>external_connection</b> - Der externe Anschluss welcher genutzt wird um das Gespr&auml;ch durchzuf&uuml;hren  ("POTS" =&gt; analoges Festnetz, "SIPx" =&gt; VoIP Nummer, "ISDN", "GSM" =&gt; Mobilfunk via GSM/UMTS-Stick)</li>
   <li><b>call_duration</b> - Die Gespr&auml;chsdauer in Sekunden. Dieser Wert wird nur bei einem disconnect-Event erzeugt. Ist der Wert 0, so wurde das Gespr&auml;ch von niemandem angenommen.</li>
   <li><b>call_id</b> - Die Identifizierungsnummer eines einzelnen Gespr&auml;chs. Dient der Zuordnung bei zwei oder mehr parallelen Gespr&auml;chen, damit alle Events eindeutig einem Gespr&auml;ch zugeordnet werden k&ouml;nnen</li>
   <li><b>missed_call</b> - Dieses Event wird nur generiert, wenn ein eingehender Anruf nicht beantwortet wird. Sofern der Name dazu bekannt ist, wird dieser ebenfalls mit angezeigt.</li>

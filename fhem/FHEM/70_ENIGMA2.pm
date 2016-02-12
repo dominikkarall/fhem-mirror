@@ -1002,7 +1002,7 @@ sub ENIGMA2_ReceiveCommand($$$) {
 
             $presence = "absent";
             readingsBulkUpdate( $hash, "presence", $presence )
-              if ( readingsBulkUpdate( $hash, "presence", "" ) ne $presence );
+              if ( ReadingsVal( $name, "presence", "" ) ne $presence );
         }
     }
 
@@ -1010,7 +1010,7 @@ sub ENIGMA2_ReceiveCommand($$$) {
     elsif ($data) {
         $presence = "present";
         readingsBulkUpdate( $hash, "presence", $presence )
-          if ( readingsBulkUpdate( $hash, "presence", "" ) ne $presence );
+          if ( ReadingsVal( $name, "presence", "" ) ne $presence );
 
         if ( !defined($cmd) || $cmd eq "" ) {
             Log3 $name, 4, "ENIGMA2 $name: RCV $service";
@@ -2819,7 +2819,7 @@ sub ENIGMA2_GetRemotecontrolCommand($) {
 1;
 
 =pod
-
+=item device
 =begin html
 
     <p>

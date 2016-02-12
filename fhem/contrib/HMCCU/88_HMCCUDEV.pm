@@ -4,14 +4,15 @@
 #
 #  $Id:$
 #
-#  Version 2.4
+#  Version 2.6
 #
-#  (c) 2015 zap (zap01 <at> t-online <dot> de)
+#  (c) 2016 zap (zap01 <at> t-online <dot> de)
 #
 ################################################################
 #
 #  define <name> HMCCUDEV <ccudev> [readonly]
 #
+#  set <name> control <value>
 #  set <name> datapoint <channel>.<datapoint> <value>
 #  set <name> devstate <value>
 #  set <name> <stateval_cmds>
@@ -27,6 +28,7 @@
 #  attr <name> ccureadings { 0 | 1 }
 #  attr <name> ccureadingformat { address | name }
 #  attr <name> ccureadingfilter <regexp>
+#  attr <name> controldatapoint <channel>.<datapoint>
 #  attr <name> statechannel <channel>
 #  attr <name> statedatapoint <datapoint>
 #  attr <name> statevals <text1>:<subtext1>[,...]
@@ -64,7 +66,7 @@ sub HMCCUDEV_Initialize ($)
 	$hash->{GetFn} = "HMCCUDEV_Get";
 	$hash->{AttrFn} = "HMCCUDEV_Attr";
 
-	$hash->{AttrList} = "IODev ccureadingfilter ccureadingformat:name,address ccureadings:0,1 ccustate statevals substitute statechannel statedatapoint stripnumber:0,1,2 loglevel:0,1,2,3,4,5,6 ". $readingFnAttributes;
+	$hash->{AttrList} = "IODev ccureadingfilter ccureadingformat:name,address ccureadings:0,1 ccustate ccuget:State,Value statevals substitute statechannel statedatapoint controldatapoint stripnumber:0,1,2 loglevel:0,1,2,3,4,5,6 ". $readingFnAttributes;
 }
 
 #####################################
@@ -83,6 +85,8 @@ sub HMCCUDEV_Define ($@)
 	my $devname = shift @a;
 	my $devtype = shift @a;
 	my $devspec = shift @a;
+
+	return "Invalid or unknown CCU device name or address" if (! HMCCU_IsValidDevice ($devspec));
 
 	if ($devspec =~ /^(.+)\.([A-Z]{3,3}[0-9]{7,7})$/) {
 		# CCU Device address with interface
@@ -134,6 +138,7 @@ sub HMCCUDEV_Define ($@)
 	AssignIoPort ($hash);
 
 	readingsSingleUpdate ($hash, "state", "Initialized", 1);
+	$hash->{ccudevstate} = 'Active';
 
 	return undef;
 }
@@ -192,6 +197,7 @@ sub HMCCUDEV_Set ($@)
 	my $statechannel = AttrVal ($name, "statechannel", '');
 	my $statedatapoint = AttrVal ($name, "statedatapoint", 'STATE');
 	my $statevals = AttrVal ($name, "statevals", '');
+	my $controldatapoint = AttrVal ($name, "controldatapoint", '');
 
 	my $hmccu_hash = $hash->{IODev};
 	my $hmccu_name = $hash->{IODev}->{NAME};
@@ -216,6 +222,16 @@ sub HMCCUDEV_Set ($@)
 
 		usleep (100000);
 		($rc, $result) = HMCCU_GetDatapoint ($hash, $objname);
+		return HMCCUDEV_SetError ($hash, $rc) if ($rc < 0);
+
+		HMCCU_SetState ($hash, "OK");
+		return undef;
+	}
+	elsif ($opt eq 'control') {
+		return HMCCUDEV_SetError ($hash, "Attribute control datapoint not set") if ($controldatapoint eq '');
+		my $objvalue = shift @a;
+		my $objname = $hash->{ccuif}.'.'.$hash->{ccuaddr}.':'.$controldatapoint;
+		$rc = HMCCU_SetDatapoint ($hash, $objname, $objvalue);
 		return HMCCUDEV_SetError ($hash, $rc) if ($rc < 0);
 
 		HMCCU_SetState ($hash, "OK");
@@ -255,7 +271,7 @@ sub HMCCUDEV_Set ($@)
 		return undef;
 	}
 	else {
-		my $retmsg = "HMCCUDEV: Unknown argument $opt, choose one of config datapoint";
+		my $retmsg = "HMCCUDEV: Unknown argument $opt, choose one of config control datapoint";
 		return undef if ($hash->{statevals} eq 'readonly');
 
 		if ($statechannel ne '') {
@@ -346,13 +362,23 @@ sub HMCCUDEV_Get ($@)
 		return $ccureadings ? undef : $result;
 	}
 	elsif ($opt eq 'update') {
-		$rc = HMCCU_GetUpdate ($hash, $hash->{ccuaddr});
+		my $ccuget = shift @a;
+		$ccuget = 'Attr' if (!defined ($ccuget));
+		if ($ccuget !~ /^(Attr|State|Value)$/) {
+			return HMCCUDEV_SetError ($hash, "Usage: get $name update [{'State'|'Value'}]");
+		}
+		$rc = HMCCU_GetUpdate ($hash, $hash->{ccuaddr}, $ccuget);
 		return HMCCUDEV_SetError ($hash, $rc) if ($rc < 0);
 
 		return undef;
 	}
 	elsif ($opt eq 'deviceinfo') {
-		$result = HMCCU_GetDeviceInfo ($hash, $hash->{ccuaddr});
+		my $ccuget = shift @a;
+		$ccuget = 'Attr' if (!defined ($ccuget));
+		if ($ccuget !~ /^(Attr|State|Value)$/) {
+			return HMCCUDEV_SetError ($hash, "Usage: get $name deviceinfo [{'State'|'Value'}]");
+		}
+		$result = HMCCU_GetDeviceInfo ($hash, $hash->{ccuaddr}, $ccuget);
 		return HMCCUDEV_SetError ($hash, -2) if ($result eq '');
 		return $result;
 	}
@@ -397,7 +423,8 @@ sub HMCCUDEV_SetError ($$)
         my %errlist = (
            -1 => 'Channel name or address invalid',
            -2 => 'Execution of CCU script failed',
-           -3 => 'Cannot detect IO device'
+           -3 => 'Cannot detect IO device',
+	   -4 => 'Device deleted in CCU'
         );
 
         if (exists ($errlist{$text})) {
@@ -501,9 +528,11 @@ sub HMCCUDEV_SetError ($$)
          <br/>
          Get description of configuration parameters for CCU device.
       </li><br/>
-      <li>get &lt;name&gt; update
-         <br/>
+      <li>get &lt;name&gt; update [{'State'|'Value'}]<br/>
          Update datapoints / readings of device.
+      </li><br/>
+      <li>get &lt;name&gt; deviceinfo [{'State'|'Value'}]<br/>
+         Display all channels and datapoints of device.
       </li>
    </ul>
    <br/>
@@ -512,18 +541,29 @@ sub HMCCUDEV_SetError ($$)
    <b>Attributes</b><br/>
    <br/>
    <ul>
-      <li>ccureadings &lt;0 | 1&gt;
-         <br/>
-            If set to 1 values read from CCU will be stored as readings.
+      <li>ccuget &lt;State | <u>Value</u>&gt;<br/>
+         Set read access method for CCU channel datapoints. Method 'State' is slower than 'Value' because
+         each request is sent to the device. With method 'Value' only CCU is queried. Default is 'Value'.
+      </li><br/>
+      <li>ccureadings &lt;0 | <u>1</u>&gt;<br/>
+         If set to 1 values read from CCU will be stored as readings. Default is 1.
       </li><br/>
       <li>ccureadingfilter &lt;datapoint-expr&gt;
          <br/>
             Only datapoints matching specified expression are stored as
             readings.
       </li><br/>
-      <li>ccureadingformat &lt;address | name&gt;
-         <br/>
-            Set format of readings. Default is 'name'.
+      <li>ccureadingformat &lt;address | name&gt; <br/>
+         Set format of readings. Default is 'name'.
+      </li><br/>
+      <li>controldatapoint &lt;channel-number.datapoint&gt;<br/>
+         Set datapoint for device control. Can be use to realize user defined control elements for
+         setting control datapoint. For example if datapoint of thermostat control is
+         2.SET_TEMPERATURE one can define a slider for setting the destination temperature with
+         following attributes:<br/><br/>
+         attr mydev controldatapoint 2.SET_TEMPERATURE
+         attr mydev webCmd control
+         attr mydev widgetOverride control:slider,10,1,25
       </li><br/>
       <li>statechannel &lt;channel-number&gt;
          <br/>

@@ -1,3 +1,26 @@
+########################################################################################
+#
+# ControlPoint.pm
+#
+# $Id$
+#
+# Now (in this version) part of Fhem.
+#
+# Fhem is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# Fhem is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with fhem.  If not, see <http://www.gnu.org/licenses/>.
+#
+########################################################################################
+
 package UPnP::ControlPoint;
 
 use 5.006;
@@ -270,7 +293,9 @@ sub _createDevice {
 	# We've found examples of where devices claim to do transfer
 	# encoding, but wind up sending chunks without chunk size headers.
 	# This code temporarily disables the TE header in the request.
-	push(@LWP::Protocol::http::EXTRA_SOCK_OPTS, SendTE => 0);
+	#push(@LWP::Protocol::http::EXTRA_SOCK_OPTS, SendTE => 0);
+	my @SOCK_OPTS_Backup = @LWP::Protocol::http::EXTRA_SOCK_OPTS;
+	_addSendTE();
 	my $ua = LWP::UserAgent->new(timeout => 20);
 	my $response = $ua->get($location);
 
@@ -280,9 +305,11 @@ sub _createDevice {
 													  {Location => $location},
 													  {ControlPoint => $self});
 	} else {
+		carp('400-URL-Absolute-Error! Location: "'.$location.'", Content: "'.$response->content.'"') if ($response->code == 400);
 		carp("Loading device description failed with error: " . $response->code . " " . $response->message) if ($response->code != 200);
 	}
-	pop(@LWP::Protocol::http::EXTRA_SOCK_OPTS);
+	#pop(@LWP::Protocol::http::EXTRA_SOCK_OPTS);
+	@LWP::Protocol::http::EXTRA_SOCK_OPTS = @SOCK_OPTS_Backup;
 
 	if ($device) {
 		$device->base($base ? $base : $location);
@@ -292,6 +319,12 @@ sub _createDevice {
 	}
 
 	return $device;
+}
+
+sub _addSendTE {
+	my %arg = @LWP::Protocol::http::EXTRA_SOCK_OPTS;
+	$arg{SendTE} = 0;
+	@LWP::Protocol::http::EXTRA_SOCK_OPTS = %arg;
 }
 
 sub _getDeviceFromHeaders {
@@ -740,7 +773,10 @@ sub _loadDescription {
 	}
 	my $parser = $cp->parser;
 
-	push(@LWP::Protocol::http::EXTRA_SOCK_OPTS, SendTE => 0);
+	#push(@LWP::Protocol::http::EXTRA_SOCK_OPTS, SendTE => 0);
+	my @SOCK_OPTS_Backup = @LWP::Protocol::http::EXTRA_SOCK_OPTS;
+	_addSendTE();
+	
 	my $ua = LWP::UserAgent->new(timeout => 20);
 	my $response = $ua->get($location);
 	
@@ -751,9 +787,16 @@ sub _loadDescription {
 		carp("Error loading SCPD document: $!");
 	}
 
-	pop(@LWP::Protocol::http::EXTRA_SOCK_OPTS);
+	#pop(@LWP::Protocol::http::EXTRA_SOCK_OPTS);
+	@LWP::Protocol::http::EXTRA_SOCK_OPTS = @SOCK_OPTS_Backup;
 
 	$self->{_loadedDescription} = 1;
+}
+
+sub _addSendTE {
+	my %arg = @LWP::Protocol::http::EXTRA_SOCK_OPTS;
+	$arg{SendTE} = 0;
+	@LWP::Protocol::http::EXTRA_SOCK_OPTS = %arg;
 }
 
 # ----------------------------------------------------------------------

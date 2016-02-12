@@ -67,8 +67,10 @@ sub GDS_Initialize($) {
 
 	$hash->{DefFn}		=	"GDS_Define";
 	$hash->{UndefFn}	=	"GDS_Undef";
+	$hash->{DeleteFn}	=	"GDS_Delete";
 	$hash->{GetFn}		=	"GDS_Get";
 	$hash->{SetFn}		=	"GDS_Set";
+	$hash->{RenameFn}	=	"GDS_Rename";
 	$hash->{ShutdownFn}	=	"GDS_Shutdown";
 #	$hash->{NotifyFn}   =   "GDS_Notify";
 	$hash->{NOTIFYDEV}  =   "global";
@@ -289,13 +291,22 @@ sub GDS_Define($$$) {
 	my $name = $hash->{NAME};
 	my @a = split("[ \t][ \t]*", $def);
 
-	return "syntax: define <name> GDS <username> <password> [<host>]" if(int(@a) != 4 ); 
-#	return "You must not define more than one gds device!" if int(devspec2array('TYPE=GDS'));
+	my $skuser = getKeyValue($name."_user");
+	my $skpass = getKeyValue($name."_pass");
+	my $skhost = getKeyValue($name."_host");
 
-	$hash->{helper}{USER}		= $a[2];
-	$hash->{helper}{PASS}		= $a[3];
+	unless(defined($skuser) && defined($skpass)) {
+		return "syntax: define <name> GDS <username> <password> [<host>]" if(int(@a) < 4 ); 
+	}
+
 	$hash->{helper}{URL}		= defined($a[4]) ? $a[4] : "ftp-outgoing2.dwd.de";
 	$hash->{helper}{INTERVAL}   = 1200;
+
+	setKeyValue($name."_user",$a[2]) unless(defined($skuser));
+	setKeyValue($name."_pass",$a[3]) unless(defined($skpass));
+	setKeyValue($name."_host",$hash->{helper}{URL}) unless(defined($skhost));
+
+	$hash->{DEF} = undef;
 
 	Log3($name, 4, "GDS $name: created");
 	Log3($name, 4, "GDS $name: tempDir=".$tempDir);
@@ -315,6 +326,26 @@ sub GDS_Undef($$) {
 	RemoveInternalTimer($hash);
     my $url = '/gds';
     delete $data{FWEXT}{$url} if int(devspec2array('TYPE=GDS')) == 1;
+	return undef;
+}
+
+sub GDS_Delete() {
+	my ($hash, $arg) = @_;
+	my $name = $hash->{NAME};
+	setKeyValue($name."_user",undef);
+	setKeyValue($name."_pass",undef);
+	setKeyValue($name."_host",undef);
+}
+
+sub GDS_Rename() {
+	my ($new,$old) = @_;
+	setKeyValue($new."_user",getKeyValue($old."_user"));
+	setKeyValue($new."_pass",getKeyValue($old."_pass"));
+	setKeyValue($new."_host",getKeyValue($old."_host"));
+
+	setKeyValue($old."_user",undef);
+	setKeyValue($old."_pass",undef);
+	setKeyValue($old."_host",undef);
 	return undef;
 }
 
@@ -1208,9 +1239,9 @@ sub retrieveData($$){
 sub _retrieveFILE {
 	my ($hash)		= shift;
 	my $name		= $hash->{NAME};
-	my $user		= $hash->{helper}{USER};
-	my $pass		= $hash->{helper}{PASS};
-	my $host		= $hash->{helper}{URL};
+	my $user		= getKeyValue($name."_user");
+	my $pass		= getKeyValue($name."_pass");
+	my $host		= getKeyValue($name."_host");
 	my $proxyName	= AttrVal($name, "gdsProxyName", "");
 	my $proxyType	= AttrVal($name, "gdsProxyType", "");
 	my $passive		= AttrVal($name, "gdsPassiveFtp", 1);
@@ -1270,9 +1301,9 @@ sub _abortedFILE {
 sub _retrieveCONDITIONS {
 	my ($hash)		= shift;
 	my $name		= $hash->{NAME};
-	my $user		= $hash->{helper}{USER};
-	my $pass		= $hash->{helper}{PASS};
-	my $host		= $hash->{helper}{URL};
+	my $user		= getKeyValue($name."_user");
+	my $pass		= getKeyValue($name."_pass");
+	my $host		= getKeyValue($name."_host");
 	my $proxyName	= AttrVal($name, "gdsProxyName", "");
 	my $proxyType	= AttrVal($name, "gdsProxyType", "");
 	my $passive		= AttrVal($name, "gdsPassiveFtp", 1);
@@ -1359,9 +1390,9 @@ sub _abortedCONDITIONS {
 sub _retrieveCAPDATA {
 	my ($hash)		= shift;
 	my $name		= $hash->{NAME};
-	my $user		= $hash->{helper}{USER};
-	my $pass		= $hash->{helper}{PASS};
-	my $host		= $hash->{helper}{URL};
+	my $user		= getKeyValue($name."_user");
+	my $pass		= getKeyValue($name."_pass");
+	my $host		= getKeyValue($name."_host");
 	my $proxyName	= AttrVal($name, "gdsProxyName", "");
 	my $proxyType	= AttrVal($name, "gdsProxyType", "");
 	my $passive		= AttrVal($name, "gdsPassiveFtp", 1);
@@ -1584,9 +1615,9 @@ sub __findCAPWarnCellId($$){
 sub _retrieveFORECAST {
 	my ($hash)		= shift;
 	my $name		= $hash->{NAME};
-	my $user		= $hash->{helper}{USER};
-	my $pass		= $hash->{helper}{PASS};
-	my $host		= $hash->{helper}{URL};
+	my $user		= getKeyValue($name."_user");
+	my $pass		= getKeyValue($name."_pass");
+	my $host		= getKeyValue($name."_host");
 	my $proxyName	= AttrVal($name, "gdsProxyName", "");
 	my $proxyType	= AttrVal($name, "gdsProxyType", "");
 	my $passive		= AttrVal($name, "gdsPassiveFtp", 1);
@@ -1939,6 +1970,8 @@ sub getListForecastStations($) {
 #
 ###################################################################################################
 #
+#	2016-01-27	changed		use setKeyValue/getKeyValue for username and password
+#
 #	2016-01-01	fixed		use txt file instead html for conditions (adopt DWD changes)
 #
 #	2015-12-31	fixed		conditions retrieval on startup
@@ -2136,6 +2169,7 @@ sub getListForecastStations($) {
 
 # commandref documentation
 =pod
+=item device
 =begin html
 
 <a name="GDS"></a>
@@ -2147,7 +2181,7 @@ sub getListForecastStations($) {
 	
 		<br/>
 		Module uses following additional Perl modules:<br/><br/>
-		<code>Net::FTP, XML::Simple, Archive::Extract</code><br/><br/>
+		<code>Net::FTP, XML::Simple, Archive::Extract, Archive::Zip</code><br/><br/>
 		If not already installed in your environment, 
 		please install them using appropriate commands from your environment.
 
@@ -2365,7 +2399,7 @@ sub getListForecastStations($) {
 	<ul>
 
 		<li>Module uses following additional Perl modules:<br/><br/>
-		<code>Net::FTP, XML::Simple, Archive::Extract</code><br/><br/>
+		<code>Net::FTP, XML::Simple, Archive::Extract, Archive::Zip</code><br/><br/>
 		If not already installed in your environment, please install them using appropriate commands from your environment.</li>
 		<br/><br/>
 		<li>Have fun!</li><br/>

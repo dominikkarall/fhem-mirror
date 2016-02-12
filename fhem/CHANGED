@@ -1,5 +1,113 @@
 # Add changes at the top of the list. Keep it in ASCII, and 80-char wide.
 # Do not insert empty lines here, update check depends on it.
+  - bugfix:  95_Dashboard: fixed javascript error because of changes
+		in fhemweb
+  - feature: 49_SSCAM: feature for retrieval snapfilename added
+  - bugfix:  57_Calendar: weekly recurring events on several weekdays,
+             missing description
+  - feature: 57_Calendar: RDATE enabled             
+  - bugfix:  49:SSCAM: "goAbsPTZ" may be unavailable on Windows-systems
+  - feature  49_SSCAM: added function "move" for continuous PTZ action
+  - feature: 02_RSS: continue image update sequence after error (HTML)
+  - feature: 98_rssFeed: Possibility to modfy feed data via a custom function.
+  - change:  49_SSCAM: entries with loglevl "2" reviewed,changed to loglevl "3"
+  - feature: 50_TelegramBot  receive media files,
+                send media files directly invocation (PNG, JPG, MP3, PDF, etc)
+                etc (see change log in file)
+  - feature: 49_SSCAM: added function "goPreset" and "goAbsPTZ" to control the 
+                       move of PTZ lense,
+             refere to commandref or have a look in forum at: 
+             forum.fhem.de/index.php/topic,45671.msg404275.html#msg404275 ,
+             forum.fhem.de/index.php/topic,45671.msg404892.html#msg404892
+  - feature: 98_weekprofile: widget: transfer day settings to other days
+  - bugfix:  FB_CALLMONITOR: corrected internal_connection mapping.
+             especially FON1-FON3. Please check your configuration.
+  - change:  98_weekprofile: return sorted lists
+  - change:  YAMAHA_AVR: reading/event newFirmware will only be triggered for
+             RX-Vx71, RX-Vx73, RX-Ax10 or RX-Ax20 as newer models do not
+             support this information anymore
+  - change:  57_Calendar: complete rewrite
+             see http://forum.fhem.de/index.php/topic,48315.0.html
+  - feature: new events for home automation buttons and unassigned buttons
+  - feature: 10_KOPP_FC: added blinds and switches
+  - updated: 74_AMAD: New Mijor Release 1.2.0
+                      !!! ATTENTION !!! Do not forget to to update the new
+                      Automagic Flowset !!!
+  - feature:  74_AMAD: shutown the Device, activate Airplanemode, control
+                       Notivicationvolume, vibrates the Device, Locked Device
+                       by PIN
+  - bugfix: 74_AMAD: modified Error handling, best practice for identify offline
+                     Mode
+  - feature: New module 74_HOMBOT to control LG Hombot vacuum cleaner
+  - bugfix:  49_SSCAM: credentials won't be deleted if "rereadcfg" is used
+  - bugfix:  76_MSGMail: Make use of attribute mailtype again (enabling html)
+  - feature: 49_SSCAM: added function "svsinfo" to get informations about 
+             installed SVS-package
+  - bugfix:  49_SSCAM: saved Credentials were deleted if a device will be 
+             deleted
+  - change:  49_SSCAM: if Availability = "disconnected" then "state"-value 
+             will be "disconnected" too
+  - feature: 70_Pushalot: added support for TimeToLive parameter.
+  - bugfix:  60_allergy: fixed invalid readings names
+  - bugfix:  73_km200: Little Bugfix with the use around Regular Expressions
+  - feature: 91_notify: add readLog attribute
+  - feature: 98_ping: Add attribute for minimum fails before reporting
+             (minFailCount)
+  - bugfix:  PRESENCE: fix log warning "use of uninitialized value ..." when 
+             using power set command without any argument.
+  - added:   60_allergy: Allergy forecast data for Germany
+  - feature: FB_CALLLIST: new attribute number-cmd to execute a FHEM command
+             when clicking on a external number within the calllist. Can be any
+             valid FHEM command or Perl code. For details see commandref
+  - change:  49_SSCAM: a little bit code optimization
+  - bugfix:  31_MilightDevice: Queue length correction for long transitions
+  - feature: 31_MilightDevice: Color changes during dim on lower brightness
+  - bugfix:  30_MilightBridge/31_MilightDevice: Variable fallbacks, colorcast
+  - bugfix:  44_TEK603: fixed wrong values.
+  - bugfix:  49_SSCam: fixed the problem a recording may still stay active if 
+             fhem will be restarted after a recording was triggered and
+             the recordtime wasn't be over,
+             Enhancement of readings.
+  - change:  76_MSGMail: move email delivery from MSGMail_set to MSGMail_send 
+             to be usable from perl; use Blocking_Call to deliver email
+  - change:  55_GDS.pm uses setKeyValue/getKeyValue for user credentials
+  - feature: new module 52_I2C_BME280.pm added (klausw)
+  - bugfix:  52_I2C_PCA9685: bugfix for interaction with FRM
+  - change:  49_SSCAM: changed DEF in order to remove credentials from string,
+             added "set credentials" command to save username/password,
+             added Attribute "session" to make login-session selectable,
+             NOTE: You have to adapt your define-strings after update !!
+             look at commandref or forum-post for details: 
+             forum.fhem.de/index.php/topic,45671.msg397449.html#msg397449
+  - bugfix:  73_GasCalculator: Bugfix in Commandref and 2 attributes renamed.
+  - feature: 98_weekprofile: including topics\categories
+  - change:  98_weekprofile: filter for homatic channel devices
+  - feature: YAMAHA_BD: input reading indicates now Netflix, YouTube, and all
+             other online apps.
+  - feature: 73_GasCalculator: New module for calc. around the gas consumption
+  - feature: FB_CALLLIST: new attribute "no-table-header" added, to hide the
+             table header for the whole list
+  - feature: 49_SSCam: Attribute "httptimeout" added
+  - feature: update is executed per default in the background
+  - bugfix:  FB_CALLLIST: fix "Use of uninitialized value" warnings on startup
+  - change:  49_SSCam: Change of define-string related to rectime.
+                       Note: see all changes of rectime usage in commandref 
+                       or in Forum:
+                       .../index.php/topic,45671.msg391664.html#msg391664
+  - added:   98_count: count devices specified by devspec or all
+  - bugfix:  57_CALVIEW: bugfix for started terms
+  - feature: 10_KOPP_FC: Receive Mode for dimmer implemented, 
+    change:  10_KOPP_FC: removed "toggle" command, use "on" or "off" instead
+  - change:  49_SSCam: Vars "USERNAME" and "RECTIME" removed from Internals,
+                      Var (Internals) "SERVERNAME" changed to "SERVERADDR",
+                      minor change of Log messages,
+                      Note: use rereadcfg in order to activate the changes
+  - feature: version: version command shows also internal helper modules that
+                      are loaded (HttpUtils, Blocking, ...)
+  - feature: 70_VIERA: Using non blocking for status update.
+                       Added color button for remoteControl and SVG layout
+                       Some new SVG icons for remoteControl layout
+  - change:  73_km200: New attribute "disabled" and default values changed.
   - feature: HUEbridge: added set deletescene and get scenes detail
   - feature: HUEDevice: added (hue|sat|ct)(Up|Down) commands
   - feature: 51_I2C_TSL2561: support non-blocking I2C-IO, especially when

@@ -26,7 +26,8 @@ TechemHKV_Initialize(@) {
   # require "Broker.pm";
 
   # TECHEM HKV
-  $hash->{Match}      = "^b..446850[\\d]{8}6980....A0.*";
+  # 61, 64 without T1 and T2
+  $hash->{Match}      = "^b..446850[\\d]{8}(61|64|69)80....A0.*";
 
   $hash->{DefFn}      = "TechemHKV_Define";
   $hash->{UndefFn}    = "TechemHKV_Undef";
@@ -97,11 +98,11 @@ TechemHKV_Notify (@) {
     TechemHKV_IOPatch($hash, $e[1]) if (($e[0] eq 'ATTR') && ($e[2] eq 'rfmode') && ($e[3] eq 'WMBus_T'));
     # disable receiver
     if (($e[0] eq 'ATTR') && ($e[2] eq 'rfmode') && ($e[3] ne 'WMBus_T')) {
-    readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, "state", "standby (IO missing)", 1);
-    readingsBulkUpdate($hash, "temp1", "--.--");
-    readingsBulkUpdate($hash, "temp2", "--.--");
-    readingsEndUpdate($hash, 1);
+      readingsBeginUpdate($hash);
+      readingsBulkUpdate($hash, "state", "standby (IO missing)", 1);
+      readingsBulkUpdate($hash, "temp1", "--.--") if exists($hash->{READINGS}->{'temp1'}); # exlude versions without t1,t2
+      readingsBulkUpdate($hash, "temp2", "--.--") if exists($hash->{READINGS}->{'temp2'});
+      readingsEndUpdate($hash, 1);
     }
   }
   return undef;
@@ -119,34 +120,39 @@ TechemHKV_Receive(@) {
   
   $hash->{VERSION} = $msg->{version};
   $hash->{METER} = $typeText{$msg->{type}};
+  delete $hash->{CHANGETIME}; # clean up, workaround for fhem prior http://forum.fhem.de/index.php/topic,47474.msg391964.html#msg391964
   
-  readingsBeginUpdate($hash);
-  readingsBulkUpdate($hash, "temp1", $msg->{temp1});
-  readingsBulkUpdate($hash, "temp2", $msg->{temp2});
-  readingsEndUpdate($hash, 1);
+  if (($msg->{version} || '') eq '69') {
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "temp1", $msg->{temp1});
+    readingsBulkUpdate($hash, "temp2", $msg->{temp2});
+    readingsEndUpdate($hash, 1);
+  }
 
   # day period changed
   $ats = ReadingsTimestamp($hash->{NAME},"current_period", "0");
   $ts = sprintf ("%02d-%02d-%02d 00:00:00", $msg->{actual}->{year}, $msg->{actual}->{month}, $msg->{actual}->{day});
   if ($ats ne $ts) {
+    my $i;
     readingsBeginUpdate($hash);
     $hash->{".updateTimestamp"} = $ts;
+    $i = $#{ $hash->{CHANGED} };
     readingsBulkUpdate($hash, "current_period", $msg->{actualVal});
-    $hash->{CHANGETIME}[0] = $ts;
+    $hash->{CHANGETIME}->[$#{ $hash->{CHANGED} }] = $ts if ($#{ $hash->{CHANGED} } != $i ); # only add ts if there is a event to
     readingsEndUpdate($hash, 1);
-    delete $hash->{CHANGETIME};
   }
 
   # billing period changed
   $ats = ReadingsTimestamp($hash->{NAME},"previous_period", "0");
   $ts = sprintf ("20%02d-%02d-%02d 00:00:00", $msg->{last}->{year}, $msg->{last}->{month}, $msg->{last}->{day});
   if ($ats ne $ts) {
+    my $i;
     readingsBeginUpdate($hash);
     $hash->{".updateTimestamp"} = $ts;
+    $i = $#{ $hash->{CHANGED} };
     readingsBulkUpdate($hash, "previous_period", $msg->{lastVal});
-    $hash->{CHANGETIME}[0] = $ts;
+    $hash->{CHANGETIME}->[$#{ $hash->{CHANGED} }] = $ts if ($#{ $hash->{CHANGED} } != $i ); # only add ts if there is a event to
     readingsEndUpdate($hash, 1);
-    delete $hash->{CHANGETIME};
   }
 
   return undef;
@@ -167,7 +173,7 @@ TechemHKV_Run(@) {
 sub
 TechemHKV_IOPatch(@) {
   my ($hash, $iodev) = @_;
-  return undef unless (AttrVal($iodev, "rfmode", undef) eq "WMBus_T");
+  return undef unless (AttrVal($iodev, "rfmode", '') eq "WMBus_T");
   # see if already patched
   readingsSingleUpdate($hash, "state", "listening", 1);
   return undef if ($defs{$iodev}{Clients} =~ /TechemHKV/ );
@@ -183,7 +189,7 @@ TechemHKV_Parse(@) {
   my ($message, $rssi);
   ($msg, $rssi) = split (/::/, $msg);
   $msg = TechemHKV_SanityCheck($msg);
-  return '' unless $msg;
+  return ('') unless $msg;
   
   my @m = ($msg =~ m/../g);
 
@@ -402,7 +408,7 @@ TechemHKV_crc16_13757(@) {
   <ul>
     <li>meter data for current billing period</li>
     <li>meter data for previous billing period including date of request</li>
-    <li>both temperature sensors</li>
+    <li>both temperature sensors (if supported by data meter)</li>
   </ul> 
   <br>
   It will require a CUL in WMBUS_T mode, although the CUL may temporary set into that mode. 
@@ -452,7 +458,7 @@ TechemHKV_crc16_13757(@) {
   <ul>
     <li>Wert des aktuellen Abrechnungszeitraumes</li>
     <li>Wert des vorhergehenden Abrechnungszeitraumes einschließlich des Ablesedatums</li>
-    <li>Beide Temperatur Sensoren</li>
+    <li>Beide Temperatur Sensoren (sofern der Heizkostenverteiler sie sendet)</li>
   </ul> 
   <br>
   Zum Empfang wird ein CUL im WMBUS_T mode benötigt. Dabei ist es ausreichend ihn vorrübergehend in diesen Modus zu schalten.

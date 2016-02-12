@@ -4583,8 +4583,11 @@ sub CUL_HM_Set($@) {#+++++++++++++++++ set command+++++++++++++++++++++++++++++
     my $msg = '8'.($mCmd{$mode}).$chn;
     $msg .= sprintf("%02X",$temp) if ($temp);
     $msg .= $party if ($party);
-    foreach my $team ( split(",",InternalVal(CUL_HM_id2Name($dst."05"),"peerList",""))
-                      ,$name){
+    my @teamList = ( split(",",InternalVal(CUL_HM_id2Name($dst."05"),"peerList","")) # peers of RT team
+                    ,split(",",InternalVal(CUL_HM_id2Name($dst."02"),"peerList","")) # peers RT/TC team
+                    ,$name                                                           # myself
+                    );
+    foreach my $team (@teamList){
       next if (!defined $defs{$team} );
       my $tId = substr(CUL_HM_name2Id($team),0,6);
       CUL_HM_UpdtReadSingle($defs{$team},"controlMode","set_".$mode,1);
@@ -4597,9 +4600,14 @@ sub CUL_HM_Set($@) {#+++++++++++++++++ set command+++++++++++++++++++++++++++++
       return "invalid temp:$a[2]" if($temp <9 ||$temp > 61);
       $temp = sprintf ("%02X",$temp);
       CUL_HM_PushCmdStack($hash,'++'.$flag."11$id$dst"."8604$temp");
+
       my $idTch = ($md =~ m/HM-CC-RT-DN/ ? $dst."05" : $dst."02");
-      foreach my $team ( split(",",InternalVal(CUL_HM_id2Name($idTch),"peerList",""))
-                        ,$name){
+      my @teamList = ( split(",",InternalVal(CUL_HM_id2Name($dst."05"),"peerList","")) # peers of RT team
+                      ,split(",",InternalVal(CUL_HM_id2Name($dst."02"),"peerList","")) # peers RT/TC team
+                      ,$name                                                             # myself
+                      );
+
+      foreach my $team (@teamList){
         next if (!defined $defs{$team} );
         my $tId = substr(CUL_HM_name2Id($team),0,6);
         CUL_HM_PushCmdStack($defs{$team},'++'.$flag."11$id$tId"."8604$temp");
@@ -5818,7 +5826,6 @@ sub CUL_HM_responseSetup($$) {#store all we need to handle the response
                                 ,"reSent:=$rss");
         #--- remove channel entries that will be replaced
 
-        $peer ="" if($list !~ m/^0[347]$/);
         #empty val since reading will be cumulative
         my $rlName = ($chnhash->{helper}{expert}{raw}?"":".")."RegL_".$list.".".$peer;
         $chnhash->{READINGS}{$rlName}{VAL}="";

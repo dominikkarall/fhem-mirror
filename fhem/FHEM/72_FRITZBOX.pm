@@ -3,9 +3,9 @@
 #
 #  72_FRITZBOX.pm 
 #
-#  (c) 2014-2015 Torsten Poitzsch < torsten . poitzsch at gmx . de >
+#  (c) 2014-2016 tupol http://forum.fhem.de/index.php?action=profile;u=5432
 #
-#  This module handles the Fritz!Box router and the Fritz!Phone MT-F 
+#  This module handles the Fritz!Box router and the Fritz!Phone MT-F and C4
 #
 #  Copyright notice
 #
@@ -1232,7 +1232,7 @@ sub FRITZBOX_Readout_Run_Web($)
    my $queryStr = "&radio=configd:settings/WEBRADIO/list(Name)"; # Webradio
    $queryStr .= "&box_dect=dect:settings/enabled"; # DECT Sender
    $queryStr .= "&handset=dect:settings/Handset/list(User,Manufacturer,Model,FWVersion)"; # DECT Handsets
-   $queryStr .= "&lanDevice=landevice:settings/landevice/list(ip,name,mac,active)"; # LAN devices
+   $queryStr .= "&lanDevice=landevice:settings/landevice/list(ip,name,mac,active,wlan)"; # LAN devices
    $queryStr .= "&wlanList=wlan:settings/wlanlist/list(state,is_guest,mac)"; # WLAN devices
    $queryStr .= "&init=telcfg:settings/Foncontrol"; # Init
    $queryStr .= "&box_stdDialPort=telcfg:settings/DialPort"; #Dial Port
@@ -1366,20 +1366,23 @@ sub FRITZBOX_Readout_Run_Web($)
    }
    FRITZBOX_Readout_Add_Reading $hash, \@roReadings, "fhem->radioCount", $runNo;
 
-# LanDevice-Liste erzeugen
+# Create LanDevice list
    %landevice = ();
+   my $wlanCount = 0;
    foreach ( @{ $result->{lanDevice} } ) {
       my $dIp = $_->{ip};
       my $dName = $_->{name};
+      $dName .= " (WLAN)"  if $_->{wlan} == 1;
       FRITZBOX_Readout_Add_Reading $hash, \@roReadings, "fhem->landevice->$dIp", $dName;
       $landevice{$dIp}=$dName;
       my $rName = "mac_".$_->{mac};
       $rName =~ s/:/_/g;
-# Create a reading if a landevice is connected
+   # Create a reading if a landevice is connected
       if ($_->{active} == 1) {
-         FRITZBOX_Readout_Add_Reading $hash, \@roReadings, $rName, $_->{name};
+         FRITZBOX_Readout_Add_Reading $hash, \@roReadings, $rName, $dName;
+         $wlanCount++   if $_->{wlan} == 1;
       }
-   # if the device is not online anymore, set the mac readings to 'inactive' and delete at next readout
+   # else if the device is not online anymore, set the mac readings to 'inactive' and delete at next readout
       elsif (exists $hash->{READINGS}{$rName}) {
          if ($hash->{READINGS}{$rName}{VAL} ne "inactive") {
             FRITZBOX_Readout_Add_Reading $hash, \@roReadings, $rName, "inactive";
@@ -1389,6 +1392,7 @@ sub FRITZBOX_Readout_Run_Web($)
          }
       }
    }
+   FRITZBOX_Readout_Add_Reading ($hash, \@roReadings, "box_wlanCount", $wlanCount);
 
 # Remove Guest WLAN devices that are not online anymore
    foreach ( @{ $result->{wlanList} } ) {
@@ -1574,23 +1578,29 @@ sub FRITZBOX_Readout_Process($$)
    # Statistics
       if ( defined $values{".box_TodayBytesReceivedLow"} && defined $hash->{READINGS}{".box_TodayBytesReceivedLow"}) {
          my $valueHigh = $values{".box_TodayBytesReceivedHigh"} - $hash->{READINGS}{".box_TodayBytesReceivedHigh"}{VAL};
-         # FRITZBOX_Log $hash, 5, "valueHigh $valueHigh";
+         my $valueLow = $values{".box_TodayBytesReceivedLow"} - $hash->{READINGS}{".box_TodayBytesReceivedLow"}{VAL};
+      # Consider reset of day counter
+         if ($valueHigh < 0 || $valueHigh == 0 && $valueLow < 0) {
+            $valueLow = $values{".box_TodayBytesReceivedLow"};
+            $valueHigh = $values{".box_TodayBytesReceivedHigh"};
+         }
          $valueHigh *= 2**22;
-         # FRITZBOX_Log $hash, 5, "valueHigh $valueHigh";
-         my $valueLow = $values{".box_TodayBytesReceivedLow"} - $hash->{READINGS}{".box_TodayBytesReceivedLow"}{VAL};;
-         # FRITZBOX_Log $hash, 5, "valueLow $valueLow";
          $valueLow /= 2**10;
-         # FRITZBOX_Log $hash, 5, "valueLow $valueLow";
-         # FRITZBOX_Log $hash, 5, "valueHigh+valueLow: ". ($valueHigh+$valueLow);
          my $time = time()-time_str2num($hash->{READINGS}{".box_TodayBytesReceivedLow"}{TIME});
-         # FRITZBOX_Log $hash, 5, "time: $time";
          $values{ "box_rateDown" } = sprintf ("%.3f", ($valueHigh+$valueLow) / $time ); 
       }
-      if ( defined $values{".box_TodayBytesSentLow"} && defined $hash->{READINGS}{".box_TodayBytesSentLow"}) {
+      if ( defined $values{".box_TodayBytesSentLow"} && defined $hash->{READINGS}{".box_TodayBytesSentLow"} ) {
          my $valueHigh = $values{".box_TodayBytesSentHigh"} - $hash->{READINGS}{".box_TodayBytesSentHigh"}{VAL};
+         my $valueLow = $values{".box_TodayBytesSentLow"} - $hash->{READINGS}{".box_TodayBytesSentLow"}{VAL};
+      # Consider reset of day counter
+         if ($valueHigh < 0 || $valueHigh == 0 && $valueLow < 0) {
+            $valueLow = $values{".box_TodayBytesSentLow"};
+            $valueHigh = $values{".box_TodayBytesSentHigh"};
+         }
+         $valueHigh *= 2**22;
+         $valueLow /= 2**10;
          my $time = time()-time_str2num($hash->{READINGS}{".box_TodayBytesSentLow"}{TIME});
-         my $valueLow = $values{".box_TodayBytesSentLow"} - $hash->{READINGS}{".box_TodayBytesSentLow"}{VAL};;
-         $values{ "box_rateUp" } = sprintf ("%.3f", ( $valueHigh * 2**22 + $valueLow / 2**10 ) / $time ); 
+         $values{ "box_rateUp" } = sprintf ("%.3f", ($valueHigh+$valueLow) / $time ); 
       }
 
    # Fill all handed over readings
@@ -4581,7 +4591,7 @@ sub FRITZBOX_fritztris($)
 <a name="FRITZBOX"></a>
 <h3>FRITZBOX</h3>
 (en | <a href="http://fhem.de/commandref_DE.html#FRITZBOX">de</a>)
-<div  style="width:800px"> 
+<div> 
 <ul>
    Controls some features of a Fritz!Box router. Connected Fritz!Fon's (MT-F, MT-D, C3, C4) can be used as
    signaling devices. MP3 files and Text2Speech can be played as ring tone or when calling phones.
@@ -4683,9 +4693,9 @@ sub FRITZBOX_fritztris($)
          <br>
          <code>set fritzbox ring 611,612 5 Budapest show:It is raining</code>
          <br>
-         <code>set fritzbox ring 611 say:(en)It is raining</code>
+         <code>set fritzbox ring 611 8 say:(en)It is raining</code>
          <br>
-         <code>set fritzbox ring 610 play:http://raspberrypi/sound.mp3</code>
+         <code>set fritzbox ring 610 10 play:http://raspberrypi/sound.mp3</code>
          <br>
          Rings the internal numbers for "duration" seconds and (on Fritz!Fons) with the given "ring tone" name.
          Different internal numbers have to be separated by a comma (without spaces).
@@ -4693,11 +4703,13 @@ sub FRITZBOX_fritztris($)
          Default duration is 5 seconds. Default ring tone is the internal ring tone of the device.
          Ring tone will be ignored for collected calls (9 or 50). 
          <br>
-         If the <a href=#FRITZBOXattr>attribute</a> 'ringWithIntern' is specified, the text behind 'show:' will be shown as the callers name.
+         If the <a href=#FRITZBOXattr>attribute</a> 'ringWithIntern' is specified, the text behind 'show:' will be shown as the callers name. (only for Fritz!OS<=6.24)
          Maximal 30 characters are allowed.
          <br>
          On Fritz!Fons the parameter 'say:' can be used to let the phone speak a message (max. 100 characters). 
          Alternatively a MP3 link can be played with 'play:'. This creates the  internet radio station 'FHEM' and uses translate.google.com for text2speech. It will <u>always</u> play the complete text/sound. It will than ring with standard ring tone until the end of the 'ring duration' is reached.
+         <br>
+         Say and play works only with a single Fritz!Fon.
         <br>
          If the call is taken the callee hears the "music on hold" which can also be used to transmit messages.
       </li><br>
@@ -4886,6 +4898,7 @@ sub FRITZBOX_fritztris($)
       <li><b>box_stdDialPort</b> - standard caller port when using the dial function of the box</li>
       <li><b>box_tr064</b> - application interface TR-064 (needed by this modul)</li>
       <li><b>box_tr069</b> - provider remote access TR-069 (safety issue!)</li>
+      <li><b>box_wlanCount</b> - Number of devices connected via WLAN</li>
       <li><b>box_wlan_2.4GHz</b> - Current state of the 2.4 GHz WLAN</li>
       <li><b>box_wlan_5GHz</b> - Current state of the 5 GHz WLAN</li>
       <br>
@@ -4937,7 +4950,7 @@ sub FRITZBOX_fritztris($)
 <a name="FRITZBOX"></a>
 <h3>FRITZBOX</h3>
 (<a href="http://fhem.de/commandref.html#FRITZBOX">en</a> | de)
-<div  style="width:800px"> 
+<div> 
 <ul>
    Steuert gewisse Funktionen eines Fritz!Box Routers. Verbundene Fritz!Fon's (MT-F, MT-D, C3, C4) k&ouml;nnen als Signalger&auml;te genutzt werden. MP3-Dateien und Text (Text2Speech) k&ouml;nnen als Klingelton oder einem angerufenen Telefon abgespielt werden.
    <br>
@@ -5043,9 +5056,9 @@ sub FRITZBOX_fritztris($)
          <br>
          <code>set fritzbox ring 611,612 5 Budapest show:Es regnet</code>
          <br>
-         <code>set fritzbox ring 610 say:Es regnet</code>
+         <code>set fritzbox ring 610 8 say:Es regnet</code>
          <br>
-         <code>set fritzbox ring 610 play:http://raspberrypi/sound.mp3</code>
+         <code>set fritzbox ring 610 10 play:http://raspberrypi/sound.mp3</code>
          <br>
          L&auml;sst die internen Nummern f&uuml;r "Dauer" Sekunden und (auf Fritz!Fons) mit dem angegebenen "Klingelton" klingeln.
          Mehrere interne Nummern m&uuml;ssen durch ein Komma (ohne Leerzeichen) getrennt werden.
@@ -5053,11 +5066,14 @@ sub FRITZBOX_fritztris($)
          Standard-Dauer ist 5 Sekunden. Standard-Klingelton ist der interne Klingelton des Ger&auml;tes.
          Der Klingelton wird f&uuml;r Rundrufe (9 oder 50) ignoriert. 
          <br>
-         Wenn das <a href=#FRITZBOXattr>Attribut</a> 'ringWithIntern' existiert, wird der Text hinter 'show:' als Name des Anrufers angezeigt.
+         Wenn das <a href=#FRITZBOXattr>Attribut</a> 'ringWithIntern' existiert, wird der Text hinter 'show:' als Name des Anrufers angezeigt. (nur bei Fritz!OS<=6.24)
          Er darf maximal 30 Zeichen lang sein.
          <br>
-         Auf Fritz!Fons wird der Text (max. 100 Zeichen) hinter dem Parameter 'say:' direkt angesagt. 
+         Auf Fritz!Fons wird der Text (max. 100 Zeichen) hinter dem Parameter 'say:' direkt angesagt.
+         <br>
          Alternativ kann mit 'play:' auch ein MP3-Link abgespielt werden. Dabei wird die Internetradiostation 39 'FHEM' erzeugt und translate.google.com f&uuml;r Text2Speech genutzt. Es wird <u>immer</u> der komplette Text/Klang abgespielt. Bis zum Ende der 'Klingeldauer' klingelt das Telefon dann mit seinem Standard-Klingelton.
+         <br>
+         Das Abspielen ist nur auf einem einzelnen Fritz!Fon möglich.
          <br>
          Wenn der Anruf angenommen wird, h&ouml;rt der Angerufene die Wartemusik (music on hold), welche ebenfalls zur Nachrichten&uuml;bermittlung genutzt werden kann.
       </li><br>
@@ -5230,8 +5246,10 @@ sub FRITZBOX_fritztris($)
       <li><b>box_stdDialPort</b> - Anschluss der ger&auml;teseitig von der W&auml;hlhilfe genutzt wird</li>
       <li><b>box_tr064</b> - Anwendungsschnittstelle TR-064 (wird auch von diesem Modul ben&ouml;tigt)</li>
       <li><b>box_tr069</b> - Provider-Fernwartung TR-069 (sicherheitsrelevant!)</li>
+      <li><b>box_wlanCount</b> - Anzahl der Ger&auml;te die &uuml;ber WLAN verbunden sind</li>
       <li><b>box_wlan_2.4GHz</b> - Aktueller Status des 2.4-GHz-WLAN</li>
       <li><b>box_wlan_5GHz</b> - Aktueller Status des 5-GHz-WLAN</li>
+      
       <br>
       <li><b>dect</b><i>1</i> - Name des DECT Telefons <i>1</i></li>
       <li><b>dect</b><i>1</i><b>_alarmRingTone</b> - Klingelton beim Wecken &uuml;ber das DECT Telefon <i>1</i></li>

@@ -16,7 +16,7 @@ sub ZWave_Get($@);
 sub ZWave_Parse($$@);
 sub ZWave_Set($@);
 sub ZWave_SetClasses($$$$);
-sub ZWave_addToSendStack($$);
+sub ZWave_addToSendStack($$$);
 sub ZWave_secStart($);
 sub ZWave_secEnd($);
 sub ZWave_configParseModel($;$);
@@ -182,16 +182,20 @@ my %zwave_class = (
   THERMOSTAT_OPERATING_STATE=>{ id => '42' },
   THERMOSTAT_SETPOINT      => { id => '43',
     set   => { setpointHeating => "010101%02x",
-               setpointCooling => "010201%02x"},
-    get   => { setpoint => "02" },
-    parse => { "064303(..)(..)(....)" => 'sprintf("setpointTemp:%0.1f %s %s", '.
-                 'hex($3)/(10**int(hex($2)/32)), '.
-                 'hex($2)&8 ? "F":"C", hex($1)==1 ? "heating":"cooling")' } },
+               setpointCooling => "010201%02x",
+               thermostatSetpointSet
+                  => 'ZWave_thermostatSetpointSet($hash, "%s")'},
+    get   => { setpoint => 'ZWave_thermostatSetpointGet("%s")',
+               thermostatSetpointSupported => '04' },
+    parse => {  "..4303(.*)" => 'ZWave_thermostatSetpointParse($hash, $1)',
+                "..4305(.*)" =>
+                        'ZWave_thermostatSetpointSupportedParse($hash, $1)' } },
   THERMOSTAT_FAN_MODE      => { id => '44' },
   THERMOSTAT_FAN_STATE     => { id => '45' },
   CLIMATE_CONTROL_SCHEDULE => { id => '46',
     set   => { ccs                => 'ZWave_ccsSet("%s")' },
     get   => { ccs                => 'ZWave_ccsGet("%s")',
+               ccsAll             => 'ZWave_ccsAllGet($hash)',
                ccsChanged         => "04",
                ccsOverride        => "07" },
     parse => { "..46(..)(.*)" => 'ZWave_ccsParse($1,$2)' }},
@@ -202,7 +206,37 @@ my %zwave_class = (
   TARIFF_TBL_MONITOR       => { id => '4b' },
   DOOR_LOCK_LOGGING        => { id => '4c' },
   NETWORK_MANAGEMANT_BASIC => { id => '4d' },
-  SCHEDULE_ENTRY_LOCK      => { id => '4e' },
+  SCHEDULE_ENTRY_LOCK      => { id => '4e', # V1, V2, V3
+    get   =>  { scheduleEntryLockTypeSupported  => '09',
+                scheduleEntryLockWeekDay        => "04%02x%02x",
+                scheduleEntryLockYearDay        => "07%02x%02x",
+                scheduleEntryLockDailyRepeating => "0e%02x%02x",
+                scheduleEntryLockTimeOffset     => '0b'
+              },
+    set   =>  { scheduleEntryLockSet => 
+                  'ZWave_scheduleEntryLockSet($hash, "%s")',
+                scheduleEntryLockAllSet => 
+                  'ZWave_scheduleEntryLockAllSet($hash, "%s")',
+                scheduleEntryLockWeekDaySet =>
+                  'ZWave_scheduleEntryLockWeekDaySet($hash, "%s")',
+                scheduleEntryLockYearDaySet =>
+                  'ZWave_scheduleEntryLockYearDaySet($hash, "%s")',
+                scheduleEntryLockTimeOffsetSet =>
+                  'ZWave_scheduleEntryLockTimeOffsetSet($hash, "%s")',
+                scheduleEntryLockYearDailyRepeatingSet =>
+                  'ZWave_scheduleEntryLockDailyRepeatingSet($hash, "%s")'
+              },
+    parse =>  { "..4e0a(.*)" => 
+                  'ZWave_scheduleEntryLockTypeSupportedParse($hash, $1)',
+                "..4e05(.{14})" =>
+                  'ZWave_scheduleEntryLockWeekDayParse($hash, $1)',
+                "..4e08(.{24})" =>
+                  'ZWave_scheduleEntryLockYearDayParse($hash, $1)',
+                "..4e0c(.{6})" =>
+                  'ZWave_scheduleEntryLockTimeOffsetParse($hash, $1)',
+                "..4e0f(.{14})" =>
+                  'ZWave_scheduleEntryLockDailyRepeatingParse($hash, $1)'
+              }},
   ZI_6LOWPAN               => { id => '4f' },
   BASIC_WINDOW_COVERING    => { id => '50',
     set   => { coveringClose => "0140",
@@ -249,12 +283,14 @@ my %zwave_class = (
                                 => 'ZWave_plusInfoParse($1,$2,$3,$4,$5)'} },
   ZIP_GATEWAY              => { id => '5f' },
   MULTI_CHANNEL            => { id => '60',  # Version 2, aka MULTI_INSTANCE
+    set   => { mcCreateAll => 'ZWave_mcCreateAll($hash,"")' },
     get   => { mcEndpoints => "07",
                mcCapability=> "09%02x"},
     parse => { "^046008(..)(..)" => '"mcEndpoints:total ".hex($2).'.
                                  '(hex($1)&0x80 ? ", dynamic":"").'.
                                  '(hex($1)&0x40 ? ", identical":", different")',
-               "^..600a(.*)"=> 'ZWave_mcCapability($hash, $1)' } },
+               "^..600a(.*)"=> 'ZWave_mcCapability($hash, $1)' },
+    init  => { ORDER=>49, CMD => '"set $NAME mcCreateAll"' } },
   ZIP_PORTAL               => { id => '61' },
   DOOR_LOCK                => { id => '62', # V2
     set   => { doorLockOperation   => 'ZWave_DoorLockOperationSet($hash, "%s")',
@@ -279,20 +315,21 @@ my %zwave_class = (
     set   => { configDefault=>"04%02x80",
                configByte  => "04%02x01%02x",
                configWord  => "04%02x02%04x",
-               configLong  => "04%02x04%08x",
-               configRequestAll => 'ZWave_configRequestAll($hash)' },
-    get   => { config      => "05%02x" },
+               configLong  => "04%02x04%08x" },
+    get   => { config      => "05%02x",
+               configAll   => 'ZWave_configAllGet($hash)' },
     parse => { "^..70..(..)(..)(.*)" => 'ZWave_configParse($hash,$1,$2,$3)'} },
   ALARM                    => { id => '71',
     get   => { alarm       => "04%02x" },
     parse => { "..7105(..)(..)(.*)" => 'ZWave_alarmParse($1,$2,$3)'} },
   MANUFACTURER_SPECIFIC    => { id => '72',
     get   => { model       => "04" },
-    parse => { "087205(....)(....)(....)" =>'ZWave_mfsParse($hash,$1,$2,$3,0)',
-               "087205(....)(....)(.{4})" =>'ZWave_mfsParse($hash,$1,$2,$3,1)',
-               "087205(....)(.{4})(.{4})" =>'ZWave_mfsParse($hash,$1,$2,$3,2)',
-               "0a7205(....)(....)(....)(....)" =>
-                                'ZWave_mfsParse($hash,$1,$2,$3,0)' },
+    parse => { "0[8a]7205(....)(....)(....)(.*)"
+                          => 'ZWave_mfsParse($hash,$1,$2,$3,0)',
+               "0[8a]7205(....)(....)(.{4})(.*)"
+                          => 'ZWave_mfsParse($hash,$1,$2,$3,1)',
+               "0[8a]7205(....)(.{4})(.{4})(.*)"
+                          => 'ZWave_mfsParse($hash,$1,$2,$3,2)' },
     init  => { ORDER=>49, CMD => '"get $NAME model"' } },
   POWERLEVEL               => { id => '73',
     set   => { powerlevel     => "01%02x%02x",
@@ -354,18 +391,17 @@ my %zwave_class = (
     init  => { ORDER=>11, CMD => '"set $NAME wakeupInterval 86400 $CTRLID"' } },
   ASSOCIATION              => { id => '85',
     set   => { associationAdd => "01%02x%02x*",
-               associationDel => "04%02x%02x*",
-               associationRequest => "02%02x",
-               associationRequestAll => 'ZWave_associationRequest($hash,"")' },
+               associationDel => "04%02x%02x*" },
     get   => { association          => "02%02x",
-               associationGroups    => "05" },
+               associationGroups    => "05",
+               associationAll       => 'ZWave_associationAllGet($hash,"")' },
     parse => { "..8503(..)(..)..(.*)" => 'ZWave_assocGroup($homeId,$1,$2,$3)',
                "..8506(..)"           => '"assocGroups:".hex($1)' },
     init  => { ORDER=>10, CMD=> '"set $NAME associationAdd 1 $CTRLID"' } },
   VERSION                  => { id => '86',
-    set   => { versionClassRequest => 'ZWave_versionClassRequest($hash,"%s")'},
     get   => { version      => "11",
-               versionClass => 'ZWave_versionClassGet("%s")' },
+               versionClass => 'ZWave_versionClassGet("%s")',
+               versionClassAll => 'ZWave_versionClassAllGet($hash)'},
     parse => { "028611"             => "cmdGet:version",
                "078612(..........)" => 'sprintf("version:Lib %d Prot '.
                 '%d.%d App %d.%d", unpack("C*",pack("H*","$1")))',
@@ -419,19 +455,12 @@ my %zwave_class = (
   AV_RENDERER_STATUS       => { id => '96' },
   AV_CONTENT_SEARCH_MD     => { id => '97' },
   SECURITY                 => { id => '98',
-    set   => { "secScheme"    => 'ZWave_sec($hash, "0400")',
-               "sendNonce"    => 'ZWave_secCreateNonce($hash)',
-               "secEnd"       => 'ZWave_secEnd($hash)',
-               "secEncap"     => 'ZWave_sec($hash, "%s")' },
-    get   => { "secSupported" => 'ZWave_sec($hash, "02")' ,
-               "secNonce"     => 'ZWave_sec($hash, "40")'},
-    parse => { "..9803(.*)"   => 'ZWave_secSupported($hash, $1)',
-               "..9805(.*)"   => 'ZWave_secInit($hash, $1)', # secScheme
-               "..9807"       => 'ZWave_secNetWorkKeyVerify($hash)',
-               "..9840"       => 'ZWave_secNonceRequestReceived($hash)',
-               "..9880(.*)"   => 'ZWave_secNonceReceived($hash, $1)',
-               "..9881(.*)"   => 'ZWave_secDecrypt($hash, $1, 0)',
-               "..98c1(.*)"   => 'ZWave_secDecrypt($hash, $1, 1)' } },
+    set   => { "secSupportedReport" => 'ZWave_sec($hash, "02")', },
+    parse => { "..9803(.*)"=> 'ZWave_secSupported($hash, $1)',
+               "..9840"    => 'ZWave_secNonceRequestReceived($hash)',
+               "..9880(.*)"=> 'ZWave_secNonceReceived($hash, $1)',
+               "..9881(.*)"=> 'ZWave_secDecrypt($hash, $1, 0)',
+               "..98c1(.*)"=> 'ZWave_secDecrypt($hash, $1, 1)' } },
   AV_TAGGING_MD            => { id => '99' },
   IP_CONFIGURATION         => { id => '9a' },
   ASSOCIATION_COMMAND_CONFIGURATION
@@ -444,14 +473,6 @@ my %zwave_class = (
   SENSOR_CONFIGURATION     => { id => '9e' },
   MARK                     => { id => 'ef' },
   NON_INTEROPERABLE        => { id => 'f0' },
-);
-
-my %zwave_quietCmds = (
-  secScheme=>1,
-  sendNonce=>1,
-  secEncap=>1,
-
-  secNonce=>1
 );
 
 my %zwave_cmdArgs = (
@@ -494,6 +515,16 @@ my $zwave_cryptRijndael = 0;
 my $zwave_lastHashSent;
 my %zwave_pepperLink;
 my %zwave_pepperImg;
+
+# standard definitions for regular expression
+# naming scheme: p<number of returned groups>_name
+my $p1_m = "([0-5][0-9])"; # mm 00-59
+my $p2_hm = "([01][0-9]|2[0-3]):([0-5][0-9])"; # hh:mm
+my $p3_hms = "([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9])"; # hh:mm:ss
+my $p1_b = "([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])"; # byte:0-255, 1-3 digits
+my $p1_wd = "(mon|tue|wed|thu|fri|sat|sun)"; # 3 letter weekday
+# ymd: yyyy-mm-dd, yyyy 4 digits, mm 2 digits 01-12, dd 2 digits 01-31
+my $p3_ymd = "([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])";
 
 sub
 ZWave_Initialize($)
@@ -659,10 +690,8 @@ ZWave_Cmd($$@)
   # Collect the commands from the distinct classes
   my %cmdList;
   my $classes = AttrVal($name, "classes", "");
-  my $cfgReq = ($type eq "set" && $cmd =~ m/^config/ && @a && $a[0] eq "request");
-  shift(@a) if($cfgReq);
   foreach my $cl (split(" ", $classes)) {
-    my $ptr = ZWave_getHash($hash, $cl, $cfgReq ? "get" : $type);
+    my $ptr = ZWave_getHash($hash, $cl, $type);
     next if(!$ptr);
 
     foreach my $k (keys %{$ptr}) {
@@ -672,8 +701,6 @@ ZWave_Cmd($$@)
       }
     }
   }
-
-  $type="get" if($cfgReq);
 
   my $id = $hash->{nodeIdHex};
   my $isMc = ($id =~ m/(....)/);
@@ -754,21 +781,22 @@ ZWave_Cmd($$@)
     }
   }
 
-  if($cmd =~ m/^config/ && $cmd ne "configRequestAll") {
+  if($cmd =~ m/^config/ && $cmd ne "configAll") {
     my ($err, $lcmd) =
-        ZWave_configCheckParam($hash, $cfgReq, $type, $cmd, $cmdFmt, @a);
+        ZWave_configCheckParam($hash, $type, $cmd, $cmdFmt, @a);
     return $err if($err);
     $cmdFmt = $lcmd;
+
   } else {
     $cmdFmt = sprintf($cmdFmt, @a) if($nArg);
     my ($err, $ncmd) = eval($cmdFmt) if($cmdFmt !~ m/^\d/);
     return $err if($err);
+    return $@ if($@);
     $cmdFmt = $ncmd if(defined($ncmd));
-    return "" if($ncmd && $ncmd eq "EMPTY"); # e.g. configRequestAll
+    return "" if($ncmd && $ncmd eq "EMPTY"); # configAll
   }
 
-  Log3 $name, $zwave_quietCmds{$cmd} ? 4 : 2,
-       "ZWave $type $name $cmd ".join(" ", @a);
+  Log3 $name, 2, "ZWave $type $name $cmd ".join(" ", @a);
 
   my ($baseClasses, $baseHash) = ($classes, $hash);
   if($id =~ m/(..)(..)/) {  # Multi-Channel, encapsulate
@@ -780,7 +808,6 @@ ZWave_Cmd($$@)
     $baseClasses = AttrVal($baseHash->{NAME}, "classes", "");
   }
 
-
   my $data;
   if($cmd eq "neighborUpdate" ||
      $cmd eq "neighborList") {
@@ -791,9 +818,7 @@ ZWave_Cmd($$@)
     my $cmdEf  = (AttrVal($name, "noExplorerFrames", 0) == 0 ? "25" : "05");
     $data = "13$id$len$cmdId${cmdFmt}$cmdEf"; # 13==SEND_DATA
     $data .= $id; # callback=>id
-
   }
-
 
   if ($data =~ m/(......)(....)(.*)(....)/) {
     my $cc_cmd=$2;
@@ -802,20 +827,21 @@ ZWave_Cmd($$@)
     #check message here for needed encryption (SECURITY)
     if(ZWave_secIsSecureClass($hash, $cc_cmd)) {
       ZWave_secStart($hash);
-      # message stored in reading, will be processed when nonce arrives
+      # message stored in hash, will be processed when nonce arrives
       my $cmd2 = "$type $name $cmd ".join(" ", @a);
       ZWave_secPutMsg($hash, $cc_cmd . $payload, $cmd2);
-      return ZWave_Cmd("get", $hash, $name, "secNonce");
+      ZWave_secAddToSendStack($hash, '9840');
+      return;
     }
   }
 
-  my $r = ZWave_addToSendStack($baseHash, $data);
+  my $r = ZWave_addToSendStack($baseHash, $type, $data);
   if($r) {
     return (AttrVal($name,"verbose",3) > 2 ? $r : undef);
   }
 
   my $val;
-  if($type eq "get") {
+  if($type eq "get" && $hash->{CL}) { # Wait for the result for frontend cmd
     no strict "refs";
     my $iohash = $hash->{IODev};
     my $fn = $modules{$iohash->{TYPE}}{ReadAnswerFn};
@@ -828,14 +854,13 @@ ZWave_Cmd($$@)
     $data = "$cmd $id $data" if($re);
 
     $val = ($data ? ZWave_Parse($iohash, $data, $type) : "no data returned");
-    ZWave_processSendStack($hash) if($data && $cmd eq "neighborList");
 
-  } else {
-    if(!$zwave_quietCmds{$cmd}) {
-      $cmd .= " ".join(" ", @a) if(@a);
-      readingsSingleUpdate($hash, "state", $cmd, 1);
-    }
+    ZWave_processSendStack($hash, "next") # No radio traffic for neighborList
+        if($data && $cmd eq "neighborList");
 
+  } elsif($type ne "get") {
+    $cmd .= " ".join(" ", @a) if(@a);
+    readingsSingleUpdate($hash, "state", $cmd, 1);
   }
 
   return $val;
@@ -891,6 +916,381 @@ ZWave_ccCapability($$)
 }
 
 sub
+ZWave_scheduleEntryLockSet ($$)
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  return ("wrong format, see commandref", "")
+    if($arg !~ m/([0-2]?[0-9]?[0-9]) ((en|dis)abled)/);
+  return ("User Identifier: only 0-255 allowed", "") if (($1<0) || ($1>255));
+
+  my $rt = sprintf("01%02x%02x", $1, ($2 eq "enabled") ? "01" : "02");
+  return ("",$rt);
+
+}
+
+sub
+ZWave_scheduleEntryLockAllSet ($$)
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  return ("wrong format, see commandref", "")
+    if($arg !~ m/((en|dis)abled)/);
+  
+  my $rt = sprintf("02%02x", ($1 eq "enabled") ? "01" : "02");
+  return ("",$rt);
+
+}
+
+sub
+ZWave_scheduleEntryLockWeekDayParse ($$)
+{
+  my ($hash, $val) = @_;
+  return if($val !~ m/^(..)(..)(..)(..)(..)(..)(..)/);
+
+  my $userId          = sprintf("userID: %d", hex($1));
+  my $scheduleSlotId  = sprintf("slotID: %d", hex($2));
+  
+  # Attention! scheduleEntryLock use different definition of weekday!
+  my @dow = ("sun","mon","tue","wed","thu","fri","sat");
+  my $dayOfWeek       = (hex($3) < 7) ? $dow[hex($3)] : "invalid";
+  
+  
+  my $start           = sprintf("%02d:%02d", hex($4), hex($5));
+  my $end             = sprintf("%02d:%02d", hex($6), hex($7));  
+  
+  my $rt1 = sprintf ("weekDaySchedule_%d:", hex($1));
+  $rt1 .= "$userId $scheduleSlotId $dayOfWeek $start $end";
+  return ($rt1);
+}
+  
+sub
+ZWave_scheduleEntryLockWeekDaySet ($$)
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  
+  if($arg !~
+    m/([01]) $p1_b $p1_b $p1_wd $p2_hm $p2_hm/) {
+    return ("wrong format, see commandref", "");
+  }
+
+  if (($2>255) || ($3>255)) {
+    return ("values our of range, see commandref", "");
+  }
+
+  # Attention! scheduleEntryLock use different definition of weekday!
+  my @dow = ("sun","mon","tue","wed","thu","fri","sat");
+
+  my $wd;
+  map { $wd=sprintf("%02x",$_) if($dow[$_] eq $4) }(0..int($#dow));
+  return ("Unknown weekday $4, use one of ".join(" ", @dow), "")
+    if(!defined($wd));
+    
+  my $rt = sprintf("03%02x%02x%02x%02x%02x%02x%02x%02x",
+                    $1,$2,$3,$wd,$5,$6,$7,$8);
+
+  return ("",$rt);
+}
+
+sub
+ZWave_scheduleEntryLockDailyRepeatingParse ($$)
+{
+  my ($hash, $val) = @_;
+  return if($val !~ m/^(..)(..)(..)(..)(..)(..)(..)/);
+  
+  my $userID        = sprintf ("userID: %d", hex($1));
+  my $scheduleID    = sprintf ("slotID: %d", hex($2));
+  
+  # bit field for week day: b7 reserved, b6 sat, b5 fri, ..., b0 sun
+  my $w = hex($3);
+  #my $wd = sprintf("weekDaySchedule: %07b ", $w);
+  my $wd = "weekDaySchedule: ";
+  my $nu = "...";
+  $wd .= (($w & 0x02) == 0x02) ? "mon" : $nu;
+  $wd .= (($w & 0x04) == 0x04) ? "tue" : $nu;
+  $wd .= (($w & 0x08) == 0x08) ? "wed" : $nu;
+  $wd .= (($w & 0x10) == 0x10) ? "thu" : $nu;
+  $wd .= (($w & 0x20) == 0x20) ? "fri" : $nu;
+  $wd .= (($w & 0x40) == 0x40) ? "sat" : $nu;
+  $wd .= (($w & 0x01) == 0x01) ? "sun" : $nu;
+  
+  my $start     = sprintf("Start: %02d:%02d"    , hex($4), hex($5));
+  my $duration  = sprintf("Duration: %02d:%02d" , hex($6), hex($7));
+
+  my $rt1 = sprintf ("scheduleEntryLockDailyRepeating_%d:", hex($1));
+  $rt1 .= "$userID $scheduleID $wd $start $duration";
+  return ($rt1);
+}
+
+sub
+ZWave_scheduleEntryLockDailyRepeatingSet ($$)
+{ 
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+   
+  if($arg !~
+    m/([01]) $p1_b $p1_b ((?:[\.a-zA-Z]{3}){1,7}) $p2_hm $p2_hm/) {
+    return ("wrong format, see commandref", "");
+  }
+
+  my $rt1 = sprintf("%02x%02x%02x", $1, $2, $3);
+  my $rt2 = sprintf("%02x%02x%02x%02x", $5, $6, $7, $8);
+
+  my $w = $4;
+  my $wd = 0x00;
+  $wd |= 0x02 if ($w =~ /mon/i);
+  $wd |= 0x04 if ($w =~ /tue/i);
+  $wd |= 0x08 if ($w =~ /wed/i);
+  $wd |= 0x10 if ($w =~ /thu/i);
+  $wd |= 0x20 if ($w =~ /fri/i);
+  $wd |= 0x40 if ($w =~ /sat/i);
+  $wd |= 0x01 if ($w =~ /sun/i);
+
+  my $rt = sprintf("10$rt1%02x$rt2", $wd);
+  return ("",$rt);
+}
+
+sub
+ZWave_scheduleEntryLockYearDayParse ($$)
+{
+  my ($hash, $val) = @_;
+  return if($val !~ m/^(..)(..)(..)(..)(..)(..)(..)(..)(..)(..)(..)(..)/);
+  
+  my $userID        = sprintf ("userID: %d", hex($1));
+  my $scheduleID    = sprintf ("slotID: %d", hex($2));
+  my $startdate     = sprintf ("start: %4d-%02d-%02d %02d:%02d",
+                        2000+hex($3),hex($4),hex($5),hex($6),hex($7));
+  my $enddate       = sprintf ("end: %4d-%02d-%02d %02d:%02d",
+                        2000+hex($8),hex($9),hex($10),hex($11),hex($12));
+
+  my $rt1 = sprintf ("yearDaySchedule_%d:", hex($1));
+  $rt1 .= "$userID $scheduleID $startdate $enddate";
+  return ($rt1);
+}
+
+sub
+ZWave_scheduleEntryLockYearDaySet ($$)
+{ 
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+   
+  if($arg !~
+    m/([01]) $p1_b $p1_b $p3_ymd $p2_hm $p3_ymd $p2_hm/) {
+    return ("wrong format, see commandref", "");
+  }
+
+  my $sy = $4-2000;
+  my $ey = $9-2000;
+  if (($sy < 0) || ($sy > 255) || ($ey < 0) || ($ey > 255)) {
+    Log3 $name, 1, "$name: year out of range";
+    return ("wrong value for year, only 2000-2255 allowed","");
+  }; # no sanity check of date (e.g. 2016-02-31 will pass)
+
+  my $rt = sprintf("06%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                    $1, $2, $3, $sy, $5, $6, $7, $8, $ey, $10, $11, $12, $13);
+  return ("",$rt);
+}
+
+sub
+ZWave_scheduleEntryLockTimeOffsetParse ($$)
+{ 
+  my ($hash, $val) = @_;
+  return if($val !~ m/^(..)(..)(..)/);
+  
+  my $sTZO  = ((hex($1) & 0x80) == 0x80) ? '-' : '+';
+  my $TZO   = sprintf("TZO: %s%02d:%02d", $sTZO, (hex($1) & 0x7f), hex($2));
+  
+  my $sDST  = ((hex($3) & 0x80) == 0x80) ? '-' : '+';
+  my $DST   = sprintf("DST: %s%02d", $sDST, (hex($3) & 0x7f));
+  
+  my $rt1 = "scheduleEntryLockTimeOffset: $TZO $DST";
+  return ($rt1);
+}
+
+sub
+ZWave_scheduleEntryLockTimeOffsetSet ($$)
+{ 
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  
+  if($arg !~ m/([\+\-])$p2_hm ([\+\-])$p1_b/) {
+    return ("wrong format, see commandref", "");
+  }
+
+  my $hTZO = $2 | (($1 eq '-') ? 0x80 : 0x00);
+  my $mTZO = $3;
+  my $mDST = $5 | (($4 eq '-') ? 0x80 : 0x00);
+
+  my $rt = sprintf("0d%02x%02x%02x", $hTZO, $mTZO, $mDST);
+
+  return ("",$rt);
+}
+
+sub
+ZWave_scheduleEntryLockTypeSupportedParse ($$)
+{
+  my ($hash, $val) = @_;
+  return if($val !~ m/^(..)(..)(.*)/);
+  
+  my $numWDslots = sprintf ("WeekDaySlots: %d", hex($1));
+  my $numYDslots = sprintf ("YearDaySlots: %d", hex($2));
+  
+  # only for V3
+  my $numDailySlots = '';
+  $numDailySlots = sprintf (" DailyRepeatingSlots: %d", hex($3)) if ($3);
+  
+  my $rt1 = "scheduleEntryLockEntryTypeSupported:"
+            ." $numWDslots $numYDslots$numDailySlots";
+  return ($rt1);
+}
+
+sub
+ZWave_thermostatSetpointGet($)
+{
+  my ($type) = @_;
+  
+  $type  = (($type eq "%s") ? "1" : $type);
+  return ("wrong format, only 1-15 allowed","")
+    if ($type !~ m/^(1[0-5]?|[0]?[1-9])$/);
+  return("",sprintf('02%02x', $type & 0x0f));
+}
+
+sub
+ZWave_thermostatSetpointSet ($$)
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+
+  my $p1_temp   = "([\+\-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+)))";
+  my $p1_scale  = "([cC|fF])";
+  my $p1_type   = "(1[0-5]?|[0]?[1-9])";
+  my $p1_prec   = "([0-7])";
+  my $p1_size   = "([124])";
+  
+  if($arg !~
+    m/$p1_temp+ ?$p1_scale?+ ?$p1_type?+ ?$p1_prec?+ ?$p1_size?+/) {
+    return ("wrong format, see commandref", "");
+  }
+  
+  my $temp  = $1;
+  my $scale = (defined $2) ? $2 : "c";          # default to c = celsius
+  $scale    = (lc($scale) eq "f") ? 1 : 0;
+  my $type  = ((defined $3) ? $3 : 1) & 0x0f;   # default to 1 = heating
+  my $prec  = ((defined $4) ? $4 : 1) & 0x07;   # default to 1 decimal
+  my $size  = ((defined $5) ? $5 : 2) & 0x07;   # default to 2 byte size
+  
+  my $sp = int($temp * (10 ** $prec));
+  my $max = (2 ** (8*$size-1)) - 1;
+  my $min = -1 * (2 ** (8*$size-1)); 
+
+  if (($sp > $max) || ($sp < $min)) {
+    my $rt = sprintf("temperature value out of range for given "
+                      ."size and precision [%0.*f, %0.*f]", 
+                      $prec, $min/(10**$prec), $prec, $max/(10**$prec));
+    return ($rt, "");
+  }
+  
+  $sp   = ($sp < 0) ? $sp + 2**(8*$size) : $sp;
+  $sp   = sprintf("%0*x", 2*$size, $sp);
+  $type = sprintf("%02x", $type);
+  my $precScaleSize = sprintf("%02x", ($size | ($scale<<3) | ($prec<<5)));
+  my $rt = "01$type$precScaleSize$sp";
+  
+  return ("",$rt);  
+}
+
+sub
+ZWave_thermostatSetpointParse ($$)
+{ 
+  my ($hash, $val) = @_;
+  my $name = $hash->{NAME};
+  
+  return if($val !~ m/^(..)(..)(.*)/);
+  
+  my @setpointtype =  ( # definition from V3
+                        "notSupported",
+                        "heating",
+                        "cooling",
+                        "notSupported1",
+                        "notSupported2",
+                        "notSupported3",
+                        "notSupported4",
+                        "furnance",
+                        "dryAir",
+                        "moistAir",
+                        "autoChangeover",
+                        "energySaveHeating",
+                        "energySaveCooling",
+                        "awayHeating",
+                        "awayCooling",
+                        "fullPower"
+                      );
+  my $type  = $setpointtype[(hex($1) & 0x0f)];
+  my $prec  = (hex($2) & 0xe0)>>5;
+  my $scale = (((hex($2) & 0x18)>>3) == 1) ? "F": "C";
+  my $size  = (hex($2) & 0x07);
+  
+  if (length($3) != $size*2) {
+    Log3 $name, 1, "$name: THERMOSTAT_SETPOINT_REPORT "
+                        ."wrong number of bytes received";
+    return;
+  }
+  my $sp = hex($3);
+  $sp -= (2 ** ($size*8)) if $sp >= (2 ** ($size*8-1));
+  $sp = $sp / (10 ** $prec);
+  
+  # output temperature with variable decimals as reported (according to $prec)
+  my $rt = sprintf("setpointTemp:%0.*f %s %s", $prec, $sp, $scale, $type);
+
+  return ($rt);
+}
+
+sub
+ZWave_thermostatSetpointSupportedParse ($$)
+{
+  # only defined for version >= V3
+  my ($hash, $val) = @_;
+  my $name = $hash->{NAME};
+  
+  return if($val !~ m/^(.*)/);
+  
+  my $n = length($val)/2;
+  my @supportedType =  ( # definition from V3
+                        "none",                   # 0x00
+                        "heating",                # 0x01
+                        "cooling",                # 0x02
+                        "furnance",               # 0x07 !type 3 to 6 left out!
+                        "dryAir",                 # 0x08
+                        "moistAir",               # 0x09
+                        "autoChangeover",         # 0x0a
+                        "energySaveHeating",      # 0x0b
+                        "energySaveCooling",      # 0x0c
+                        "awayHeating",            # 0x0d
+                        "awayCooling",            # 0x0e
+                        "fullPower"               # 0x0f
+                      );
+  my $numTypes = @supportedType;
+  my $delimeter = '';
+  my $rt = "thermostatSetpointSupported:";
+
+  for (my $i=0; $i<$n; $i++) {
+    # loop over all supplied bytes
+    my $supported = hex(substr($val, $i*2, 2));
+    for (my $j=$i*8; $j<$i*8+8; $j++) {
+      # loop over all bits
+      last if $j >= $numTypes;
+      if ($supported & (2 ** ($j-$i*8))) { 
+        $rt .= sprintf("$delimeter$supportedType[$j]");
+        $delimeter = " ";
+      }
+    }
+  }
+
+  return ($rt);
+}
+
+sub
 ZWave_scheduleSupportedParse ($$)
 {
   my ($hash, $val) = @_;
@@ -919,9 +1319,10 @@ ZWave_scheduleSupportedParse ($$)
     }
 
   }
-  my $rt1 = "scheduleSupported:$numSupported $sTimeSupport $fbSupport ".
-    "$sEnaDis $numSupportedCC $OverrideTypes $overrideSupport";
-  my $rt2 = "scheduleSupportedCC:$supportedCCs";
+  my $rt1 = "scheduleEntryLockScheduleSupported:"
+    ."$numSupported $sTimeSupport $fbSupport "
+    ."$sEnaDis $numSupportedCC $OverrideTypes $overrideSupport";
+  my $rt2 = "scheduleEntryLockScheduleSupportedCC:$supportedCCs";
   return ($rt1, $rt2);
 }
 
@@ -977,7 +1378,6 @@ ZWave_scheduleSet ($$)
   return ("",$rt);
   
 }
-
 
 sub
 ZWave_scheduleParse ($$)
@@ -1150,48 +1550,6 @@ ZWave_meterSupportedParse($$)
             " $meter_reset_text";
 }
 
-sub
-ZWave_versionClassRequest($$)
-{
-  my ($hash, $answer) = @_;
-  my $name = $hash->{NAME};
-
-  if($answer =~ m/^048614(..)(..)$/i) { # Parse part
-    my $v = $hash->{versionhash};
-    $v->{$zwave_id2class{lc($1)}} = $2;
-    foreach my $class (keys %{$v}) {
-      next if($v->{$class} ne "");
-      my $r = ZWave_Set($hash, $name, "versionClassRequest", $class);
-      return;
-    }
-    $attr{$hash->{NAME}}{vclasses} =
-        join(" ", map { "$_:$v->{$_}" } sort keys %{$v});
-    delete($hash->{versionhash});
-  }
-
-  if($answer ne "%s" && $hash->{versionhash}) { # get next
-    return("", sprintf('13%02x', hex($zwave_class{$answer}{id})))
-          if($zwave_class{$answer});
-    return("versionClassRequest needs no parameter", "");
-  }
-
-  return("versionClassRequest needs no parameter", "")
-        if($answer ne "%s" && !$hash->{versionhash});
-
-  return("another versionClassRequest is already running", "")
-        if(defined($hash->{versionhash}));
-
-  # User part: called with no parameters
-  my %h = map { $_ => "" }
-          grep { $_ !~ m/^MARK$/ && $_ !~ m/^UNKNOWN/ }
-          split(" ", AttrVal($name, "classes", ""));
-  $hash->{versionhash} = \%h;
-  foreach my $class (keys %h) {
-    next if($h{$class} ne "");
-    return("", sprintf('13%02x', hex($zwave_class{$class}{id})));
-  }
-  return("Should not happen", "");
-}
 
 sub
 ZWave_versionClassGet($)
@@ -1204,6 +1562,35 @@ ZWave_versionClassGet($)
         if($zwave_class{$class});
   return ("versionClass needs a class as parameter", "") if($class eq "%s");
   return ("Unknown class $class", "");
+}
+
+sub
+ZWave_versionClassAllGet($@)
+{
+  my ($hash, $data) = @_;
+  my $name = $hash->{NAME};
+  my $hname = ".versionClassAllGet";
+
+  if(!$data) { # called by the user
+    $zwave_parseHook{"$hash->{nodeIdHex}:..8614"} = \&ZWave_versionClassAllGet;
+    delete($hash->{CL});
+    my @arr = split(" ", AttrVal($name, "classes", ""));
+    $hash->{$hname} = \@arr;
+    ZWave_Get($hash, $name, "versionClass", shift @{$hash->{$hname}});
+    $attr{$name}{vclasses} = "";
+    return("", "EMPTY");
+  }
+
+  return 0 if($data !~ m/^048614(..)(..)$/i); # ??
+  $attr{$name}{vclasses} .= " " if($attr{$name}{vclasses});
+  $attr{$name}{vclasses} .= $zwave_id2class{lc($1)}.":".hex($2);
+  if(!int(@{$hash->{$hname}})) {
+    delete($hash->{$hname});
+    return 1; # "veto" for parseHook
+  }
+  ZWave_Get($hash, $name, "versionClass", shift @{$hash->{$hname}});
+  $zwave_parseHook{"$hash->{nodeIdHex}:..8614"} = \&ZWave_versionClassAllGet;
+  return 1; # "veto" for parseHook
 }
 
 sub
@@ -1279,7 +1666,6 @@ ZWave_multilevelParse($$$)
   return sprintf("%s:%.*f %s", $ml->{n}, $pr, $val/(10**$pr),
        int(@{$ml->{st}}) > $sc ? $ml->{st}->[$sc] : "");
 }
-
 
 sub
 ZWave_applicationStatusBusyParse($$$)
@@ -1383,7 +1769,6 @@ ZWave_timeOffsetReport($$)
     $monthEndDST, $dayEndDST, $hourEndDST);
 
   return (sprintf("timeOffset:$UTCoffset $DSToffset $startDST $endDST"));
-  
 }
 
 sub
@@ -1592,7 +1977,6 @@ ZWave_sceneParse($)
   return sprintf("sceneEvent%s:%s", int(hex($p)/10), $arg[hex($p)%10]);
 }
 
-
 sub
 ZWave_mcCapability($$)
 {
@@ -1626,6 +2010,22 @@ ZWave_mcCapability($$)
   }
 
   return "mcCapability_$chid:".join(" ", @classes);
+}
+
+sub
+ZWave_mcCreateAll($$)
+{
+  my ($hash, $data) = @_;
+  if(!$data) { # called by the user
+    $zwave_parseHook{"$hash->{nodeIdHex}:046008...."} = \&ZWave_mcCreateAll;
+    return("", "07");
+  }
+  $data =~ m/^046008(..)(..)/;
+  my $nGrp = hex($2);
+  for(my $c = 1; $c <= $nGrp; $c++) {
+    ZWave_Get($hash, $hash->{NAME}, "mcCapability", $c);
+  }
+  return undef;
 }
 
 sub
@@ -1710,7 +2110,7 @@ ZWave_ccsSet($)
   my @arg = split(/[ ,]/, $spec);
   my $usage = "wrong arg, need: <weekday> HH:MM relTemp HH:MM relTemp ...";
 
-  return ($usage,"") if(@arg < 3 || int(@arg) > 19 || (int(@arg)-1)%2 != 0);
+  return ($usage,"") if(@arg < 1 || int(@arg) > 19 || (int(@arg)-1)%2 != 0);
   my $wds = shift(@arg);
   my $ret;
   map { $ret=sprintf("%02x",$_) if($zwave_wd[$_] eq $wds) }(1..int($#zwave_wd));
@@ -1739,6 +2139,16 @@ ZWave_ccsGet($)
   return ("", sprintf("02%02x", $wdn));
 }
 
+sub
+ZWave_ccsAllGet ($)
+{
+  my ($hash) = @_;
+  foreach my $idx (1..int($#zwave_wd)) {
+    ZWave_Get($hash, $hash->{NAME}, "ccs", $zwave_wd[$idx]);
+  }
+  return ("","EMPTY");
+}
+  
 sub
 ZWave_ccsParse($$)
 {
@@ -1921,16 +2331,15 @@ ZWave_configGetHash($)
 }
 
 sub
-ZWave_configCheckParam($$$$$@)
+ZWave_configCheckParam($$$$@)
 {
-  my ($hash, $cfgReq, $type, $cmd, $fmt, @arg) = @_;
+  my ($hash, $type, $cmd, $fmt, @arg) = @_;
   my $mc = ZWave_configGetHash($hash);
   return ("", sprintf($fmt, @arg)) if(!$mc);
   my $h = $mc->{config}{$cmd};
   return ("", sprintf($fmt, @arg)) if(!$h);
 
-  # Support "set XX configYY request" for configRequestAll
-  return ("", sprintf("05%02x", $h->{index})) if($type eq "get" || $cfgReq);
+  return ("", sprintf("05%02x", $h->{index})) if($type eq "get");
 
   if($cmd eq "configRGBLedColorForTesting") {
     return ("6 digit hext number needed","") if($arg[0] !~ m/^[0-9a-f]{6}$/i);
@@ -2158,29 +2567,29 @@ ZWave_configParse($$$$)
 }
 
 sub
-ZWave_configRequestAll($)
+ZWave_configAllGet($)
 {
   my ($hash) = @_;
   my $mc = ZWave_configGetHash($hash);
-  return ("configRequestAll: no model specific configs found", undef)
+  return ("configAll: no model specific configs found", undef)
         if(!$mc || !$mc->{config});
-  #use Data::Dumper;
-  #Log 1, Dumper $mc;
+  delete($hash->{CL});
   foreach my $c (sort keys %{$mc->{get}}) {
-    my $r = ZWave_Set($hash, $hash->{NAME}, $c, "request");
-    Log 1, "$c: $r" if($r);
+    ZWave_Get($hash, $hash->{NAME}, $c);
   }
   return ("","EMPTY");
 }
 
 sub
-ZWave_associationRequest($$)
+ZWave_associationAllGet($$)
 {
   my ($hash, $data) = @_;
 
   if(!$data) { # called by the user
-    $zwave_parseHook{"$hash->{nodeIdHex}:..85"} = \&ZWave_associationRequest;
-    return("", "05");
+    $zwave_parseHook{"$hash->{nodeIdHex}:..85"} = \&ZWave_associationAllGet;
+    delete($hash->{CL});
+    ZWave_Get($hash, $hash->{NAME}, "associationGroups");
+    return("", "EMPTY");
   }
 
   my $nGrp = ($data =~ m/..8506(..)/ ? hex($1) :
@@ -2188,10 +2597,10 @@ ZWave_associationRequest($$)
   my $grp = 0;
   $grp = hex($1) if($data =~ m/..8503(..)/);
   return if($grp >= $nGrp);
-  $zwave_parseHook{"$hash->{nodeIdHex}:..85"} = \&ZWave_associationRequest;
-  ZWave_Set($hash, $hash->{NAME}, "associationRequest", $grp+1);
+  $zwave_parseHook{"$hash->{nodeIdHex}:..85"} = \&ZWave_associationAllGet;
+  ZWave_Get($hash, $hash->{NAME}, "association", $grp+1);
+  return;
 }
-
 
 my %zwave_roleType = (
   "00"=>"CentralStaticController",
@@ -2296,31 +2705,171 @@ ZWave_CRC16($)
 ##############################################
 #  SECURITY (start)
 ##############################################
+
 sub
-ZWave_secInit(@)
+ZWave_secIncludeStart($$)
 {
-  my ($hash, $param) = @_;
+  my ($hash, $iodev) = @_;
+  my $name = $hash->{NAME};
+  my $ioName = $iodev->{NAME};
+  
+  readingsSingleUpdate($hash, "SECURITY",
+                          "INITIALIZING (starting secure inclusion)", 0);
+  my $classes = AttrVal($name, "classes", "");
+  if($classes =~ m/SECURITY/) {
+    if ($zwave_cryptRijndael == 1) {
+      my $key = AttrVal($ioName, "networkKey", "");
+      if($key) {
+        $iodev->{secInitName} = $name;
+        Log3 $ioName, 2, "ZWAVE Starting secure init for $name";
+
+        #~ ZWave_secIncludeStart($dh);
+        #~ return "";
+
+        # starting secure inclusion by setting the scheme
+        $zwave_parseHook{"$hash->{nodeIdHex}:..9805"} = \&ZWave_secSchemeReport;
+        ZWave_secAddToSendStack($hash, "980400"); # only scheme "00" is defined
+        
+        return 1;
+      } else {
+        Log3 $ioName,1,"No secure inclusion as $ioName has no networkKey";
+        readingsSingleUpdate($hash, "SECURITY",
+                                'DISABLED (Networkkey not found)', 0);
+        Log3 $name, 1, "$name: SECURITY disabled, ".
+          "networkkey not found";
+      }
+    } else {
+      readingsSingleUpdate($hash, "SECURITY",
+                        'DISABLED (Module Crypt::Rijndael not found)', 0);
+      Log3 $name, 1, "$name: SECURITY disabled, module ".
+        "Crypt::Rijndael not found";
+    }
+  } else {
+    readingsSingleUpdate($hash, "SECURITY",
+                        'DISABLED (SECURITY not supported by device)', 0);
+    Log3 $name, 1, "$name: secure inclusion failed, ".
+      "SECURITY disabled, device does not support SECURITY command class";
+  }  
+  return 0;
+}
+
+sub
+ZWave_secSchemeReport($$) # only called by zwave_parseHook during Include
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  
+  if ($arg =~ m/..9805(..)/) { # 03980500 is expected
+    if ($1 == 0) { # supported SECURITY-Scheme, prepare for setting networkkey
+      $zwave_parseHook{"$hash->{nodeIdHex}:..9880"} = \&ZWave_secNetworkkeySet;
+      ZWave_secAddToSendStack($hash, '9840');
+      #ZWave_Cmd("set", $hash, $name, "secNonceReport");
+    } else {
+      Log3 $name, 1, "$name: Unsupported SECURITY-Scheme received: $1"
+                          .", please report";
+    }
+  } else {
+    Log3 $name, 1, "$name: Unknown SECURITY-SchemeReport received: $arg";
+  }
+  return 1; # "veto" for parseHook 
+}
+
+sub
+ZWave_secNetworkkeySet($$) # only called by zwave_parseHook during Include
+{  
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  my $iodev = $hash->{IODev};
+
+  my $r_nonce_hex;
+  if ($arg =~ m/..9880(................)/) {
+    $r_nonce_hex = $1;
+  } else {
+    Log3 $name, 1, "$name: Unknown SECURITY-NonceReport received: $arg";
+  }
+
+  my $key_hex = AttrVal($iodev->{NAME}, "networkKey", "");
+  my $mynonce_hex = substr (ZWave_secCreateNonce($hash), 2, 16);
+  my $cryptedNetworkKeyMsg = ZWave_secNetworkkeyEncode($r_nonce_hex,
+      $mynonce_hex, $key_hex, $hash->{nodeIdHex});
+      
+  $zwave_parseHook{"$hash->{nodeIdHex}:..9807"} = \&ZWave_secNetWorkKeyVerify;
+  ZWave_secAddToSendStack($hash, '98'.$cryptedNetworkKeyMsg);
+    
+  readingsSingleUpdate($hash, "SECURITY", 'INITIALIZING (Networkkey sent)',0);
+  Log3 $name, 5, "$name: SECURITY initializing, networkkey sent";
+
+  # start timer here to check state if networkkey was not verified
+  $hash->{networkkeyTimer} = { hash => $hash };
+  InternalTimer(gettimeofday()+25, "ZWave_secTestNetworkkeyVerify",
+                    $hash->{networkkeyTimer}, 0);
+  return 1; # "veto" for parseHook
+}
+
+sub
+ZWave_secNetWorkKeyVerify ($$) # only called by zwave_parseHook during Include
+{
+  my ($hash, $arg) = @_;
+  my $name = $hash->{NAME};
+  my $iodev = $hash->{IODev};
+
+  if (!ZWave_secIsEnabled($hash)) {
+    return 1;
+  }
+  
+  RemoveInternalTimer($hash->{networkkeyTimer});
+  delete $hash->{networkkeyTimer};
+  readingsSingleUpdate($hash, "SECURITY", 'ENABLED', 0);
+  Log3 $name, 3, "$name: SECURITY enabled, networkkey was verified";
+  
+  $zwave_parseHook{"$hash->{nodeIdHex}:..9803"} = \&ZWave_secIncludeFinished;
+  ZWave_Cmd("set", $hash, $name, ("secSupportedReport"));
+  return 1; # "veto" for parseHook
+}
+
+sub
+ZWave_secIncludeFinished($$) # only called by zwave_parseHook during Include
+{
+  my ($hash, $arg) = @_;
   my $iodev = $hash->{IODev};
   my $name = $hash->{NAME};
-  if (!ZWave_secIsEnabled($hash)) {
-    return;
+  
+  if ($iodev->{secInitName}) {
+    # Secure inclusion is finished, remove readings and execute "normal" init
+    delete $iodev->{secInitName};
+    ZWave_execInits($hash, 0);
   }
+  return 0; # no "veto" for parseHook -> parsing of secureSupported
+}
 
-  $hash->{secStatus} = 0 if(!$hash->{secStatus});
-  my $status = ++$hash->{secStatus};
-  my @stTxt = ( "secScheme", "secNonceRequest");
-  my $stTxt = ($status > int(@stTxt) ? "ERR" : $stTxt[$status-1]);
-
-  if($status == 1) {
-    ZWave_Cmd("set", $hash, $name, "secScheme");
-    return ""; # not evaluated
-  } elsif($status == 2) {
-    ZWave_Cmd("get", $hash, $name, "secNonce");
-    return undef;
-  } else {
-    Log3 $name, 5, "$name: secureInit called with invalid status";
-    return undef;
+sub
+ZWave_secTestNetworkkeyVerify ($)
+{
+  my ($p) = @_;
+  my $hash = $p->{hash};
+  my $name = $hash->{NAME};
+  my $sec_status = ReadingsVal($name, "SECURITY", undef);
+  
+  delete $hash->{networkkeyTimer};
+  if ($sec_status !~ m/ENABLED/) {
+    readingsSingleUpdate($hash, "SECURITY",
+        'DISABLED (networkkey not verified and timer expired)', 0);
+    Log3 $name, 1, "$name: SECURITY disabled, networkkey was not verified ".
+      "and timer expired";
   }
+}
+
+sub
+ZWave_secAddToSendStack($$)
+{
+  my ($hash, $cmd) = @_;
+  my $name = $hash->{NAME};
+ 
+  my $id = $hash->{nodeIdHex};  
+  my $len = sprintf("%02x", (length($cmd)-2)/2+1);
+  my $cmdEf  = (AttrVal($name, "noExplorerFrames", 0) == 0 ? "25" : "05");
+  my $data = "13$id$len$cmd$cmdEf$id"; # 13==SEND_DATA
+  ZWave_addToSendStack($hash, "set", $data);  
 }
 
 sub
@@ -2400,13 +2949,11 @@ ZWave_secIsSecureClass($$)
   return 0;
 }
 
-
 sub
 ZWave_secSupported($$)
 {
   my ($hash, $arg) = @_;
   my $name = $hash->{NAME};
-  my $iodev = $hash->{IODev};
   my $id = $hash->{nodeIdHex};
 
   if (!ZWave_secIsEnabled($hash)) {
@@ -2432,7 +2979,6 @@ ZWave_secSupported($$)
 
   # Add new secure_classes to classes if not already present
   # Needed for classes that are only supported with SECURITY
-
   if ($attr{$name}{secure_classes} && $attr{$name}{classes}) {
     my $classes        = $attr{$name}{classes};
     my $secure_classes = $attr{$name}{secure_classes};
@@ -2470,13 +3016,6 @@ ZWave_secSupported($$)
     $classes =~ s/ +/ /gs;
     $attr{$name}{classes} = $classes;
   }
-
-  if ($iodev->{secInitName} && $hash->{secStatus}) {
-    # Secure inclusion is finished, remove readings and execute "normal" init
-    delete $iodev->{secInitName};
-    delete $hash->{secStatus};
-    return ZWave_execInits($hash, 0);
-  }
 }
 
 sub
@@ -2489,23 +3028,6 @@ ZWave_secNonceReceived($$)
   if (!ZWave_secIsEnabled($hash))
   {
     return;
-  }
-
-  # If a nonce is received during secure_Include, send the networkkey...
-  if ($hash->{secStatus} && ($hash->{secStatus} == 2)) {
-    my $key_hex = AttrVal($iodev->{NAME}, "networkKey", "");
-    my $mynonce_hex = substr (ZWave_secCreateNonce($hash), 2, 16);
-    my $cryptedNetworkKeyMsg = ZWave_secNetworkkeySet($r_nonce_hex,
-      $mynonce_hex, $key_hex, $hash->{nodeIdHex});
-    ZWave_Cmd("set", $hash, $name, ("secEncap", $cryptedNetworkKeyMsg));
-    $hash->{secStatus}++;
-    readingsSingleUpdate($hash, "SECURITY", 'INITIALIZING (Networkkey sent)',0);
-    Log3 $name, 5, "$name: SECURITY initializing, networkkey sent";
-
-    # start timer here to check state if networkkey was not verified
-    $hash->{networkkeyTimer} = { hash => $hash };
-    InternalTimer(gettimeofday()+25, "ZWave_secTestNetworkkeyVerify", $hash->{networkkeyTimer}, 0);
-    return undef;
   }
 
   # if nonce is received, we should have stored a message for encryption
@@ -2522,16 +3044,14 @@ ZWave_secNonceReceived($$)
   }
 
   my $enc = ZWave_secEncrypt($hash, $r_nonce_hex, $secMsg);
-  ZWave_Cmd("set", $hash, $name, ("secEncap", $enc));
+  ZWave_secAddToSendStack($hash, '98'.$enc);
   if ($type eq "set" && $cmd && $cmd !~ m/^config.*request$/) {
     readingsSingleUpdate($hash, "state", $cmd, 1);
     Log3 $name, 5, "$name: type=$type, cmd=$cmd ($getSecMsg)";
     ZWave_secEnd($hash) if ($type eq "set");
   }
-
   return undef;
 }
-
 
 sub
 ZWave_secPutMsg ($$$)
@@ -2573,7 +3093,7 @@ ZWave_secNonceRequestReceived ($)
     return;
   }
   ZWave_secStart($hash);
-  return ZWave_Cmd("set", $hash, $hash->{NAME}, "sendNonce");
+  ZWave_secAddToSendStack($hash, '98'.ZWave_secCreateNonce($hash));
 }
 
 sub
@@ -2602,9 +3122,11 @@ ZWave_secCreateNonce($)
   if (ZWave_secIsEnabled($hash)) {
     my $nonce = ZWave_secGetNonce();
     setReadingsVal($hash, "send_nonce", $nonce, TimeNow());
-    return ("",'80'.$nonce);
+    #return ("",'80'.$nonce);
+    return ('80'.$nonce);
   } else {
-    return ("", '00');
+    #return ("", '00');
+    return ('00');
   }
 }
 
@@ -2616,41 +3138,6 @@ ZWave_secGetNonce()
     $nonce .= sprintf "%02x",int(rand(256));
   }
   return $nonce;
-}
-
-sub
-ZWave_secNetWorkKeyVerify ($)
-{
-  my ($hash) = @_;
-  my $name = $hash->{NAME};
-  my $iodev = $hash->{IODev};
-
-  if (!ZWave_secIsEnabled($hash)) {
-    return;
-  }
-
-  RemoveInternalTimer($hash->{networkkeyTimer});
-  delete $hash->{networkkeyTimer};
-  readingsSingleUpdate($hash, "SECURITY", 'ENABLED', 0);
-  Log3 $name, 3, "$name: SECURITY enabled, networkkey was verified";
-  ZWave_Cmd("get", $hash, $name, ("secSupported"));
-}
-
-sub
-ZWave_secTestNetworkkeyVerify ($)
-{
-  my ($p) = @_;
-  my $hash = $p->{hash};
-  my $name = $hash->{NAME};
-  my $sec_status = ReadingsVal($name, "SECURITY", undef);
-  
-  delete $hash->{networkkeyTimer};
-  if ($sec_status !~ m/ENABLED/) {
-    readingsSingleUpdate($hash, "SECURITY",
-        'DISABLED (networkkey not verified and timer expired)', 0);
-    Log3 $name, 1, "$name: SECURITY disabled, networkkey was not verified ".
-      "and timer expired";
-  }
 }
 
 sub
@@ -2791,7 +3278,8 @@ ZWave_secDecrypt($$$)
   }
 
   if ($newnonce == 1) {
-    ZWave_Cmd("set", $hash, $hash->{NAME}, "sendNonce");
+    ZWave_secAddToSendStack($hash, '98'.ZWave_secCreateNonce($hash));
+    #ZWave_Cmd("set", $hash, $hash->{NAME}, "secNonce");
   }
 
   return "";
@@ -2878,10 +3366,10 @@ ZWave_secGenerateAuth ($$$)
 }
 
 sub
-ZWave_secNetworkkeySet ($$$$)
+ZWave_secNetworkkeyEncode ($$$$)
 {
   my ($nonce_hex, $mynonce_hex, $key_plain_hex, $id_hex) = @_;
-  my $name ="ZWave_secNetworkkeySet";
+  #my $name ="ZWave_secNetworkkeySet";
 
   # The NetworkKeySet command message will be encrcpted and authentificated
   # with temporary keys that are created with the networkkey and default
@@ -2924,7 +3412,7 @@ ZWave_secNetworkkeySet ($$$$)
 }
 
 ##############################################
-#AH:   SECURITY (end)
+#  SECURITY (end)
 ##############################################
 
 sub
@@ -2999,14 +3487,23 @@ ZWave_isWakeUp($)
   return $h->{isWakeUp};
 }
 
+# stack contains type:hexcode
+# type is: set / sentset, get / sentget / sentackget
+# sentset will be discarded after ack, sentget needs ack (->sentackget) then msg
+# next discards either state.
+# acktpye: next, ack or msg
 sub
-ZWave_processSendStack($)
+ZWave_processSendStack($$)
 {
-  my ($hash) = @_;
+  my ($hash,$ackType) = @_;
   my $ss = $hash->{SendStack};
   return if(!$ss);
 
-  if(index($ss->[0],"sent") == 0) {
+  if($ss->[0] =~ m/^sent(.*?):(.*)$/) {
+    if($1 eq "get" && $ackType eq "ack") {
+      $ss->[0] = "sentackget:$2";
+      return;
+    }
     shift @{$ss};
     RemoveInternalTimer($hash) if(!ZWave_isWakeUp($hash));
   }
@@ -3016,30 +3513,32 @@ ZWave_processSendStack($)
     return;
   }
 
-  IOWrite($hash, $hash->{homeId}, "00".$ss->[0]);
-  $ss->[0] = "sent:".$ss->[0];
+  $ss->[0] =~ m/^([^:]*?):(.*)$/;
+  my ($type, $msg) = ($1, $2);
+  IOWrite($hash, $hash->{homeId}, "00$msg");
+  $ss->[0] = "sent$type:$msg";
 
   $hash->{lastMsgSent} = gettimeofday();
   $zwave_lastHashSent = $hash;
 
   if(!ZWave_isWakeUp($hash)) {
-    InternalTimer($hash->{lastMsgSent}+10, sub {
-      Log 2, "ZWave: No ACK from $hash->{NAME} after 10s for $ss->[0]";
-      ZWave_processSendStack($hash);
+    InternalTimer($hash->{lastMsgSent}+3, sub {
+      Log 2, "ZWave: No ACK from $hash->{NAME} after 3s for $ss->[0]";
+      ZWave_processSendStack($hash, "next");
     }, $hash, 0);
   }
 }
 
 sub
-ZWave_addToSendStack($$)
+ZWave_addToSendStack($$$)
 {
-  my ($hash, $cmd) = @_;
+  my ($hash, $type, $cmd) = @_;
   if(!$hash->{SendStack}) {
     my @empty;
     $hash->{SendStack} = \@empty;
   }
   my $ss = $hash->{SendStack};
-  push @{$ss}, $cmd;
+  push @{$ss}, "$type:$cmd";
 
   if(ZWave_isWakeUp($hash)) {
     # SECURITY XXX and neighborList
@@ -3051,14 +3550,14 @@ ZWave_addToSendStack($$)
 
   } else { # clear commands without 0113 and 0013
     my $now = gettimeofday();
-    if(@{$ss} > 1 && $now-$hash->{lastMsgSent} > 10) {
+    if(@{$ss} > 1 && $now-$hash->{lastMsgSent} > 3) {
       Log3 $hash, 2,
-        "ERROR: $hash->{NAME}: cleaning commands without ack after 10s";
+        "ERROR: $hash->{NAME}: cleaning commands without ack after 3s";
       delete $hash->{SendStack};
-      return ZWave_addToSendStack($hash, $cmd);
+      return ZWave_addToSendStack($hash, $type, $cmd);
     }
   }
-  ZWave_processSendStack($hash) if(@{$ss} == 1);
+  ZWave_processSendStack($hash, "next") if(@{$ss} == 1);
   return undef;
 }
 
@@ -3100,7 +3599,7 @@ ZWave_Parse($$@)
           my $hash = $zwave_lastHashSent;
           readingsSingleUpdate($hash, "SEND_DATA", "failed:$arg", 1);
           Log3 $ioName, 2, "ERROR: cannot SEND_DATA to $hash->{NAME}: $arg";
-          ZWave_processSendStack($hash);
+          ZWave_processSendStack($hash, "next");
 
         } else {
           Log3 $ioName, 2, "ERROR: cannot SEND_DATA: $arg (unknown device)";
@@ -3163,40 +3662,10 @@ ZWave_Parse($$@)
       ZWave_wakeupTimer($dh, 1) if(ZWave_isWakeUp($dh));
 
       if($iodev->{addSecure}) {
-        readingsSingleUpdate($dh, "SECURITY",
-                                "INITIALIZING (starting secure inclusion)", 0);
-        my $classes = AttrVal($dh->{NAME}, "classes", "");
-        if($classes =~ m/SECURITY/) {
-          if ($zwave_cryptRijndael == 1) {
-            my $key = AttrVal($ioName, "networkKey", "");
-            if($key) {
-              $iodev->{secInitName} = $dh->{NAME};
-              Log3 $ioName, 2, "ZWAVE Starting secure init";
-              return ZWave_secInit($dh);
-            } else {
-              Log3 $ioName,1,"No secure inclusion as $ioName has no networkKey";
-              readingsSingleUpdate($dh, "SECURITY",
-                                      'DISABLED (Networkkey not found)', 0);
-              Log3 $dh->{NAME}, 1, "$dh->{NAME}: SECURITY disabled, ".
-                "networkkey not found";
-            }
-          } else {
-            readingsSingleUpdate($dh, "SECURITY",
-                              'DISABLED (Module Crypt::Rijndael not found)', 0);
-            Log3 $dh->{NAME}, 1, "$dh->{NAME}: SECURITY disabled, module ".
-              "Crypt::Rijndael not found";
-          }
-        } else {
-          readingsSingleUpdate($dh, "SECURITY",
-                              'DISABLED (SECURITY not supported by device)', 0);
-          Log3 $dh->{NAME}, 1, "$dh->{NAME}: secure inclusion failed, ".
-            "SECURITY disabled, device does not support SECURITY command class";
-        }
+        return "" if (ZWave_secIncludeStart($dh, $iodev) == 1);
       }
-
       return ZWave_execInits($dh, 0);
     }
-
 
   } elsif($cmd eq "ZW_APPLICATION_UPDATE" && $arg =~ m/....(..)..(.*)$/) {
     my ($type6,$classes) = ($1, $2);
@@ -3206,7 +3675,7 @@ ZWave_Parse($$@)
     if($hash) {
       if(ZWave_isWakeUp($hash)) {
         ZWave_wakeupTimer($hash, 1);
-        ZWave_processSendStack($hash);
+        ZWave_processSendStack($hash, "next");
       }
 
       if(!$ret) {
@@ -3226,7 +3695,7 @@ ZWave_Parse($$@)
       Log3 $ioName, 4, "$ioName transmit $lmsg for $callbackid";
       if($hash) {
         readingsSingleUpdate($hash, "transmit", $lmsg, 0);
-        ZWave_processSendStack($hash);
+        ZWave_processSendStack($hash, "ack");
       }
       return "";
 
@@ -3348,42 +3817,43 @@ ZWave_Parse($$@)
        next;
     }
 
-    if($className eq "VERSION" && defined($hash->{versionhash})) {
-      ZWave_versionClassRequest($hash, $arg);
-      return "";
-    }
-
     my $ptr = ZWave_getHash($hash, $className, "parse");
     if(!$ptr) {
       push @event, "UNPARSED:$className $arg";
       next;
     }
 
-    my $matched = 0;
-    foreach my $k (keys %{$ptr}) {
-      if($arg =~ m/^$k/) {
-        my $val = $ptr->{$k};
-        my @val = ($val);
-        @val = eval $val if(index($val, '$') >= 0);
-        push @event, @val if(defined($val[0]));
-        $matched++;
-      }
-    }
-
+    my $hookVeto = 0;
     foreach my $h (keys %zwave_parseHook) {
       if("$id:$arg" =~ m/$h/) {
         my $fn = $zwave_parseHook{$h};
         delete $zwave_parseHook{$h};
-        $fn->($hash, $arg);
+        $hookVeto++ if($fn->($hash, $arg));
       }
     }
 
-    push @event, "UNPARSED:$className $arg" if(!$matched);
+    if(!$hookVeto) {
+      my $matched = 0;
+      foreach my $k (keys %{$ptr}) {
+        if($arg =~ m/^$k/) {
+          my $val = $ptr->{$k};
+          my @val = ($val);
+          @val = eval $val if(index($val, '$') >= 0);
+          push @event, @val if(defined($val[0]));
+          $matched++;
+        }
+      }
+      push @event, "UNPARSED:$className $arg" if(!$matched);
+    }
   }
 
   if($arg =~ m/^028407/) { # wakeup:notification
     ZWave_wakeupTimer($hash, 1);
-    ZWave_processSendStack($hash);
+    ZWave_processSendStack($hash, "next");
+
+  } else {
+    ZWave_processSendStack($hash, "msg");
+
   }
 
   return "" if(!@event);
@@ -3533,7 +4003,7 @@ s2Hex($)
   </ul>
   <br>
 
-  Note: the sets/gets/generated events of a gven node depend on the classes
+  Note: the sets/gets/generated events of a given node depend on the classes
   supported by this node. If a node supports 3 classes, then the union of
   these sets/gets/events will be available for this node.<br>
   Commands for battery operated nodes will be queues internally, and sent when
@@ -3558,17 +4028,13 @@ s2Hex($)
 
   <br><br><b>Class ASSOCIATION</b>
   <li>associationAdd groupId nodeId ...<br>
-  Add the specified list of nodeIds to the assotion group groupId.<br> Note:
+  Add the specified list of nodeIds to the association group groupId.<br> Note:
   upon creating a fhem-device for the first time fhem will automatically add
   the controller to the first association group of the node corresponding to
   the fhem device, i.e it issues a "set name associationAdd 1
   controllerNodeId"</li>
   <li>associationDel groupId nodeId ...<br>
-  Remove the specified list of nodeIds from the assotion group groupId.</li>
-  <li>associationRequest groupId<br>
-  corresponds to "get association", used by associationRequestAll</li>
-  <li>associationRequestAll<br>
-  request association info for all possibe groups.</li>
+  Remove the specified list of nodeIds from the association group groupId.</li>
 
   <br><br><b>Class BASIC</b>
   <li>basicValue value<br>
@@ -3597,7 +4063,9 @@ s2Hex($)
     Up to 9 pairs of HH:MM tempDiff may be specified.<br>
     HH:MM must occur in increasing order.
     tempDiff is relative to the setpoint temperature, and may be between -12
-    and 12, with one decimal point, measured in Kelvin (or Centigrade).
+    and 12, with one decimal point, measured in Kelvin (or Centigrade).<br>
+    If only a weekday is specified without any time and tempDiff, then the
+    complete schedule for the specified day is removed and marked as unused.
     </li>
 
   <br><br><b>Class CLOCK</b>
@@ -3628,10 +4096,6 @@ s2Hex($)
   <li>configDefault cfgAddress<br>
     Reset the configuration parameter for the cfgAddress parameter to its
     default value.  See the device documentation to determine this value.</li>
-  <li>configRequestAll<br>
-    If the model of a device is set, and configuration descriptions are
-    available from the database for this device, then request the value of all
-    known configuration parameters.</li>
 
   <br><br><b>Class DOOR_LOCK, V2</b>
   <li>doorLockOperation DOOR_LOCK_MODE<br>
@@ -3682,6 +4146,12 @@ s2Hex($)
     The command will reset ALL accumulated values, it is not possible to
     choose a single value.</li>
 
+  <br><br><b>Class MULTI_CHANNEL</b>
+  <li>mcCreateAll<br>
+    Create a FHEM device for all channels. This command is executed after
+    inclusion of a new device.
+    </li>
+
   <br><br><b>Class MULTI_CHANNEL_ASSOCIATION</b>
   <li>mcaAdd groupId node1 node2 ... 0 node1 endPoint1 node2 endPoint2 ...<br>
     Add a list of node or node:endpoint associations. The latter can be used to
@@ -3706,20 +4176,23 @@ s2Hex($)
     Set a schedule for a user. Due to lack of documentation,
       details for some parameters are not available. Command Class is
       used together with class USER_CODE.<br>
-      ID: id of schedule, refer to maximum number of supported schedules
-        reported by the scheduleSupported command.<br>
-      USER_ID: id of user, refer to the USER_CODE class description.<br>
-      YEAR-MONTH-DAY: start of schedule in the format yyyy-mm-dd.<br>
-      WDAY: weekday, 1=Monday, 7=Sunday.<br>
-      ACTIVE_ID: unknown parameter.<br>
-      DURATION_TYPE: unknown parameter.<br>
-      HOUR:MINUTE: start of schedule in the format hh:mm.<br>
-      DURATION: unknown parameter.<br>
-      NUM_REPORTS: number of reports to follow, must be 0.<br>
-      CMD: command(s) (as hexcode sequence) that the schedule executes,
-        see report of scheduleSupported command for supported command
-        class and mask. A list of space separated command can be
-        specified.<br>
+      <ul>
+        ID: id of schedule, refer to maximum number of supported schedules
+          reported by the scheduleSupported command.<br>
+        USER_ID: id of user, starting from 1 up to the number of supported
+        users, refer also to the USER_CODE class description.<br>
+        YEAR-MONTH-DAY: start of schedule in the format yyyy-mm-dd.<br>
+        WDAY: weekday, 1=Monday, 7=Sunday.<br>
+        ACTIVE_ID: unknown parameter.<br>
+        DURATION_TYPE: unknown parameter.<br>
+        HOUR:MINUTE: start of schedule in the format hh:mm.<br>
+        DURATION: unknown parameter.<br>
+        NUM_REPORTS: number of reports to follow, must be 0.<br>
+        CMD: command(s) (as hexcode sequence) that the schedule executes,
+          see report of scheduleSupported command for supported command
+          class and mask. A list of space separated command can be
+          specified.<br>
+      </ul>
       </li>
   <li>scheduleRemove ID<br>
     Remove the schedule with the id ID</li>
@@ -3768,25 +4241,84 @@ s2Hex($)
     set configuration for a specific scene.
     Parameters are: groupId, sceneId, dimmingDuration.
     </li>
-
-  <br><br><b>Class SECURITY</b>
-  <li>secScheme<br>
-    (internaly used to) set the security scheme '00'
+    
+  <br><br><b>Class SCHEDULE_ENTRY_LOCK, V1, V2, V3</b>
+  <li>scheduleEntryLockSet USER_ID ENABLED<br>
+    enables or disables schedules for a specified user ID (V1)<br>
+      <ul>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      ENABLED: 0=disabled, 1=enabled<br>
+      </ul>
     </li>
-  <li>sendNonce<br>
-    (internaly used to) send a security NONCE to the device
+  <li>scheduleEntryLockAllSet ENABLED<br>
+    enables or disables schedules for all users (V1)<br>
+      <ul>
+      ENABLED: 0=disabled, 1=enabled<br>
+      </ul>
     </li>
-  <li>secEncap<br>
-    (internaly used to) send an encrypted message to the device
+  <li>scheduleEntryLockWeekDaySet ACTION USER_ID SCHEDULE_ID WEEKDAY
+      STARTTIME ENDTIME<br>
+    erase or set a week day schedule for a specified user ID (V1)<br>
+      <ul>
+      ACTION: 0=erase schedule slot, 1=modify the schedule slot for the user<br>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      WEEKDAY: day of week, choose one of:
+                    "sun","mon","tue","wed","thu","fri","sat"<br>
+      STARTTIME: time of schedule start, in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      ENDTIME: time of schedule end in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      </ul>
     </li>
-  <li>Notes:<br>
-    This class needs the installation of the perl module Crypt::Rijndael
-    and a defined networkkey in the attributes of the ZWDongle device<br>
-    Currently a secure inclusion can only be started from the command input
-    with "set &lt;ZWDongle_device_name&gt; addNode [onSec|onNwSec]"<br>
-    These commands are only described here for completeness of the
-    documentation, but are not intended for manual usage. These commands
-    will be removed from the interface in future version.</li>
+  <li>scheduleEntryLockYearDaySet ACTION USER_ID SCHEDULE_ID 
+        STARTDATE STARTTIME ENDDATE ENDTIME<br>
+    erase or set a year day schedule for a specified user ID (V1)<br>
+      <ul>
+      ACTION: 0=erase schedule slot, 1=modify the schedule slot for the user<br>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      STARTDATE: date of schedule start in the format YYYY-MM-DD<br>
+      STARTTIME: time of schedule start in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      ENDDATE: date of schedule end in the format YYYY-MM-DD<br>
+      ENDTIME: time of schedule end in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      </ul>
+    </li>
+  <li>scheduleEntryLockTimeOffsetSet TZO DST<br>
+    set the TZO and DST (V2)<br>  
+      <ul>
+      TZO: current local time zone offset in the format (+|-)HH:MM
+          (sign and leading 0 is mandatory)<br>
+      DST: daylight saving time offset in the format (+|-)[[m]m]m
+          (sign is mandatory, minutes: 0 to 127, 1-3 digits)<br>
+      </ul>
+    </li>
+  <li>scheduleEntryLockDailyRepeatingSet ACTION USER_ID SCHEDULE_ID WEEKDAYS
+        STARTTIME DURATION<br>
+    set a daily repeating schedule for the specified user (V3)<br>
+      <ul>
+      ACTION: 0=erase schedule slot, 1=modify the schedule slot for the user<br>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      WEEKDAYS: concatenated string of weekdays (choose from:
+                    "sun","mon","tue","wed","thu","fri","sat");
+                    e.g. "montuewedfri" or "satsun", unused days can be
+                    specified as "..."<br>
+      STARTTIME: time of schedule start in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      DURATION: duration of schedule in the format HH:MM
+                    (leading 0 is mandatory)<br>
+      </ul>
+    </li>
 
   <br><br><b>Class SWITCH_ALL</b>
   <li>swaIncludeNone<br>
@@ -3829,12 +4361,51 @@ s2Hex($)
   <br><br><b>Class THERMOSTAT_SETPOINT</b>
   <li>setpointHeating value<br>
     set the thermostat to heat to the given value.
-    The value is a whole number and read as celsius.
+    The value is a whole number and read as celsius.<br>
+    See thermostatSetpointSet for a more enhanced method.
   </li>
   <li>setpointCooling value<br>
     set the thermostat to heat to the given value.
-    The value is a whole number and read as celsius.
+    The value is a whole number and read as celsius.<br>
+    See thermostatSetpointSet for a more enhanced method.
   </li>
+  <li>thermostatSetpointSet TEMP [SCALE [TYPE [PREC [SIZE]]]]<br>
+    set the setpoint of the thermostat to the given value.<br>
+      <ul>
+      TEMP: setpoint temperature value, by default the value is used
+              with 1 decimal, see PREC<br>
+      SCALE: (optional) scale of temperature; [cC]=celsius, [fF]=fahrenheit,
+            defaults to celsius<br>
+      TYPE: (optional) setpoint type; [1, 15], defaults to 1=heating<br>
+        <ul>
+        1=heating,
+        2=cooling,
+        7=furnance,
+        8=dryAir,
+        9=moistAir,
+        10=autoChangeover,
+        11=energySaveHeating,
+        12=energySaveCooling,
+        13=awayHeating,
+        14=awayCooling,
+        15=fullPower
+        </ul>
+      PREC: (optional) number of decimals to be used, [1-7], defaults to 1<br>
+      SIZE: (optional) number of bytes used, [1, 2, 4], defaults to 2<br>
+      Note: optinal parameters can be ommitted and are used with there default
+            values. If you need or want to specify an optional parameter, ALL
+            parameters in front of this parameter need to be also specified!<br>
+      Note: the number of decimals (defined by PREC) and the number of
+      bytes (defined by SIZE) used for the setpoint influence the usable
+      range for the temperature. Some device do not support all possible
+      values/combinations for PREC/SIZE.<br>
+        <ul>
+        1 byte: 0 decimals [-128, 127], 1 decimal [-12.8, 12.7], ...<br>
+        2 byte: 0 decimals [-32768, 32767], 1 decimal [-3276.8, 3276.7], ...<br>
+        4 byte: 0 decimals [-2147483648, 2147483647], ...<br>
+        </ul>
+      </ul>
+    </li>
 
   <br><br><b>Class TIME, V2</b>
   <li>timeOffset TZO DST_Offset DST_START DST_END<br>
@@ -3861,14 +4432,6 @@ s2Hex($)
     set code and status for the id n. n ist starting at 1, status is 0 for
     available (deleted) and 1 for set (occupied). code is a hexadecimal string.
     </li>
-
-  <br><br><b>Class VERSION</b>
-  <li>versionClassRequest<br>
-    executes "get devicename versionClass class" for each class from the
-    classes attribute in the background without generating events, and sets the
-    vclasses attribute at the end.
-    </li>
-
 
   <br><br><b>Class WAKE_UP</b>
   <li>wakeupInterval value nodeId<br>
@@ -3903,6 +4466,8 @@ s2Hex($)
   <li>associationGroups<br>
     return the number of association groups<br>
     </li>
+  <li>associationAll<br>
+    request association info for all possibe groups.</li>
 
   <br><br><b>Class ASSOCIATION_GRP_INFO</b>
   <li>associationGroupName groupId<br>
@@ -3931,6 +4496,9 @@ s2Hex($)
   <li>ccs [mon|tue|wed|thu|fri|sat|sun]<br>
     request the climate control schedule for the given day.
     </li>
+  <li>ccsAll<br>
+    request the climate control schedule for all days. (runs in background)
+    </li>
 
   <br><br><b>Class CLOCK</b>
   <li>clock<br>
@@ -3951,6 +4519,10 @@ s2Hex($)
     Note: if the model is set (see MANUFACTURER_SPECIFIC get), then more
     specific config commands are available.
     </li>
+  <li>configAll<br>
+    If the model of a device is set, and configuration descriptions are
+    available from the database for this device, then request the value of all
+    known configuration parameters.</li>
 
   <br><br><b>Class DOOR_LOCK, V2</b>
   <li>doorLockConfiguration<br>
@@ -4068,17 +4640,51 @@ s2Hex($)
   <li>groupConfig<br>
     returns the settings for a given group. Parameter is groupId
     </li>
+    
+  <br><br><b>Class SCHEDULE_ENTRY_LOCK, V1, V2, V3</b>
+  <li>scheduleEntryLockTypeSupported<br>
+    returns the number of available slots for week day and year day
+      schedules (V1), in V3 the number of available slots for the daily
+      repeating schedule is reported additionally
+    </li> 
+  <li>scheduleEntryLockWeekDay USER_ID SCHEDULE_ID<br>
+    returns the specified week day schedule for the specified user
+      (day of week, start time, end time) (V1)<br>
+      <ul>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      </ul>
+    </li>
+  <li>scheduleEntryLockYearDay USER_ID SCHEDULE_ID<br>
+    returns the specified year day schedule for the specified user
+      (start date, start time, end date, end time) (V1)<br>
+      <ul>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      </ul>
+    </li>
+  <li>scheduleEntryLockDailyRepeating USER_ID SCHEDULE_ID<br>
+    returns the specified daily schedule for the specified user
+      (weekdays, start date, duration) (V3)<br>
+      <ul>
+      USER_ID: id of user, starting from 1 up to the number of supported users,
+      refer also to the USER_CODE class description.<br>
+      SCHEDULE_ID: schedule slot id (from 1 up to number of supported 
+                    schedule slots)<br>
+      </ul>
+    </li>
+  <li>scheduleEntryLockTimeOffset<br>
+    returns the time zone offset TZO and the daylight saving time offset (V2)
+    </li>
 
   <br><br><b>Class SECURITY</b>
-  <li>secSupported<br>
+  <li>secSupportedReport<br>
     (internaly used to) request the command classes that are supported
     with SECURITY
-    </li>
-  <li>secNonce<br>
-    (internaly used to) request a security NONCE from the device
-    </li>
-  <li>secEncap<br>
-    (internaly used to) send an encrypted message to the device
     </li>
   <li>Notes:<br>
     This class needs the installation of the perl module Crypt::Rijndael and
@@ -4127,8 +4733,25 @@ s2Hex($)
     </li>
 
   <br><br><b>Class THERMOSTAT_SETPOINT</b>
-  <li>setpoint<br>
-    request the setpoint
+  <li>setpoint [TYPE]<br>
+    request the setpoint<br>
+      TYPE: (optional) setpoint type; [1, 15], defaults to 1=heating<br>
+        <ul>
+        1=heating,
+        2=cooling,
+        7=furnance,
+        8=dryAir,
+        9=moistAir,
+        10=autoChangeover,
+        11=energySaveHeating,
+        12=energySaveCooling,
+        13=awayHeating,
+        14=awayCooling,
+        15=fullPower
+        </ul>
+    </li>
+  <li>thermostatSetpointSupported<br>
+    requests the list of supported setpoint types
     </li>
 
   <br><br><b>Class TIME, V2</b>
@@ -4160,7 +4783,14 @@ s2Hex($)
     </li>
   <li>versionClass classId or className<br>
      return the supported command version for the requested class
-  </li>
+    </li>
+  <li>versionClassAll<br>
+    executes "get devicename versionClass class" for each class from the
+    classes attribute in the background without generating events, and sets the
+    vclasses attribute at the end.
+    </li>
+
+
 
   <br><br><b>Class WAKE_UP</b>
   <li>wakeupInterval<br>
@@ -4203,12 +4833,12 @@ s2Hex($)
       class names (capital letters).
       </li>
     <li><a href="#secure_classes">secure_classes</a>
-      This attribute is the result of the "get DEVICE secSupported" command. It
-      contains a space seperated list of the the command classes that are
-      supported with SECURITY.
+      This attribute is the result of the "set DEVICE secSupportedReport"
+      command. It contains a space seperated list of the the command classes
+      that are supported with SECURITY.
       </li>
     <li><a href="#vclasses">vclasses</a>
-      This is the result of the "set DEVICE versionClassRequest" command, and
+      This is the result of the "get DEVICE versionClassAll" command, and
       contains the version information for each of the supported classes.
       </li>
     <li><a href="#noExplorerFrames">noExplorerFrames</a>
@@ -4372,10 +5002,25 @@ s2Hex($)
   <br><br><b>Class SCENE_CONTROLLER_CONF</b>
   <li>group_Id:scene dimmingDuration</li>
 
+  <br><br><b>Class SCHEDULE_ENTRY_LOCK</b>
+  <li>scheduleEntryLockEntryTypeSupported:WeekDaySlots: $value 
+        YearDaySlots: $value</li>
+  <li>weekDaySchedule_$userId:userID: $value slotID: $value $weekday 
+        $starthour:$startminute $endhour:$endminute</li>
+  <li>yearDaySchedule_$userId:userID: $value slotID: $value
+        start: $year-$month-$day $hour:$minute
+        end: $year-$month-$day $hour:$minute</li>
+  <li>scheduleEntryLockDailyRepeating_$userId:userID: $value $weekdays
+        $hour:$minute $durationhour:$durationminute<br>
+        Note: $weekdays is a concatenated string with weekdaynames
+        ("sun","mon","tue","wed","thu","fri","sat") where inactive weekdays are
+        represented by "...", e.g. montue...wedfri</li>
+  <li>scheduleEntryLockTimeOffset:TZO: $sign$hour:$minute DST: $sign$minutes</li>
+
   <br><br><b>Class SECURITY</b>
   <li>none<br>
   Note: the class security should work transparent to the sytem and is not
-  intended to generate event</li>
+  intended to generate events</li>
 
   <br><br><b>Class SENSOR_ALARM</b>
   <li>alarm_type_X:level Y node $nodeID seconds $seconds</li>
@@ -4482,7 +5127,27 @@ s2Hex($)
   <li>setTmManual</li>
 
   <br><br><b>Class THERMOSTAT_SETPOINT</b>
-  <li>setpointTemp:$temp [C|F] [heating|cooling]</li>
+  <li>setpointTemp:$temp $scale $type<br>
+    <ul>
+    $temp: setpoint temperature with number of decimals as reported
+            by the device<br>
+    $scale: [C|F]; C=Celsius scale, F=Fahrenheit scale<br>
+    $type: setpoint type, one of:<br>
+      <ul>
+        heating,
+        cooling,
+        furnance,
+        dryAir,
+        moistAir,
+        autoChangeover,
+        energySaveHeating,
+        energySaveCooling,
+        awayHeating,
+        awayCooling,
+        fullPower
+      </ul>
+    </ul>
+    </li>
 
   <br><br><b>Class TIME, V2</b>
   <li>time:$time RTC: [failed|working]</li>

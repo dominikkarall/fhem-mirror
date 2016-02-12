@@ -82,6 +82,7 @@ at_Define($$)
   $rel = "" if(!defined($rel));
   $rep = "" if(!defined($rep));
   $cnt = "" if(!defined($cnt));
+  delete $hash->{VOLATILE} if (defined($hash->{VOLATILE}));
   $hash->{RELATIVE} = ($rel ? "yes" : "no");
   $hash->{PERIODIC} = ($rep ? "yes" : "no");
   $hash->{TIMESPEC} = $tspec;
@@ -371,6 +372,7 @@ EOF
 1;
 
 =pod
+=item helper
 =begin html
 
 <a name="at"></a>
