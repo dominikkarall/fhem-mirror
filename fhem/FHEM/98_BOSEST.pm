@@ -6,9 +6,12 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 0.9.5
+# Version: 0.9.6
 #
 #############################################################
+#
+# v0.9.6 - 20160210
+#  - FEATURE: support prev/next track
 #
 # v0.9.5 - 20160210
 #  - FEATURE: update channel based on websocket events
@@ -60,6 +63,7 @@
 #  - change preset via /key
 #
 # TODO
+#  - fix if off or on is sent 2 times in a short time (STANDBY not identified yet)
 #  - check if Mojolicious::Lite can be used
 #  - handle aborted blockingcalls
 #  - use processXml for all XML messages (websocket, httpget)
@@ -501,6 +505,7 @@ sub BOSEST_Set($@) {
             return ""; #no arguments for server
         } else {
             return "Unknown argument, choose one of on:noArg off:noArg power:noArg play:noArg 
+                    nextTrack:noArg prevTrack:noArg
                     stop:noArg pause:noArg channel:1,2,3,4,5,6 volume:slider,0,1,100";
         }
     } elsif($workType eq "volume") {
@@ -523,6 +528,10 @@ sub BOSEST_Set($@) {
         BOSEST_on($hash);
     } elsif($workType eq "off") {
         BOSEST_off($hash);
+    } elsif($workType eq "nextTrack") {
+        BOSEST_next($hash);
+    } elsif($workType eq "prevTrack") {
+        BOSEST_prev($hash);
     } else {
         return "BOSEST: Unknown argument $workType";
     }
@@ -588,6 +597,18 @@ sub BOSEST_pause($) {
 sub BOSEST_power($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "POWER");
+    return undef;
+}
+
+sub BOSEST_next($) {
+    my ($hash) = @_;
+    BOSEST_sendKey($hash, "NEXT_TRACK");
+    return undef;
+}
+
+sub BOSEST_prev($) {
+    my ($hash) = @_;
+    BOSEST_sendKey($hash, "PREV_TRACK");
     return undef;
 }
 
