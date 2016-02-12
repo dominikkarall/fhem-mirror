@@ -1,5 +1,11 @@
 ##############################################
-# 2016-02-10, v1.20, dominik $
+# 2016-02-12, v1.22, dominik $
+#
+# v1.22
+# - CHANGED: set state offline on startup and off when found
+#
+# v1.21
+# - BUGFIX: fix handling if device was not found
 #
 # v1.20
 # - CHANGED: removed all iThreads
@@ -70,23 +76,25 @@ DLNAClient_finishedUPnPScan($)
   my ($string) = @_;
   my ($name, $ssdp, $description) = split("\\|", $string);
   my $hash = $main::defs{$name};
-  
-  $ssdp = decode_base64($ssdp);
-  $description = decode_base64($description);
-  
+
   delete($hash->{helper}{SCAN_PID});
   InternalTimer(gettimeofday() + 60, 'DLNAClient_startUPnPScan', $hash, 0);
-  
+
   if(!defined($ssdp)) {
     Log3 $hash, 4, "DLNAClient: DLNA device not found.";
     return undef;
   }
+  
+  $ssdp = decode_base64($ssdp);
+  $description = decode_base64($description);
 
   my $dev = Net::UPnP::Device->new();
   $dev->setssdp($ssdp);
   $dev->setdescription($description);
   
   $hash->{helper}{device} = $dev;
+  
+  readingsSingleUpdate($hash,"state","off",1);
   
   Log3 $hash, 4, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
   
@@ -144,6 +152,8 @@ DLNAClient_Define($$)
   my $type            = shift @param;
   my $clientName      = join(" ", @param);
   $hash->{DEVNAME} = $clientName;
+  
+  readingsSingleUpdate($hash,"state","offline",1);
   
   InternalTimer(gettimeofday() + 10, 'DLNAClient_startUPnPScan', $hash, 0);
   
