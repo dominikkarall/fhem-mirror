@@ -1,8 +1,13 @@
 ##############################################
-# 2016-02-12, v1.22, dominik $
+# 2016-02-14, v1.23, dominik $
+#
+# v1.23
+# - BUGFIX: call GetVolume only after scan
 #
 # v1.22
 # - CHANGED: set state offline on startup and off when found
+# - BUGFIX: add use Blocking
+# - FEATURE: log version on startup
 #
 # v1.21
 # - BUGFIX: fix handling if device was not found
@@ -19,6 +24,8 @@ package main;
 
 use strict;
 use warnings;
+
+use Blocking;
 
 use MIME::Base64;
 use Net::UPnP::ControlPoint;
@@ -94,9 +101,43 @@ DLNAClient_finishedUPnPScan($)
   
   $hash->{helper}{device} = $dev;
   
+  #set render_service
+  my $render_service;
+  my @service_list = $dev->getservicelist();
+  foreach my $service (@service_list) {
+    my @serv_parts = split(/:/, $service->getservicetype());
+    if ($serv_parts[3] eq "RenderingControl") {
+      $render_service = $service;
+    }
+  }
+  $hash->{helper}{render_service} = $render_service;
+  
+  DLNAClient_updateVolume($hash);
+  
   readingsSingleUpdate($hash,"state","off",1);
   
   Log3 $hash, 4, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
+  
+  return undef;
+}
+
+sub
+DLNAClient_updateVolume($)
+{
+  my ($hash) = @_;
+  my $render_service = $hash->{helper}{render_service};
+  
+  #get current volume
+  if ($render_service) {
+    my %action_renderctrl_in_args = (
+      'InstanceID' => 0,
+      'Channel' => 'Master'
+    );
+    my $render_service_res = $render_service->postcontrol('GetVolume', \%action_renderctrl_in_args);
+    my $volume_out_arg = $render_service_res->getargumentlist();
+    my $currVolume = $volume_out_arg->{'CurrentVolume'};
+    readingsSingleUpdate($hash, "volume", $currVolume, 1);
+  }
   
   return undef;
 }
@@ -153,6 +194,8 @@ DLNAClient_Define($$)
   my $clientName      = join(" ", @param);
   $hash->{DEVNAME} = $clientName;
   
+  Log3 $hash, 3, "DLNAClient: DLNA Client v1.23";
+  
   readingsSingleUpdate($hash,"state","offline",1);
   
   InternalTimer(gettimeofday() + 10, 'DLNAClient_startUPnPScan', $hash, 0);
@@ -179,6 +222,7 @@ DLNAClient_Set($@)
   my ($hash, @param) = @_;
   my $deviceName = $hash->{DEVNAME};
   my $dev = $hash->{helper}{device};
+  my $render_service = $hash->{helper}{render_service};
   my $streamURI = "";
   
   # check parameters
@@ -192,26 +236,6 @@ DLNAClient_Set($@)
   # check device presence
   if (!defined($dev)) {
     return "DLNAClient: Currently searching for device $hash->{DEVNAME}...";
-  }
-  
-  my $service;
-  my $render_service;
-  my @service_list = $dev->getservicelist();
-  foreach $service (@service_list) {
-    my @serv_parts = split(/:/, $service->getservicetype());
-    if ($serv_parts[3] eq "RenderingControl") {
-      $render_service = $service;
-    }
-  }
-  if ($render_service) {
-    my %action_renderctrl_in_args = (
-      'InstanceID' => 0,
-      'Channel' => 'Master'
-    );
-    my $render_service_res = $render_service->postcontrol('GetVolume', \%action_renderctrl_in_args);
-    my $volume_out_arg = $render_service_res->getargumentlist();
-    my $currVolume = $volume_out_arg->{'CurrentVolume'};
-    readingsSingleUpdate($hash, "volume", $currVolume, 1);
   }
   
   # set volume
