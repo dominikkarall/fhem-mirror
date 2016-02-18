@@ -1,8 +1,9 @@
 ##############################################
-# 2016-02-14, v1.23, dominik $
+# 2016-02-16, v1.23, dominik $
 #
 # v1.23
 # - BUGFIX: call GetVolume only after scan
+# - FEATURE: add presence based on first scan
 #
 # v1.22
 # - CHANGED: set state offline on startup and off when found
@@ -18,6 +19,9 @@
 #
 # DLNA Module to play given URLs on a DLNA Renderer
 # and control their volume
+#
+# TODO
+# - set presence=offline if device wasn't found for X minutes
 #
 ##############################################
 package main;
@@ -100,7 +104,7 @@ DLNAClient_finishedUPnPScan($)
   $dev->setdescription($description);
   
   $hash->{helper}{device} = $dev;
-  
+    
   #set render_service
   my $render_service;
   my @service_list = $dev->getservicelist();
@@ -112,11 +116,13 @@ DLNAClient_finishedUPnPScan($)
   }
   $hash->{helper}{render_service} = $render_service;
   
+  if (defined($hash->{READINGS}{presence}) and $hash->{READINGS}{presence}{VAL} ne "online") {
+    readingsSingleUpdate($hash,"presence","online",1);
+  }
+  
   DLNAClient_updateVolume($hash);
   
-  readingsSingleUpdate($hash,"state","off",1);
-  
-  Log3 $hash, 4, "DLNAClient: Using device \"".$dev->getfriendlyname()."\".";
+  Log3 $hash, 4, "DLNAClient: Using device \"".$hash->{helper}{device}->getfriendlyname()."\".";
   
   return undef;
 }
@@ -136,7 +142,9 @@ DLNAClient_updateVolume($)
     my $render_service_res = $render_service->postcontrol('GetVolume', \%action_renderctrl_in_args);
     my $volume_out_arg = $render_service_res->getargumentlist();
     my $currVolume = $volume_out_arg->{'CurrentVolume'};
-    readingsSingleUpdate($hash, "volume", $currVolume, 1);
+    if (defined($hash->{READINGS}{volume}) and $hash->{READINGS}{volume}{VAL} ne $currVolume) {
+      readingsSingleUpdate($hash, "volume", $currVolume, 1);
+    }
   }
   
   return undef;
@@ -196,7 +204,7 @@ DLNAClient_Define($$)
   
   Log3 $hash, 3, "DLNAClient: DLNA Client v1.23";
   
-  readingsSingleUpdate($hash,"state","offline",1);
+  readingsSingleUpdate($hash,"presence","offline",1);
   
   InternalTimer(gettimeofday() + 10, 'DLNAClient_startUPnPScan', $hash, 0);
   

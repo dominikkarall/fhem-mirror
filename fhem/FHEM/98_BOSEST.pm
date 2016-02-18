@@ -6,9 +6,29 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 0.9.7
+# Version: 1.0.0
 #
 #############################################################
+#
+# v1.0.0 - xxxxxxxx
+#  - FEATURE: support multi-room (play everywhere)
+#  - FEATURE: add "double-tap" multi-room feature
+#             double-tap (<1s) a hardware preset button to
+#             enable or disable the multi-room feature
+#  - FEATURE: show current zone members in readings
+#  - FEATURE: support bass settings
+#  - FEATURE: support infoUpdated (e.g. deviceName change)
+#  - FEATURE: support mute on/off/toggle
+#  - FEATURE: support recent channel list
+#             set name recent X
+#             names for recent list entries are shown in readings
+#  - FEATURE: support channel_07-20 by attribute
+#             format:name|location|source|sourceAccount or
+#                    name|location|source| if no sourceAccount
+#  - FEATURE: support bluetooth/bt-discover/aux mode
+#  - FEATURE: support ignoreDeviceIDs for main define
+#             format:B23C23FF,A2EC81EF
+#  - CHANGE: reading channel_X => channel_0X (e.g. channel_02)
 #
 # v0.9.7 - 20160214
 #  - FEATURE: print module version on startup of main module
@@ -77,22 +97,17 @@
 #  - change preset via /key
 #
 # TODO
+#  - define own groups of players
 #  - update readings only on change
 #  - check if websocket finished can be called after websocket re-connected
 #  - cleanup all readings on startup (IP=unknown)
 #  - use LWP callback functions
-#  - support multi-room (play everywhere)
-#  - support recents list (set recent...)
 #  - fix usage of bulkupdate vs. singleupdate
 #  - check if Mojolicious::Lite can be used
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
 #  - add attribute to ignore deviceID in main
-#  - define own presets with attr (7:1234,8:4567,...)
 #  - "auto-zone" if 2 or more speakers play the same station
-#  - support "zone-buttons"
-#  - support "double-tap" presets
-#  - support bass settings
 #
 #############################################################
 
@@ -122,6 +137,10 @@ sub BOSEST_Initialize($) {
     $hash->{UndefFn} = 'BOSEST_Undef';
     $hash->{GetFn} = 'BOSEST_Get';
     $hash->{SetFn} = 'BOSEST_Set';
+    $hash->{AttrFn} = 'BOSEST_Attribute';
+    $hash->{AttrList} = 'channel_07 channel_08 channel_09 channel_10 channel_11 ';
+    $hash->{AttrList} .= 'channel_12 channel_13 channel_14 channel_15 channel_16 ';
+    $hash->{AttrList} .= 'channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs '.$readingFnAttributes;
     
     return undef;
 }
@@ -136,7 +155,7 @@ sub BOSEST_Define($$) {
     
     if (int(@a) > 3) {
         return 'BOSEST: Wrong syntax, must be define <name> BOSEST [<deviceID>]';
-    } elsif(int(@a) == 3) {
+    } elsif(int(@a) == 3) {    
         $name = $a[0];
         #set device id from parameter
         $hash->{DEVICEID} = $a[2];
@@ -144,17 +163,38 @@ sub BOSEST_Define($$) {
         $hash->{helper}{IP} = "unknown";
         readingsSingleUpdate($hash, "IP", "unknown", 1);
         
-        #TODO cleanup all readings on startup
+        #TODO cleanup all readings on startup (updateIP?)
         
-        #allow on/off commands
+        #allow on/off commands (updateIP?)
         $hash->{helper}{sent_on} = 0;
         $hash->{helper}{sent_off} = 0;
+        
+        #FIXME check /getZone if playeverwhere is active (updateIP?)
+        $hash->{helper}{playZoneMaster} = "";
+        $hash->{helper}{playZoneMasterTS} = gettimeofday();
+        
+        #init switchSource
+        $hash->{helper}{switchSource} = "";
+        
+        #FIXME reset all recent_$i entries on startup (must be done here, otherwise readings are displayed when player wasn't found)
     }
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v0.9.7";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.0.0";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
+    }
+    
+    return undef;
+}
+
+sub BOSEST_Attribute($$$$) {
+    my ($mode, $devName, $attrName, $attrValue) = @_;
+    
+    if($mode eq "set") {
+        #currently nothing to do
+    } elsif($mode eq "del") {
+        #currently nothing to do
     }
     
     return undef;
@@ -172,8 +212,10 @@ sub BOSEST_Set($@) {
             return ""; #no arguments for server
         } else {
             return "Unknown argument, choose one of on:noArg off:noArg power:noArg play:noArg 
-                    nextTrack:noArg prevTrack:noArg
-                    stop:noArg pause:noArg channel:1,2,3,4,5,6 volume:slider,0,1,100";
+                    mute:on,off,toggle recent source:bluetooth,bt-discover,aux 
+                    nextTrack:noArg prevTrack:noArg playEverywhere:noArg stopPlayEverywhere:noArg 
+                    stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 
+                    volume:slider,0,1,100 bass:slider,1,1,10";
         }
     }
     
@@ -189,6 +231,22 @@ sub BOSEST_Set($@) {
         return "BOSEST: channel requires preset id as additional parameter" if(int(@params) < 1);
         #params[0] = preset channel
         BOSEST_setPreset($hash, $params[0]);
+    } elsif($workType eq "bass") {
+        return "BOSEST: bass requires bass (1-10) as additional parameter" if(int(@params) < 1);
+        #params[0] = bass value
+        BOSEST_setBass($hash, $params[0]);
+    } elsif($workType eq "mute") {
+        return "BOSEST: mute requires on/off/toggle as additional parameter" if(int(@params) < 1);
+        #params[0] = mute value
+        BOSEST_setMute($hash, $params[0]);
+    } elsif($workType eq "recent") {
+        return "BOSEST: recebt requires number as additional parameter" if(int(@params) < 1);
+        #params[0] = recent value
+        BOSEST_setRecent($hash, $params[0]);
+    } elsif($workType eq "source") {
+        return "BOSEST: source requires bluetooth/aux as additional parameter" if(int(@params) < 1);
+        #params[0] = source value
+        BOSEST_setSource($hash, $params[0]);
     } elsif($workType eq "play") {
         BOSEST_play($hash);
     } elsif($workType eq "stop") {
@@ -211,6 +269,10 @@ sub BOSEST_Set($@) {
         BOSEST_next($hash);
     } elsif($workType eq "prevTrack") {
         BOSEST_prev($hash);
+    } elsif($workType eq "playEverywhere") {
+        BOSEST_playEverywhere($hash);
+    } elsif($workType eq "stopPlayEverywhere") {
+        BOSEST_stopPlayEverywhere($hash);
     } else {
         return "BOSEST: Unknown argument $workType";
     }
@@ -219,6 +281,53 @@ sub BOSEST_Set($@) {
 }
 
 #DEVELOPNEWFUNCTION-2 (create own function)
+sub BOSEST_stopPlayEverywhere($) {
+    my ($hash) = @_;
+    my $postXmlHeader = "<zone master=\"$hash->{DEVICEID}\">";
+    my $postXmlFooter = "</zone>";
+    my $postXml = "";
+    
+    my @players = BOSEST_getAllBosePlayers($hash);
+    foreach my $playerHash (@players) {
+        $postXml .= "<member ipaddress=\"".$playerHash->{helper}{IP}."\">".$playerHash->{DEVICEID}."</member>" if($playerHash->{helper}{IP} ne "unknown");
+    }
+    
+    $postXml = $postXmlHeader.$postXml.$postXmlFooter;
+    
+    if(BOSEST_HTTPPOST($hash, '/removeZoneSlave', $postXml) == 0) {
+        #update reading?
+        foreach my $playerHash (@players) {
+            $playerHash->{helper}{playZoneMaster} = "";
+            $playerHash->{helper}{playZoneMasterTS} = gettimeofday();
+        }
+    }
+}
+
+sub BOSEST_playEverywhere($) {
+    my ($hash) = @_;
+    my $postXmlHeader = "<zone master=\"$hash->{DEVICEID}\" senderIPAddress=\"$hash->{helper}{IP}\">";
+    my $postXmlFooter = "</zone>";
+    my $postXml = "";
+    
+    my @players = BOSEST_getAllBosePlayers($hash);
+    foreach my $playerHash (@players) {
+        #FIXME is it allowed to add myself as member?
+        $postXml .= "<member ipaddress=\"".$playerHash->{helper}{IP}."\">".$playerHash->{DEVICEID}."</member>" if($playerHash->{helper}{IP} ne "unknown");
+    }
+    
+    $postXml = $postXmlHeader.$postXml.$postXmlFooter;
+    
+    if(BOSEST_HTTPPOST($hash, '/setZone', $postXml) == 0) {
+        #set zone master
+        foreach my $playerHash (@players) {
+            if($playerHash->{helper}{IP} ne "unknown") {
+                $playerHash->{helper}{playZoneMaster} = $hash->{DEVICEID};
+                $playerHash->{helper}{playZoneMasterTS} = gettimeofday();
+            }
+        }
+    }
+}
+
 sub BOSEST_on($) {
     my ($hash) = @_;
     my $sourceState = ReadingsVal($hash->{NAME}, "source", "STANDBY");
@@ -235,41 +344,138 @@ sub BOSEST_off($) {
     }
 }
 
-sub BOSEST_setVolume($$) {
-    my ($hash, $volume) = @_;
-    my $postXml = '<volume>'.$volume.'</volume>';
-    if(BOSEST_HTTPPOST($hash, '/volume', $postXml) == 0) {
-        readingsSingleUpdate($hash, "volume", $volume, 1);
+sub BOSEST_setRecent($$) {
+    my ($hash, $nr) = @_;
+    
+    if(!defined($hash->{helper}{recents}{$nr}{itemName})) {
+        #recent entry not found
+        return undef;
+    }
+    
+    BOSEST_setContentItem($hash,
+                          $hash->{helper}{recents}{$nr}{itemName},
+                          $hash->{helper}{recents}{$nr}{location},
+                          $hash->{helper}{recents}{$nr}{source},
+                          $hash->{helper}{recents}{$nr}{sourceAccount});
+
+    return undef;
+}
+
+sub BOSEST_setContentItem($$$$$) {
+    my ($hash, $itemName, $location, $source, $sourceAccount) = @_;
+    
+    my $postXml = "<ContentItem source=\"".
+              $source.
+              "\" sourceAccount=\"".
+              $sourceAccount.
+              "\" location=\"".
+              $location.
+              "\">".
+              "<itemName>".
+              $itemName.
+              "</itemName>".
+              "</ContentItem>";
+              
+    if(BOSEST_HTTPPOST($hash, "/select", $postXml) == 0) {
+        #ok
+    }
+    return undef;
+}
+
+sub BOSEST_setBass($$) {
+    my ($hash, $bass) = @_;
+    $bass = $bass - 10;
+    #FIXME currently not working
+    my $postXml = "<bass>$bass</bass>";
+    if(BOSEST_HTTPPOST($hash, '/bass', $postXml) == 0) {
+        #readingsSingleUpdate($hash, "bass", $bass+10, 1);
     }
     #FIXME error handling
     return undef;
 }
 
+sub BOSEST_setVolume($$) {
+    my ($hash, $volume) = @_;
+    my $postXml = '<volume>'.$volume.'</volume>';
+    if(BOSEST_HTTPPOST($hash, '/volume', $postXml) == 0) {
+        #readingsSingleUpdate($hash, "volume", $volume, 1);
+    }
+    #FIXME error handling
+    return undef;
+}
+
+sub BOSEST_setMute($$) {
+    my ($hash, $mute) = @_;
+    
+    if(($mute eq "on" && $hash->{READINGS}{mute}{VAL} eq "false") or 
+       ($mute eq "off" && $hash->{READINGS}{mute}{VAL} eq "true") or
+       ($mute eq "toggle")) {
+        BOSEST_sendKey($hash, "MUTE");
+    }
+    
+    return undef;
+}
+
+sub BOSEST_setSource($$) {
+    my ($hash, $source) = @_;
+    
+    Log3 $hash, 3, "BOSEST: Change source ".$hash->{READINGS}{source}{VAL}."/".$hash->{READINGS}{connectionStatusInfo}{VAL}."=>".$source;
+    
+    $hash->{helper}{switchSource} = uc $source;
+    
+    if($hash->{helper}{switchSource} eq "") {
+        return undef;
+    }
+    
+    if($hash->{helper}{switchSource} eq "BT-DISCOVER" &&
+       $hash->{READINGS}{connectionStatusInfo}{VAL} eq "DISCOVERABLE") {
+        $hash->{helper}{switchSource} = "";
+        return undef;
+    }
+    
+    if($hash->{helper}{switchSource} eq $hash->{READINGS}{source}{VAL}) {
+        $hash->{helper}{switchSource} = "";
+        return undef;
+    }
+    
+    #source is not switchSource yet
+    BOSEST_sendKey($hash, "AUX_INPUT");
+
+    return undef;
+}
+
 sub BOSEST_setPreset($$) {
     my ($hash, $preset) = @_;
-    BOSEST_sendKey($hash, "PRESET_".$preset);
-    readingsSingleUpdate($hash, "channel", $preset, 1);
+    if($preset > 0 && $preset < 7) {
+        BOSEST_sendKey($hash, "PRESET_".$preset);
+    } else {
+        #set channel based on AttrVal
+        my $channelVal = AttrVal($hash->{NAME}, sprintf("channel_%02d", $preset), "0");
+        return undef if($channelVal eq "0");
+        my @channel = split("\\|", $channelVal);
+        $channel[3] = "" if(!defined($channel[3]));
+        Log3 $hash, 5, "BOSEST: AttrVal: $channel[0], $channel[1], $channel[2], $channel[3]";
+        #format: itemName|location|source|sourceAccount
+        BOSEST_setContentItem($hash, $channel[0], $channel[1], $channel[2], $channel[3]);
+    }
     return undef;
 }
 
 sub BOSEST_play($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "PLAY");
-    readingsSingleUpdate($hash, "playStatus", "playing", 1);
     return undef;
 }
 
 sub BOSEST_stop($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "STOP");
-    readingsSingleUpdate($hash, "playStatus", "stopped", 1);
     return undef;
 }
 
 sub BOSEST_pause($) {
     my ($hash) = @_;
     BOSEST_sendKey($hash, "PAUSE");
-    readingsSingleUpdate($hash, "playStatus", "paused", 1);
     return undef;
 }
 
@@ -316,11 +522,17 @@ sub BOSEST_updateInfo($$) {
     return undef;
 }
 
-
 sub BOSEST_updatePresets($$) {
     my ($hash, $deviceId) = @_;
     my $presets = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/presets");
     BOSEST_processXml($hash, $presets);
+    return undef;    
+}
+
+sub BOSEST_updateZone($$) {
+    my ($hash, $deviceId) = @_;
+    my $zone = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/getZone");
+    BOSEST_processXml($hash, $zone);
     return undef;    
 }
 
@@ -331,10 +543,44 @@ sub BOSEST_updateVolume($$) {
     return undef;    
 }
 
+sub BOSEST_updateBass($$) {
+    my ($hash, $deviceId) = @_;
+    my $bass = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/bass");
+    BOSEST_processXml($hash, $bass);
+    return undef;
+}
+
 sub BOSEST_updateNowPlaying($$) {
     my ($hash, $deviceId) = @_;
     my $nowPlaying = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/now_playing");
     BOSEST_processXml($hash, $nowPlaying);
+    return undef;
+}
+
+sub BOSEST_checkDoubleTap($$) {
+    my ($hash, $channel) = @_;
+    
+    if(!defined($hash->{helper}{nowSelectionUpdatedTS}) or $channel ne $hash->{helper}{nowSelectionUpdatedCH}) {
+        $hash->{helper}{nowSelectionUpdatedTS} = gettimeofday();
+        $hash->{helper}{nowSelectionUpdatedCH} = $channel;
+        return undef;
+    }
+    
+    my $timeDiff = gettimeofday() - $hash->{helper}{nowSelectionUpdatedTS};
+    if($timeDiff < 1) {
+        if($hash->{helper}{playZoneMaster} eq $hash->{DEVICEID}) {
+            BOSEST_stopPlayEverywhere($hash);
+        } elsif($hash->{helper}{playZoneMaster} eq "") {
+            #make sure that play isn't started just after stop, that might confuse the player
+            my $timeDiffMasterChange = gettimeofday() - $hash->{helper}{playZoneMasterTS};
+            if($timeDiffMasterChange > 2) {
+                BOSEST_playEverywhere($hash);
+            }
+        }
+    }
+    
+    $hash->{helper}{nowSelectionUpdatedTS} = gettimeofday();
+    
     return undef;
 }
 
@@ -346,22 +592,30 @@ sub BOSEST_processXml($$) {
         if($wsxml->{updates}->{nowPlayingUpdated}) {
             if($wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying}) {
                 BOSEST_parseAndUpdateNowPlaying($hash, $wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying});
+                if($hash->{helper}{switchSource} ne "") {
+                    BOSEST_setSource($hash, $hash->{helper}{switchSource});
+                }
             }
         } elsif ($wsxml->{updates}->{volumeUpdated}) {
             BOSEST_parseAndUpdateVolume($hash, $wsxml->{updates}->{volumeUpdated}->{volume});
         } elsif ($wsxml->{updates}->{nowSelectionUpdated}) {
-            readingsBeginUpdate($hash);
-            BOSEST_XMLUpdate($hash, "channel", $wsxml->{updates}->{nowSelectionUpdated}->{preset}->{id});
-            readingsEndUpdate($hash, 1);
+            BOSEST_parseAndUpdateChannel($hash, $wsxml->{updates}->{nowSelectionUpdated}->{preset});
+            BOSEST_checkDoubleTap($hash, $wsxml->{updates}->{nowSelectionUpdated}->{preset}->{id});
         } elsif ($wsxml->{updates}->{recentsUpdated}) {
-            #Log3 $hash, 3, "BOSEST: Event not implemented (recentsUpdated):\n".Dumper($wsxml);
-            #TODO implement recent channel event
+            BOSEST_parseAndUpdateRecents($hash, $wsxml->{updates}->{recentsUpdated}->{recents});
         } elsif ($wsxml->{updates}->{connectionStateUpdated}) {
             #BOSE SoundTouch team says that it's not necessary to handle this one
         } elsif ($wsxml->{updates}->{clockDisplayUpdated}) {
             #TODO handle clockDisplayUpdated (feature currently unknown)
         } elsif ($wsxml->{updates}->{presetsUpdated}) {
             BOSEST_parseAndUpdatePresets($hash, $wsxml->{updates}->{presetsUpdated}->{presets});
+        } elsif ($wsxml->{updates}->{zoneUpdated}) {
+            BOSEST_updateZone($hash, $hash->{DEVICEID});
+        } elsif ($wsxml->{updates}->{bassUpdated}) {
+            #get /bass for more details
+            BOSEST_updateBass($hash, $hash->{DEVICEID});
+        } elsif ($wsxml->{updates}->{infoUpdated}) {
+            BOSEST_updateInfo($hash, $hash->{DEVICEID});
         } else {
             Log3 $hash, 4, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
         }
@@ -373,8 +627,59 @@ sub BOSEST_processXml($$) {
         BOSEST_parseAndUpdateVolume($hash, $wsxml->{volume});
     } elsif($wsxml->{presets}) {
         BOSEST_parseAndUpdatePresets($hash, $wsxml->{presets});
+    } elsif($wsxml->{bass}) {
+        BOSEST_parseAndUpdateBass($hash, $wsxml->{bass});
+    } elsif($wsxml->{zone}) {
+        BOSEST_parseAndUpdateZone($hash, $wsxml->{zone});
     }
     
+    return undef;
+}
+
+sub BOSEST_parseAndUpdateChannel($$) {
+    my ($hash, $preset) = @_;
+    
+    readingsBeginUpdate($hash);
+    if($preset->{id} ne "0") {
+        BOSEST_XMLUpdate($hash, "channel", $preset->{id});
+    } else {
+        my $channelString = $preset->{ContentItem}->{itemName}."|".$preset->{ContentItem}->{location}."|".
+                            $preset->{ContentItem}->{source}."|".$preset->{ContentItem}->{sourceAccount};
+                            
+        foreach my $channelNr (7..20) {
+            my $channelVal = AttrVal($hash->{NAME}, sprintf("channel_%02d", $channelNr), "0");
+            if($channelVal eq $channelString) {
+                BOSEST_XMLUpdate($hash, "channel", $channelNr);
+            }
+        }
+    }
+    readingsEndUpdate($hash, 1);
+    
+    return undef;
+}
+
+sub BOSEST_parseAndUpdateZone($$) {
+    my ($hash, $zone) = @_;
+    readingsBeginUpdate($hash);
+    BOSEST_XMLUpdate($hash, "zoneMaster", $zone->{master});
+    
+    my $i = 1;
+    if($zone->{member}) {
+        foreach my $member (@{$zone->{member}}) {
+            my $player = BOSEST_getBosePlayerByDeviceId($hash, $member->{content});
+            BOSEST_XMLUpdate($hash, "zoneMember_$i", $player->{NAME});
+            $i++;
+        }
+    }
+    
+    while ($i < 20) {
+        if(defined($hash->{READINGS}{"zoneMember_$i"})) {
+            BOSEST_XMLUpdate($hash, "zoneMember_$i", "");
+        }
+        $i++;
+    }
+    
+    readingsEndUpdate($hash, 1);
     return undef;
 }
 
@@ -393,10 +698,30 @@ sub BOSEST_parseAndUpdatePresets($$) {
     }
     
     foreach my $preset (1..6) {
-        BOSEST_XMLUpdate($hash, "channel_$preset", $activePresets{$preset});
+        BOSEST_XMLUpdate($hash, sprintf("channel_%02d", $preset), $activePresets{$preset});
     }
     
     readingsEndUpdate($hash, 1);
+    return undef;
+}
+
+sub BOSEST_parseAndUpdateRecents($$) {
+    my ($hash, $recents) = @_;
+    my $i = 1;
+    
+    readingsBeginUpdate($hash);
+
+    foreach my $recentEntry (@{$recents->{recent}}) {
+        BOSEST_XMLUpdate($hash, sprintf("recent_%02d", $i), $recentEntry->{contentItem}->{itemName});
+        $hash->{helper}{recents}{$i}{location} = $recentEntry->{contentItem}->{location};
+        $hash->{helper}{recents}{$i}{source} = $recentEntry->{contentItem}->{source};
+        $hash->{helper}{recents}{$i}{sourceAccount} = $recentEntry->{contentItem}->{sourceAccount};
+        $hash->{helper}{recents}{$i}{itemName} = $recentEntry->{contentItem}->{itemName};
+        $i++;
+    }
+    
+    readingsEndUpdate($hash, 1);
+    
     return undef;
 }
 
@@ -404,6 +729,16 @@ sub BOSEST_parseAndUpdateVolume($$) {
     my ($hash, $volume) = @_;
     readingsBeginUpdate($hash);
     BOSEST_XMLUpdate($hash, "volume", $volume->{actualvolume});
+    BOSEST_XMLUpdate($hash, "mute", $volume->{muteenabled});
+    readingsEndUpdate($hash, 1);
+    return undef;
+}
+
+sub BOSEST_parseAndUpdateBass($$) {
+    my ($hash, $bass) = @_;
+    my $currBass = $bass->{actualbass} + 10;
+    readingsBeginUpdate($hash);
+    BOSEST_XMLUpdate($hash, "bass", $currBass);
     readingsEndUpdate($hash, 1);
     return undef;
 }
@@ -463,6 +798,11 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
         BOSEST_XMLUpdate($hash, "contentItemSource", "");
         BOSEST_XMLUpdate($hash, "contentItemIsPresetable", "");
         BOSEST_XMLUpdate($hash, "contentItemType", "");
+    }
+    if($nowPlaying->{connectionStatusInfo}) {
+        BOSEST_XMLUpdate($hash, "connectionStatusInfo", $nowPlaying->{connectionStatusInfo}->{status});
+    } else {
+        BOSEST_XMLUpdate($hash, "connectionStatusInfo", "");
     }
     #handle state based on play status and standby state
     if($nowPlaying->{source} eq "STANDBY") {
@@ -549,6 +889,7 @@ sub BOSEST_finishedDiscovery($) {
     my $name = $commands[0];
     my $hash = $defs{$name};
     my $i = 0;
+    my $ignoreDeviceIDs = AttrVal($hash->{NAME}, "ignoreDeviceIDs", "");
     
     delete($hash->{helper}{DISCOVERY_PID});
     
@@ -558,12 +899,14 @@ sub BOSEST_finishedDiscovery($) {
     for($i = 1; $i < @commands; $i = $i+2) {
         my $command = $commands[$i];
         my @params = split(",", $commands[$i+1]);
+        my $deviceId = $params[0];
+        
+        next if($ignoreDeviceIDs =~ /$deviceId/);
+        
         if($command eq "commandDefineBOSE") {
-            my $deviceId = $params[0];
             my $deviceName = $params[1];
             BOSEST_commandDefine($hash, $deviceId, $deviceName);
         } elsif($command eq "updateIP") {
-            my $deviceId = $params[0];
             my $ip = $params[1];
             BOSEST_updateIP($hash, $deviceId, $ip);
         }
@@ -591,6 +934,8 @@ sub BOSEST_updateIP($$$) {
         BOSEST_updateVolume($deviceHash, $deviceID);
         #get current presets
         BOSEST_updatePresets($deviceHash, $deviceID);
+        #get current bass settings
+        BOSEST_updateBass($deviceHash, $deviceID);
         #connect websocket
         Log3 $hash, 4, "BOSEST: $deviceHash->{NAME}, start new WebSocket.";
         BOSEST_startWebSocketConnection($deviceHash);
@@ -724,21 +1069,32 @@ sub BOSEST_getBosePlayerByDeviceId($$) {
     my ($hash, $deviceId) = @_;
     
     if (defined($deviceId)) {
-		foreach my $fhem_dev (sort keys %main::defs) { 
-			return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'BOSEST' && $main::defs{$fhem_dev}{DEVICEID} eq $deviceId);
-		}
-	} else {
-		return $hash;
-	}
+        foreach my $fhem_dev (sort keys %main::defs) { 
+          return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'BOSEST' && $main::defs{$fhem_dev}{DEVICEID} eq $deviceId);
+        }
+    } else {
+        return $hash;
+    }
 
     return undef;
+}
+
+sub BOSEST_getAllBosePlayers($) {
+    my ($hash) = @_;
+    my @players = ();
+    
+		foreach my $fhem_dev (sort keys %main::defs) { 
+			push @players, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'BOSEST' && $main::defs{$fhem_dev}{DEVICEID} ne "0");
+		}
+		
+    return @players;
 }
 
 sub BOSEST_sendKey($$) {
     my ($hash, $key) = @_;
     my $postXml = '<key state="press" sender="Gabbo">'.$key.'</key>';
     if(BOSEST_HTTPPOST($hash, '/key', $postXml) == 0) {
-        select(undef, undef, undef, .1); #sleep 100ms
+        select(undef, undef, undef, .05); #sleep 50ms
         $postXml = '<key state="release" sender="Gabbo">'.$key.'</key>';
         if(BOSEST_HTTPPOST($hash, '/key', $postXml) == 0) {
             #FIXME success
@@ -781,12 +1137,12 @@ sub BOSEST_HTTPPOST($$$) {
     my $ua = LWP::UserAgent->new();
     my $ip = $hash->{helper}{IP};
     my $req = HTTP::Request->new(POST => 'http://'.$ip.':8090'.$postURI);
-    Log3 $hash, 5, "BOSEST: set ".$postURI." => ".$postXml;
+    Log3 $hash, 4, "BOSEST: set ".$postURI." => ".$postXml;
     $req->content($postXml);
 
     my $response = $ua->request($req);
     if($response->is_success) {
-        Log3 $hash, 5, "BOSEST: success: ".$response->decoded_content;
+        Log3 $hash, 4, "BOSEST: success: ".$response->decoded_content;
         return 0;
     } else {
         #TODO return error
