@@ -6,11 +6,12 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.1.0
+# Version: 1.5.0
 #
 #############################################################
 #
-# v1.1.0 - XXXXXXXX
+# v1.5.0 - 20160306
+#  - FEATURE: support SetExtensions (on-for-timer,...)
 #  - FEATURE: support TTS (TextToSpeach) via Google Translate
 #             set <name> speak "This is a test message"
 #  - FEATURE: support volume control for TTS
@@ -18,19 +19,35 @@
 #  - FEATURE: support different languages for TTS
 #             set <name> speak "Das ist ein deutscher Test" de
 #             set <name> speak "Das ist ein deutscher Test" 30 de
-#  - FEATURE: support off after (instead of resume) TTS messages
+#  - FEATURE: support off (instead of resume) after TTS messages (restores only volume settings)
 #             set <name> speakOff "Music is going to switch off now. Good night." 30 en
-#  - FEATURE: set default TTS language via ttsLanguage attribute
 #  - FEATURE: speak "not available" text on Google Captcha
 #             can be disabled by ttsSpeakOnError = 0
-#  - FEATURE: set DLNA directory via ttsDirectory attribute
+#  - FEATURE: set default TTS language via ttsLanguage attribute
+#  - FEATURE: automatically add DLNA server running on the same 
+#             server as FHEM to the BOSE library
+#  - FEATURE: automatically add all DLNA servers to BOSE library
+#             requires autoAddDLNAServers = 1 attribute for "main" (not players!)
+#  - FEATURE: reuse cached TTS files for 30 days
+#  - FEATURE: set DLNA TTS directory via ttsDirectory attribute
+#  - FEATURE: set DLNA TTS server via ttsDLNAServer attribute
+#             only needed if the DLNA server is not the FHEM server
+#  - FEATURE: support ttsVolume for speak
+#             ttsVolume = 20 (set volume 20 for speak)
+#             ttsVolume = +20 (increase volume by 20 from current level)
 #  - FEATURE: add html documentation (provided by Miami)
 #  - FEATURE: support relative volume settings with +/-
 #             set <name> volume +3
 #             set <name> speak "This is a louder message" +10
-#  - FEATURE: reuse cached TTS files for 30 days
+#  - FEATURE: new reading "connectedDLNAServers" (blanks are replaced by "-")
+#  - FEATURE: support add/remove DLNA servers to the BOSE library
+#             set <name> addDLNAServer RPi
+#             set <name> removeDLNAServer RPi
 #  - FEATURE: add readings for channel_07-20
 #  - FEATURE: support saveChannel to save current channel to channel_07-20
+#  - FEATURE: support bass settings only if available (/bassCapabilities)
+#  - FEATURE: support bluetooth only if available (/sources)
+#  - FEATURE: support switch source to airplay (untested)
 #  - BUGFIX: update zone on Player discovery
 #  - BUGFIX: fixed some uninitialized variables
 #  - CHANGE: limit recent_X readings to 15 max
@@ -125,19 +142,17 @@
 #  - change preset via /key
 #
 # TODO
-#  - download speak on error text on startup?
-#  - get capabilities and supported sources on startup
-#  - support /listMediaServers for DLNA selection
-#  - add /setMusicServiceAccount support (ttsDLNA) (default: fhem server based on IP)
+#  - adduserattr function??
+#  - TTS code cleanup (group functions logically)
+#  - test speak during bluetooth play
 #  - delete TTS files after 30 days
-#  - support texts longer than 100 characters (https://github.com/Glutanimate/simple-google-tts/blob/master/speak.pl)
 #  - define own groups of players
 #  - update readings only on change
 #  - check if websocket finished can be called after websocket re-connected
 #  - cleanup all readings on startup (IP=unknown)
-#  - use LWP callback functions
 #  - fix usage of bulkupdate vs. singleupdate
 #  - check if Mojolicious::Lite can be used
+#  - check if Mojolicious should be used for HTTPGET/HTTPPOST
 #  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
 #  - ramp up/down volume support
@@ -157,18 +172,24 @@ use warnings;
 
 use Blocking;
 use Encode;
+use SetExtensions;
 
 use Data::Dumper;
 use Digest::MD5 qw(md5_hex);
+use File::stat;
+use IO::Socket::INET;
 use LWP::UserAgent;
 use Mojolicious 5.54;
 use Net::Bonjour;
 use Scalar::Util qw(looks_like_number);
 use XML::Simple;
 
+my $BOSEST_GOOGLE_NOT_AVAILABLE_TEXT = "Hello, I'm sorry, but Google Translate is currently not available.";
+my $BOSEST_GOOGLE_NOT_AVAILABLE_LANG = "en";
+
 sub BOSEST_Initialize($) {
     my ($hash) = @_;
-
+    
     $hash->{DefFn} = 'BOSEST_Define';
     $hash->{UndefFn} = 'BOSEST_Undef';
     $hash->{GetFn} = 'BOSEST_Get';
@@ -177,7 +198,8 @@ sub BOSEST_Initialize($) {
     $hash->{AttrList} = 'channel_07 channel_08 channel_09 channel_10 channel_11 ';
     $hash->{AttrList} .= 'channel_12 channel_13 channel_14 channel_15 channel_16 ';
     $hash->{AttrList} .= 'channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs ';
-    $hash->{AttrList} .= 'ttsDirectory ttsLanguage ttsSpeakOnError '.$readingFnAttributes;
+    $hash->{AttrList} .= 'ttsDirectory ttsLanguage ttsSpeakOnError ttsDLNAServer ttsVolume ';
+    $hash->{AttrList} .= 'autoAddDLNAServers '.$readingFnAttributes;
     
     return undef;
 }
@@ -208,6 +230,8 @@ sub BOSEST_Define($$) {
         
         #no websockets connected
         $hash->{helper}{wsconnected} = 0;
+        #create mojo useragent
+        $hash->{helper}{useragent} = Mojo::UserAgent->new() if(!defined($hash->{helper}{useragent}));
         
         #init statecheck
         $hash->{helper}{stateCheck}{enabled} = 0;
@@ -218,8 +242,11 @@ sub BOSEST_Define($$) {
         #FIXME reset all recent_$i entries on startup (must be done here, otherwise readings are displayed when player wasn't found)
     }
     
+    #init dlnaservers
+    $hash->{helper}{dlnaServers} = "";
+    
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.1.0";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.0";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
     }
@@ -237,6 +264,8 @@ sub BOSEST_Attribute($$$$) {
             return "BOSEST: wrong format" if(!defined($value[2]));
             #update reading for channel_X
             readingsSingleUpdate($main::defs{$devName}, $attrName, $value[0], 1);
+        } elsif($attrName eq "ttsDLNAServer") {
+            BOSEST_addDLNAServer($main::defs{$devName}, $attrValue);
         }
     } elsif($mode eq "del") {
         if(substr($attrName, 0, 8) eq "channel_") {
@@ -249,8 +278,7 @@ sub BOSEST_Attribute($$$$) {
 }
 
 sub BOSEST_Set($@) {
-    my ($hash, @params) = @_;
-    my $name = shift(@params);
+    my ($hash, $name, @params) = @_;
     my $workType = shift(@params);
     
     #get quoted text from params
@@ -261,19 +289,23 @@ sub BOSEST_Set($@) {
     }
     @params = @params2;
 
+    my $list = "on:noArg off:noArg power:noArg play:noArg 
+                mute:on,off,toggle recent source:".$hash->{helper}{supportedSourcesCmds}." 
+                nextTrack:noArg prevTrack:noArg playTrack speak speakOff 
+                playEverywhere:noArg stopPlayEverywhere:noArg createZone addToZone removeFromZone 
+                stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 
+                volume:slider,0,1,100 ".$hash->{helper}{supportedBassCmds}." 
+                saveChannel:07,08,09,10,11,12,13,14,15,16,17,18,19,20 
+                addDLNAServer:".$hash->{helper}{dlnaServers}." 
+                removeDLNAServer:".ReadingsVal($hash->{NAME}, "connectedDLNAServers", "noArg");
+
     # check parameters for set function
     #DEVELOPNEWFUNCTION-1
     if($workType eq "?") {
         if($hash->{DEVICEID} eq "0") {
             return ""; #no arguments for server
         } else {
-            return "Unknown argument, choose one of on:noArg off:noArg power:noArg play:noArg 
-                    mute:on,off,toggle recent source:bluetooth,bt-discover,aux 
-                    nextTrack:noArg prevTrack:noArg playTrack speak 
-                    playEverywhere:noArg stopPlayEverywhere:noArg createZone addToZone removeFromZone 
-                    stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 
-                    volume:slider,0,1,100 bass:slider,1,1,10 
-                    saveChannel:07,08,09,10,11,12,13,14,15,16,17,18,19,20";
+            return SetExtensions($hash, $list, $name, $workType, @params);
         }
     }
     
@@ -309,6 +341,14 @@ sub BOSEST_Set($@) {
         return "BOSEST: source requires bluetooth/aux as additional parameter" if(int(@params) < 1);
         #params[0] = source value
         BOSEST_setSource($hash, $params[0]);
+    } elsif($workType eq "addDLNAServer") {
+        return "BOSEST: addDLNAServer requires DLNA friendly name as additional parameter" if(int(@params) < 1);
+        #params[0] = friendly name
+        BOSEST_addDLNAServer($hash, $params[0]);
+    } elsif($workType eq "removeDLNAServer") {
+        return "BOSEST: removeDLNAServer requires DLNA friendly name as additional parameter" if(int(@params) < 1);
+        #params[0] = friendly name
+        BOSEST_removeDLNAServer($hash, $params[0]);
     } elsif($workType eq "play") {
         BOSEST_play($hash);
     } elsif($workType eq "stop") {
@@ -339,6 +379,11 @@ sub BOSEST_Set($@) {
         return "BOSEST: speak requires quoted text as additional parameters" if(int(@params) < 1);
         return "BOSEST: speak requires quoted text" if(substr($blankParams, 0, 1) ne "\"");
         return "BOSEST: speak maximum text length is 100 characters" if(length($params[0])>100);
+        if(AttrVal($hash->{NAME}, "ttsDirectory", "") eq "") {
+            return "BOSEST: Please set ttsDirectory attribute first.
+                            FHEM user needs permissions to write to that directory.
+                            It is also recommended to set ttsLanguage (default: en).";
+        }
         #set text (must be within quotes)
         my $text = $params[0];
         my $volume = AttrVal($hash->{NAME}, "ttsVolume", ReadingsVal($hash->{NAME}, "volume", 20));
@@ -375,13 +420,46 @@ sub BOSEST_Set($@) {
         #params[0] = deviceID channel
         BOSEST_removeFromZone($hash, $params[0]);
     } else {
-        return "BOSEST: Unknown argument $workType";
+        return SetExtensions($hash, $list, $name, $workType, @params);
     }
     
     return undef;
 }
 
 #DEVELOPNEWFUNCTION-2 (create own function)
+sub BOSEST_addDLNAServer($$) {
+    my ($hash, $friendlyName) = @_;
+    
+    #retrieve uuid for friendlyname
+    my $listMediaServers = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/listMediaServers");
+    foreach my $mediaServer (@{ $listMediaServers->{ListMediaServersResponse}->{media_server} }) {
+        $mediaServer->{friendly_name} =~ s/\ /_/g;
+        if($mediaServer->{friendly_name} eq $friendlyName) {
+            BOSEST_setMusicServiceAccount($hash, $friendlyName, $mediaServer->{id});
+        }
+    }
+    
+    return undef;
+}
+
+sub BOSEST_removeDLNAServer($$) {
+    my ($hash, $friendlyName) = @_;
+    
+    #retrieve uuid for friendlyname
+    my $sources = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/sources");
+    foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
+        next if($source->{source} ne "STORED_MUSIC");
+        
+        $source->{content} =~ s/\ /_/g;
+        
+        if($source->{content} eq $friendlyName) {
+            BOSEST_removeMusicServiceAccount($hash, $friendlyName, $source->{sourceAccount});
+        }
+    }
+    
+    return undef;
+}
+
 sub BOSEST_saveChannel($$) {
     my ($hash, $channel) = @_;
 
@@ -407,7 +485,9 @@ sub BOSEST_stopPlayEverywhere($) {
     
     my @players = BOSEST_getAllBosePlayers($hash);
     foreach my $playerHash (@players) {
-        $postXml .= "<member ipaddress=\"".$playerHash->{helper}{IP}."\">".$playerHash->{DEVICEID}."</member>" if($playerHash->{helper}{IP} ne "unknown");
+        if($playerHash->{DEVICEID} ne $hash->{DEVICEID}) {
+            $postXml .= "<member ipaddress=\"".$playerHash->{helper}{IP}."\">".$playerHash->{DEVICEID}."</member>" if($playerHash->{helper}{IP} ne "unknown");
+        }
     }
     
     $postXml = $postXmlHeader.$postXml.$postXmlFooter;
@@ -733,7 +813,7 @@ sub BOSEST_restoreSavedState($) {
     BOSEST_setVolume($hash, $hash->{helper}{savedState}{volume});
     BOSEST_setBass($hash, $hash->{helper}{savedState}{bass});
     #bose off when source was off
-    if($hash, $hash->{helper}{savedState}{source} eq "STANDBY") {
+    if($hash->{helper}{savedState}{source} eq "STANDBY") {
         BOSEST_off($hash);
     } else {
         #FIXME test if setsource works properly
@@ -747,84 +827,153 @@ sub BOSEST_restoreSavedState($) {
     return undef;
 }
 
-sub BOSEST_downloadGoogleNotAvailable($$) {
+sub BOSEST_restoreVolumeAndOff($) {
     my ($hash) = @_;
-    my $text = "Hello, I'm sorry, but Google Translate is currently not available.";
-    my $lang = "en";
+    
+    BOSEST_setVolume($hash, $hash->{helper}{savedState}{volume});
+    BOSEST_setBass($hash, $hash->{helper}{savedState}{bass});
+
+    BOSEST_off($hash);
+}
+
+sub BOSEST_downloadGoogleNotAvailable($) {
+    my ($hash) = @_;
+    my $text = $BOSEST_GOOGLE_NOT_AVAILABLE_TEXT;
+    my $lang = $BOSEST_GOOGLE_NOT_AVAILABLE_LANG;
     my $ttsDir = AttrVal($hash->{NAME}, "ttsDirectory", "");
 
-    $hash->{helper}{useragent} = Mojo::UserAgent->new() if(!defined($hash->{helper}{useragent}));
+    my $md5 = md5_hex($lang.$text);
+    my $filename = $ttsDir."/".$md5.".mp3";
+    if (-f $filename) {
+        #file exists already
+        return undef;
+    }
+    
+    BOSEST_downloadGoogleTTS($hash, $filename, $md5, $text, $lang);
+    
+    return undef;
+}
 
-    my $filename = md5_hex($lang.$text);
+sub BOSEST_downloadGoogleTTS($$$$$;$) {
+    my ($hash, $filename, $md5, $text, $lang, $callback) = @_;
+    
     $hash->{helper}{useragent}->get("http://translate.google.com/translate_tts?tl=$lang&client=tw-ob&q=$text" => sub {
             my ($ua, $tx) = @_;
+            my $downloadOk = 0;
             if($tx->res->headers->content_type eq "audio/mpeg") {
-                $tx->res->content->asset->move_to($ttsDir."/".$filename.".mp3");
+                $tx->res->content->asset->move_to($filename);
+                $downloadOk = 1;
+            }
+            if(defined($callback)) {
+                $callback->($hash, $filename, $md5, $downloadOk);
             }
     });
+    
+    return undef;
+}
+
+sub BOSEST_playMessage($$$$) {
+    my ($hash, $trackname, $volume, $stopAfterSpeak) = @_;
+    
+    BOSEST_saveCurrentState($hash);
+    
+    if($volume ne ReadingsVal($hash->{NAME}, "volume", 0)) {
+        BOSEST_stop($hash);
+        BOSEST_setVolume($hash, $volume);
+    }
+    
+    BOSEST_playTrack($hash, $trackname);
+        
+    $hash->{helper}{stateCheck}{enabled} = 1;
+    $hash->{helper}{stateCheck}{always} = 0;
+    #after play the speaker sets INVALID_SOURCE
+    $hash->{helper}{stateCheck}{actionSource} = "INVALID_SOURCE";
+    #check if we need to stop after speak
+    if(defined($stopAfterSpeak) && $stopAfterSpeak eq "1") {
+        $hash->{helper}{stateCheck}{function} = \&BOSEST_restoreVolumeAndOff;
+    } else {
+        $hash->{helper}{stateCheck}{function} = \&BOSEST_restoreSavedState;
+    }
+
     return undef;
 }
 
 sub BOSEST_playGoogleTTS($$$$$$) {
     my ($hash, $ttsDir, $text, $volume, $lang, $stopAfterSpeak) = @_;
     
-    $hash->{helper}{useragent} = Mojo::UserAgent->new() if(!defined($hash->{helper}{useragent}));
+    BOSEST_downloadGoogleNotAvailable($hash);
 
-    my $filename = md5_hex($lang.$text);
-    #translate.google.com/translate_tts?tl=LANGUAGE&client=tw-ob&q=TEXT
-    if(-f $ttsDir/$filename.".mp3") {
-        my $timestamp = stat($ttsDir/$filename.".mp3")->mtime();
+    my $md5 = md5_hex($lang.$text);
+    my $filename = $ttsDir."/".$md5.".mp3";
+    
+    if(-f $filename) {
+        my $timestamp = (stat($filename))->mtime(); #last modification timestamp
         my $now = time();
         if($now-$timestamp < 2592000) {
             #file is not older than 30 days
-            #FIXME file exists, call play sub
+            #file exists, call play sub
+            BOSEST_playMessage($hash, $md5, $volume, $stopAfterSpeak);
             return undef;
         }
     }
-    $hash->{helper}{useragent}->get("http://translate.google.com/translate_tts?tl=$lang&client=tw-ob&q=$text" => sub {
-            my ($ua, $tx) = @_;
-            if($tx->res->headers->content_type eq "audio/mpeg") {
-                $tx->res->content->asset->move_to($ttsDir."/".$filename.".mp3");
-                Log3 $hash, 4, "BOSEST: Download ($ttsDir/$filename) finished...";
+    
+    BOSEST_downloadGoogleTTS($hash, $filename, $md5, $text, $lang, sub {
+            my ($hash, $filename, $md5, $downloadOk) = @_;
+            
+            if($downloadOk) {
+                BOSEST_playMessage($hash, $md5, $volume, $stopAfterSpeak);
             } else {
                 if(AttrVal($hash->{NAME}, "ttsSpeakOnError", "1") eq "1") {
-                    $filename = md5_hex("enHello, I'm sorry, but Google Translate is currently not available.");
+                    $md5 = md5_hex($BOSEST_GOOGLE_NOT_AVAILABLE_LANG.$BOSEST_GOOGLE_NOT_AVAILABLE_TEXT);
+                    BOSEST_playMessage($hash, $md5, $volume, $stopAfterSpeak);
                 } else {
+                    Log3 $hash, 3, "BOSEST: Download Google Translate failed ($text).";
                     return undef;
                 }
             }
-
-            BOSEST_saveCurrentState($hash);
-            
-            if($volume ne ReadingsVal($hash->{NAME}, "volume", 0)) {
-                BOSEST_pause($hash);
-                BOSEST_setVolume($hash, $volume);
-            }
-
-            BOSEST_playTrack($hash, $filename);
-
-            $hash->{helper}{stateCheck}{enabled} = 1;
-            $hash->{helper}{stateCheck}{always} = 0;
-            $hash->{helper}{stateCheck}{actionState} = "stopped";
-            #check if we need to stop after speak
-            if($stopAfterSpeak) {
-                $hash->{helper}{stateCheck}{function} = \&BOSEST_off;
-            } else {
-                $hash->{helper}{stateCheck}{function} = \&BOSEST_restoreSavedState;
-            }
-      
-            Log3 $hash, 4, "BOSEST: Play finished...";
-    });
+        });
     
+    return undef;
+}
+
+sub BOSEST_setMusicServiceAccount($$$) {
+    my ($hash, $friendlyName, $uuid) = @_;
+    my $postXml = '<credentials source="STORED_MUSIC" displayName="'.
+                  $friendlyName.
+                  '"><user>'.
+                  $uuid.'/0'.
+                  '</user><pass/></credentials>';
+    if(BOSEST_HTTPPOST($hash, '/setMusicServiceAccount', $postXml)) {
+        #ok
+    }
+    return undef;
+}
+
+sub BOSEST_removeMusicServiceAccount($$$) {
+    my ($hash, $friendlyName, $uuid) = @_;
+    my $postXml = '<credentials source="STORED_MUSIC" displayName="'.
+                  $friendlyName.
+                  '"><user>'.
+                  $uuid.
+                  '</user><pass/></credentials>';
+    if(BOSEST_HTTPPOST($hash, '/removeMusicServiceAccount', $postXml)) {
+        #ok
+    }
     return undef;
 }
 
 sub BOSEST_playTrack($$) {
     my ($hash, $trackName) = @_;
+
+    my $ttsDlnaServer = AttrVal($hash->{NAME}, "ttsDLNAServer", "");
     
     foreach my $source (@{$hash->{helper}{sources}}) {
         if($source->{source} eq "STORED_MUSIC" && $source->{status} eq "READY") {
-            Log3 $hash, 3, "BOSEST: Search for $trackName on $source->{source}";
+            #skip servers which don't equal to ttsDLNAServer attribute if set
+            if($ttsDlnaServer ne "") {
+                next if($ttsDlnaServer ne $source->{content});
+            }
+            Log3 $hash, 4, "BOSEST: Search for $trackName on $source->{source}";
             if(my $xmlTrack = BOSEST_searchTrack($hash, $source->{sourceAccount}, $trackName)) {
                 BOSEST_setContentItem($hash,
                                       $xmlTrack->{itemName},
@@ -995,7 +1144,7 @@ sub BOSEST_processXml($$) {
     
     if($hash->{helper}{stateCheck}{enabled}) {
         #check if state is action state
-        if(ReadingsVal($hash->{NAME}, "state", "") eq $hash->{helper}{stateCheck}{actionState}) {
+        if(ReadingsVal($hash->{NAME}, "source", "") eq $hash->{helper}{stateCheck}{actionSource}) {
             #call function with $hash as argument
             $hash->{helper}{stateCheck}{function}->($hash);
             
@@ -1014,10 +1163,8 @@ sub BOSEST_parseAndUpdateSources($$) {
     
     $hash->{helper}->{sources} = ();
     
-    Log3 $hash, 3, "BOSEST: Update sources...";
-    
     foreach my $sourceItem (@{$sourceItems}) {
-        Log3 $hash, 3, "BOSEST: Add $sourceItem->{source}";
+        Log3 $hash, 5, "BOSEST: Add $sourceItem->{source}";
         #save source information
         # - source (BLUETOOTH, STORED_MUSIC, ...)
         # - sourceAccount
@@ -1036,6 +1183,19 @@ sub BOSEST_parseAndUpdateSources($$) {
                       
         push @{$hash->{helper}->{sources}}, \%source;
     }
+    
+    my $connectedDlnaServers = "";
+    foreach my $sourceItem (@{ $hash->{helper}->{sources} }) {
+        if($sourceItem->{source} eq "STORED_MUSIC") {
+            $connectedDlnaServers .= $sourceItem->{name}.",";
+        }
+    }
+    #remove last comma
+    $connectedDlnaServers = substr($connectedDlnaServers, 0, length($connectedDlnaServers) - 1);
+    #replace blank with hyphen
+    $connectedDlnaServers =~ s/\ /_/g;
+    
+    readingsSingleUpdate($hash, "connectedDLNAServers", $connectedDlnaServers, 1);
     
     return undef;
 }
@@ -1271,6 +1431,7 @@ sub BOSEST_Discovery($) {
         $res->discover;
         foreach my $device ($res->entries) {
             my $info = BOSEST_HTTPGET($hash, $device->address, "/info");
+            my $sources = BOSEST_HTTPGET($hash, $device->address, "/sources");
             #remove info tag to reduce line length
             $info = $info->{info} if (defined($info->{info}));
             #skip entry if no deviceid was found
@@ -1281,8 +1442,60 @@ sub BOSEST_Discovery($) {
                 $info->{name} = Encode::encode('UTF-8',$info->{name});
                 Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
                 $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
+
+            }
+
+            #MOVE THIS PART INTO THE IF ABOVE IN FOR NEXT VERSION
+            #set supported sources
+            $return .= "|supportedSources|$info->{deviceID}";
+            foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
+                $return .= ",".$source->{source};
+            }
+
+            #set supported capabilities-currently not of intereset
+            #my $capabilities = BOSEST_HTTPGET($hash, $device->address, "/capabilities");
+
+            #set supported bass capabilities
+            my $bassCapabilities = BOSEST_HTTPGET($hash, $device->address, "/bassCapabilities");
+            $return .= "|bassCapabilities|$info->{deviceID}";
+            if($bassCapabilities->{bassCapabilities}) {
+                my $bassCap = $bassCapabilities->{bassCapabilities};
+                $return .= ",".$bassCap->{bassAvailable}.",".$bassCap->{bassMin}.",".
+                           $bassCap->{bassMax}.",".$bassCap->{bassDefault};
+            }
+
+            #TODO create own function
+            my $myIp = BOSEST_getMyIp($hash);
+            my $listMediaServers = BOSEST_HTTPGET($hash, $device->address, "/listMediaServers");
+
+            my $returnListMediaServers = "|listMediaServers|".$info->{deviceID};
+            foreach my $mediaServer (@{ $listMediaServers->{ListMediaServersResponse}->{media_server} }) {
+                $returnListMediaServers .= ",".$mediaServer->{friendly_name};
+                
+                #check if it is already connected
+                my $isConnected = 0;
+                foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
+                    next if($source->{source} ne "STORED_MUSIC");
+                    
+                    if(substr($source->{sourceAccount}, 0, length($mediaServer->{id})) eq $mediaServer->{id}) {
+                        #already connected
+                        $isConnected = 1;
+                        next;
+                    }
+                }
+                
+                next if($isConnected);
+                
+                if(($myIp eq $mediaServer->{ip}) ||
+                   (AttrVal($name, "autoAddDLNAServers", "0") eq "1" )) {
+                    $return = $return."|setMusicServiceAccount|".$info->{deviceID}.",".$mediaServer->{friendly_name}.",".$mediaServer->{id};
+                    Log3 $hash, 3, "BOSEST: DLNA Server ".$mediaServer->{friendly_name}." added.";
+                }
             }
             
+            #append listMediaServers
+            $return .= $returnListMediaServers;
+
             #update IP address of the device
             $return = $return."|updateIP|".$info->{deviceID}.",".$device->address;
         }
@@ -1311,16 +1524,57 @@ sub BOSEST_finishedDiscovery($) {
     for($i = 1; $i < @commands; $i = $i+2) {
         my $command = $commands[$i];
         my @params = split(",", $commands[$i+1]);
-        my $deviceId = $params[0];
+        my $deviceId = shift(@params);
         
         next if($ignoreDeviceIDs =~ /$deviceId/);
 
         if($command eq "commandDefineBOSE") {
-            my $deviceName = $params[1];
+            my $deviceName = $params[0];
             BOSEST_commandDefine($hash, $deviceId, $deviceName);
         } elsif($command eq "updateIP") {
-            my $ip = $params[1];
+            my $ip = $params[0];
             BOSEST_updateIP($hash, $deviceId, $ip);
+        } elsif($command eq "setMusicServiceAccount") {
+            my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
+            #0...friendly name
+            #1...UUID
+            BOSEST_setMusicServiceAccount($deviceHash, $params[0], $params[1]);
+        } elsif($command eq "listMediaServers") {
+            my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
+            $deviceHash->{helper}{dlnaServers} = join(",", @params);
+            $deviceHash->{helper}{dlnaServers} =~ s/\ /_/g;
+        } elsif($command eq "bassCapabilities") {
+            my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
+            #bassAvailable, bassMin, bassMax, bassDefault
+            $deviceHash->{helper}{bassAvailable} = 1 if($params[0] eq "true");
+            $deviceHash->{helper}{bassMin} = $params[1];
+            $deviceHash->{helper}{bassMax} = $params[2];
+            $deviceHash->{helper}{bassDefault} = $params[3];
+            if($params[0] eq "true") {
+                $deviceHash->{helper}{supportedBassCmds} = "bass:slider,1,1,10";
+            } else {
+                $deviceHash->{helper}{supportedBassCmds} = "";
+            }
+        } elsif($command eq "supportedSources") {
+            my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
+            #list of supported sources
+            $deviceHash->{helper}{bluetoothSupport} = 0;
+            $deviceHash->{helper}{auxSupport} = 0;
+            $deviceHash->{helper}{airplaySupport} = 0;
+            $deviceHash->{helper}{supportedSourcesCmds} = "";
+            foreach my $source (@params) {
+                if($source eq "BLUETOOTH") {
+                    $deviceHash->{helper}{bluetoothSupport} = 1;
+                    $deviceHash->{helper}{supportedSourcesCmds} .= "bluetooth,bt-discover,";
+                } elsif($source eq "AUX") {
+                    $deviceHash->{helper}{auxSupport} = 1;
+                    $deviceHash->{helper}{supportedSourcesCmds} .= "aux,";
+                } elsif($source eq "AIRPLAY") {
+                    $deviceHash->{helper}{airplaySupport} = 1;
+                    $deviceHash->{helper}{supportedSourcesCmds} .= "airplay,";
+                }
+            } 
+            $deviceHash->{helper}{supportedSourcesCmds} = substr($deviceHash->{helper}{supportedSourcesCmds}, 0, length($deviceHash->{helper}{supportedSourcesCmds})-1);
         }
     }
 }
@@ -1441,7 +1695,7 @@ sub BOSEST_webSocketReceivedMsg($$$) {
     #parse XML
     my $xml = "";
     eval {
-        $xml = XMLin($msg, KeepRoot => 1, ForceArray => [qw(item member recent)], KeyAttr => []);
+        $xml = XMLin($msg, KeepRoot => 1, ForceArray => [qw(media_server item member recent)], KeyAttr => []);
     };
     
     if($@) {
@@ -1467,7 +1721,6 @@ sub BOSEST_startWebSocketConnection($) {
         return undef;
     }
     
-    $hash->{helper}{useragent} = Mojo::UserAgent->new() if(!defined($hash->{helper}{useragent}));
     $hash->{helper}{bosewebsocket} = $hash->{helper}{useragent}->websocket('ws://'.$hash->{helper}{IP}.':8080'
         => ['gabbo'] => sub {
             my ($ua, $tx) = @_;
@@ -1498,6 +1751,21 @@ sub BOSEST_checkWebSocketConnection($) {
 }
 
 ###### GENERIC ######
+sub BOSEST_getMyIp($) {
+    #Attention: Blocking function
+    my ($hash) = @_;
+
+    my $socket = IO::Socket::INET->new(
+        Proto => 'udp',
+        PeerAddr => '198.41.0.4', #a.root-servers.net
+        PeerPort => '53' #DNS
+    );
+
+    my $local_ip_address = $socket->sockhost;
+
+    return $local_ip_address;
+}
+
 sub BOSEST_getSourceAccountByName($$) {
     my ($hash, $sourceName) = @_;
     
@@ -1563,7 +1831,7 @@ sub BOSEST_HTTPGET($$$) {
     if($response->is_success) {
         my $xmlres = "";
         eval {
-            $xmlres = XMLin($response->decoded_content, KeepRoot => 1, ForceArray => [qw(item member recent)], KeyAttr => []);
+            $xmlres = XMLin($response->decoded_content, KeepRoot => 1, ForceArray => [qw(media_server item member recent)], KeyAttr => []);
         };
         
         if($@) {
@@ -1590,7 +1858,7 @@ sub BOSEST_HTTPPOST($$$) {
         Log3 $hash, 4, "BOSEST: success: ".$response->decoded_content;
         my $xmlres = "";
         eval {
-            $xmlres = XMLin($response->decoded_content, KeepRoot => 1, ForceArray => [qw(item member recent)], KeyAttr => []);
+            $xmlres = XMLin($response->decoded_content, KeepRoot => 1, ForceArray => [qw(media_server item member recent)], KeyAttr => []);
         };
         
         if($@) {

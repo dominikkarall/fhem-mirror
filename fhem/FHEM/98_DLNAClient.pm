@@ -205,6 +205,7 @@ DLNAClient_Define($$)
   Log3 $hash, 3, "DLNAClient: DLNA Client v1.23";
   
   readingsSingleUpdate($hash,"presence","offline",1);
+  readingsSingleUpdate($hash,"state","initialized",1);
   
   InternalTimer(gettimeofday() + 10, 'DLNAClient_startUPnPScan', $hash, 0);
   
@@ -242,7 +243,7 @@ DLNAClient_Set($@)
   }
     
   # check device presence
-  if (!defined($dev)) {
+  if (!defined($dev) or $hash->{READINGS}{presence}{VAL} eq "offline") {
     return "DLNAClient: Currently searching for device $hash->{DEVNAME}...";
   }
   
