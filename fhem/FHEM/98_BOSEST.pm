@@ -6,9 +6,14 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.0
+# Version: 1.5.1
 #
 #############################################################
+#
+# v1.5.1 - 201603XX
+#  - FEATURE: support 3-tap press (currently no function implemented: any ideas? :))
+#  - CHANGE: change back channel even after speakOff
+#  - BUGFIX: unitialized value fixed
 #
 # v1.5.0 - 20160306
 #  - FEATURE: support SetExtensions (on-for-timer,...)
@@ -144,7 +149,6 @@
 # TODO
 #  - adduserattr function??
 #  - TTS code cleanup (group functions logically)
-#  - test speak during bluetooth play
 #  - delete TTS files after 30 days
 #  - define own groups of players
 #  - update readings only on change
@@ -245,8 +249,12 @@ sub BOSEST_Define($$) {
     #init dlnaservers
     $hash->{helper}{dlnaServers} = "";
     
+    #init supported source commands
+    $hash->{helper}{supportedSourcesCmds} = "";
+    $hash->{helper}{supportedBassCmds} = "";
+    
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.0";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.1";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
     }
@@ -812,12 +820,11 @@ sub BOSEST_restoreSavedState($) {
     
     BOSEST_setVolume($hash, $hash->{helper}{savedState}{volume});
     BOSEST_setBass($hash, $hash->{helper}{savedState}{bass});
+    
     #bose off when source was off
     if($hash->{helper}{savedState}{source} eq "STANDBY") {
         BOSEST_off($hash);
     } else {
-        #FIXME test if setsource works properly
-        #BOSEST_setSource($hash, $hash->{helper}{savedState}{source});
         BOSEST_setContentItem($hash, $hash->{helper}{savedState}{contentItemItemName},
                               $hash->{helper}{savedState}{contentItemLocation},
                               $hash->{helper}{savedState}{contentItemSource},
@@ -829,9 +836,14 @@ sub BOSEST_restoreSavedState($) {
 
 sub BOSEST_restoreVolumeAndOff($) {
     my ($hash) = @_;
-    
+
     BOSEST_setVolume($hash, $hash->{helper}{savedState}{volume});
     BOSEST_setBass($hash, $hash->{helper}{savedState}{bass});
+
+    BOSEST_setContentItem($hash, $hash->{helper}{savedState}{contentItemItemName},
+                  $hash->{helper}{savedState}{contentItemLocation},
+                  $hash->{helper}{savedState}{contentItemSource},
+                  $hash->{helper}{savedState}{contentItemSourceAccount});
 
     BOSEST_off($hash);
 }
@@ -1063,22 +1075,31 @@ sub BOSEST_checkDoubleTap($$) {
         $hash->{helper}{dt_nowSelectionUpdatedTS} = gettimeofday();
         $hash->{helper}{dt_nowSelectionUpdatedCH} = $channel;
         $hash->{helper}{dt_lastChange} = 0;
+        $hash->{helper}{dt_counter} = 1;
         return undef;
     }
     
     my $timeDiff = gettimeofday() - $hash->{helper}{dt_nowSelectionUpdatedTS};
     if($timeDiff < 1) {
-        if(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq $hash->{DEVICEID}) {
-            BOSEST_stopPlayEverywhere($hash);
-            $hash->{helper}{dt_lastChange} = gettimeofday();
-        } elsif(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq "") {
-            #make sure that play isn't started just after stop, that might confuse the player
-            my $timeDiffMasterChange = gettimeofday() - $hash->{helper}{dt_lastChange};
-            if($timeDiffMasterChange > 2) {
-                BOSEST_playEverywhere($hash);
+        $hash->{helper}{dt_counter}++;
+        
+        if($hash->{helper}{dt_counter} == 2) {
+            if(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq $hash->{DEVICEID}) {
+                BOSEST_stopPlayEverywhere($hash);
                 $hash->{helper}{dt_lastChange} = gettimeofday();
+            } elsif(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq "") {
+                #make sure that play isn't started just after stop, that might confuse the player
+                my $timeDiffMasterChange = gettimeofday() - $hash->{helper}{dt_lastChange};
+                if($timeDiffMasterChange > 2) {
+                    BOSEST_playEverywhere($hash);
+                    $hash->{helper}{dt_lastChange} = gettimeofday();
+                }
             }
+        } elsif($hash->{helper}{dt_counter} == 3) {
+            #handle three-tap function - ideas?
         }
+    } else {
+        $hash->{helper}{dt_counter} = 1;
     }
     
     $hash->{helper}{dt_nowSelectionUpdatedTS} = gettimeofday();

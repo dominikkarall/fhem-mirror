@@ -1,7 +1,9 @@
-##############################################
-# 2016-03-XX, v2.0.0, dominik $
+############################################################################
+# 2016-03-21, v2.0.0, dominik.karall@gmail.com $
 #
-# v2.0.0 - 20160320
+# v2.0.0 - 20160321
+# - FEATURE: autodiscover and autocreate DLNA devices
+#       just use "define dlnadevices DLNARenderer" and wait 2 minutes
 # - FEATURE: support Caskeid (e.g. MUNET devices) with following commands
 #                set <name> playEverywhere
 #                set <name> stopPlayEverywhere
@@ -9,11 +11,12 @@
 #                set <name> removeUnit <UNIT>
 #                set <name> enableBTCaskeid
 #                set <name> disableBTCaskeid
-# - FEATURE: autodiscover and autocreate DLNA devices
-#       just use "define dlnadevices DLNARenderer" and wait 2 minutes
+# - FEATURE: display multiroom speakers in multiRoomUnits reading
 # - FEATURE: automatically set alias for friendlyname
 # - FEATURE: automatically set webCmd volume
 # - FEATURE: automatically set devStateIcon audio icons
+# - FEATURE: ignoreUDNs attribute in main
+# - FEATURE: scanInterval attribute in main
 #
 # DLNA Module to play given URLs on a DLNA Renderer
 # and control their volume. Just define
@@ -21,14 +24,15 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 # TODO
-# - multiroomunits?? multiroom, caskeid, zone, session??
-# - rename auf DLNA?
 # - set presence=offline if device wasn't found for X minutes
-# - implement events from DLNA devices
+# - implement events from DLNA devices (MediaInfo)
 # - implement stereo mode for caskeid devices
 # - implement speak functions
+# - check Standby -> Online signal
+# - remove attributes (scanInterval, ignoreUDNs, multiRoomGroups) from play devices
 #
-##############################################
+############################################################################
+
 package main;
 
 use strict;
@@ -50,6 +54,25 @@ DLNARenderer_Initialize($)
   $hash->{SetFn}     = "DLNARenderer_Set";
   $hash->{DefFn}     = "DLNARenderer_Define";
   $hash->{UndefFn}   = "DLNARenderer_Undef";
+  $hash->{AttrFn}    = "DLNARenderer_Attribute";
+  $hash->{AttrList}  = "ignoreUDNs scanInterval ".$readingFnAttributes;
+}
+
+sub DLNARenderer_Attribute {
+  my ($mode, $devName, $attrName, $attrValue) = @_;
+  #ignoreUDNs, scanInterval, multiRoomGroups
+  
+  if($mode eq "set") {
+    if($attrName eq "scanInterval") {
+      if($attrValue > 86400) {
+        return "DLNARenderer: Max scan intervall is 24 hours (86400s).";
+      }
+    }
+  } elsif($mode eq "del") {
+    
+  }
+  
+  return undef;
 }
 
 sub
@@ -92,7 +115,7 @@ DLNARenderer_finishedUPnPScan($)
   my $hash = $main::defs{$name};
 
   delete($hash->{helper}{SCAN_PID});
-  InternalTimer(gettimeofday() + 60, 'DLNARenderer_startUPnPScan', $hash, 0);
+  InternalTimer(gettimeofday() + AttrVal($hash->{NAME}, "scanInterval", 60), 'DLNARenderer_startUPnPScan', $hash, 0);
   
   for(my $i=0; $i<@params; $i=$i+2) {
     my $ssdp = decode_base64($params[$i]);
@@ -100,6 +123,12 @@ DLNARenderer_finishedUPnPScan($)
     my $dev = Net::UPnP::Device->new();
     $dev->setssdp($ssdp);
     $dev->setdescription($description);
+    my $udn = $dev->getudn();
+    
+    #TODO check for BOSE UDN
+    
+    #ignoreUDNs
+    next if(AttrVal($hash->{NAME}, "ignoreUDNs", "") =~ /$udn/);
     
     my $foundDevice = 0;
     my @allDLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
@@ -110,8 +139,6 @@ DLNARenderer_finishedUPnPScan($)
     }
     
     if(!$foundDevice) {
-      #TODO check if this UDN needs to be ignored
-      #TODO check if the UDN is a BOSE SoundTouch UDN and log the thread URL
       my $uniqueDeviceName = "DLNA_".substr($dev->getudn(),29,12);
       CommandDefine(undef, "$uniqueDeviceName DLNARenderer ".$dev->getudn());
       CommandAttr(undef,"$uniqueDeviceName alias ".$dev->getfriendlyname());
@@ -143,9 +170,9 @@ DLNARenderer_finishedUPnPScan($)
         #check caskeid
         if($dev->getservicebyname('urn:schemas-pure-com:service:SessionManagement:1')) {
           $DLNARendererHash->{helper}{caskeid} = 1;
-          readingsSingleUpdate($DLNARendererHash,"caskeidSupport","1",1);
+          readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","1",1);
         } else {
-          readingsSingleUpdate($DLNARendererHash,"caskeidSupport","0",1);
+          readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","0",1);
         }
         
         readingsSingleUpdate($DLNARendererHash,"friendlyName",$dev->getfriendlyname(),1);
@@ -161,11 +188,21 @@ DLNARenderer_finishedUPnPScan($)
             $DLNARendererHash->{helper}{caskeidClients} .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
           }
         }
-        $DLNARendererHash->{helper}{caskeidClients} = substr($DLNARendererHash->{helper}{caskeidClients}, 1);
+        $DLNARendererHash->{helper}{caskeidClients} = substr($DLNARendererHash->{helper}{caskeidClients}, 1) if($DLNARendererHash->{helper}{caskeidClients} ne "");
       }
     }
   }
   
+  return undef;
+}
+
+sub DLNARenderer_getMainDLNARenderer($) {
+  my ($hash) = @_;
+    
+  foreach my $fhem_dev (sort keys %main::defs) { 
+    return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq "0");
+  }
+		
   return undef;
 }
 
@@ -361,7 +398,7 @@ sub DLNARenderer_createSession {
   );
   my $session = $conn_service->postaction("CreateSession", \%req_arg);
   my $res = $session->getargumentlist();
-  Log3 $hash, 3, "DLNARenderer: CreateSession => ID: ".$res->{'SessionID'};
+  Log3 $hash, 4, "DLNARenderer: CreateSession => ID: ".$res->{'SessionID'};
   return $res->{'SessionID'};
 }
 
@@ -372,7 +409,7 @@ sub DLNARenderer_getSession {
   my %req_arg = ();
   my $session = $conn_service->postaction("GetSession", \%req_arg);
   my $res = $session->getargumentlist();
-  Log3 $hash, 3, "DLNARenderer: GetSession => ID: ".$res->{'SessionID'};
+  Log3 $hash, 4, "DLNARenderer: GetSession => ID: ".$res->{'SessionID'};
   return $res->{'SessionID'};
 }
 
@@ -417,6 +454,19 @@ sub DLNARenderer_destroySession {
   }
 }
 
+sub DLNARenderer_saveGroupAs {
+  my ($hash, $dev, $groupName) = @_;
+  my $mainDlnaRendererHash = DLNARenderer_getMainDLNARenderer($hash);
+  
+  #return if(!defined($mainDlnaRendererHash));
+  
+  #my $currentGroupSettings = AttrVal($mainDlnaRendererHash->{NAME}, "multiRoomGroups", "");
+  #$currGroupSettings .= "," if($currGroupSettings ne "");
+  #TODO implement feature
+  
+  #CommandAttr(undef, "$mainDlnaRendererHash->{NAME} attr ")  
+}
+
 ###################################
 sub
 DLNARenderer_Define($$)
@@ -424,29 +474,24 @@ DLNARenderer_Define($$)
   my ($hash, $def) = @_;
   my @param = split("[ \t][ \t]*", $def);
   
+  #init caskeid clients for multiroom
+  $hash->{helper}{caskeidClients} = "";
+  $hash->{helper}{caskeid} = 0;
+  
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA";
     InternalTimer(gettimeofday() + 10, 'DLNARenderer_startUPnPScan', $hash, 0);
     readingsSingleUpdate($hash,"state","initialized",1);
     return undef;
   }
-  
-  #TODO check format of 3rd parameter if it is UDN
   
   #device specific
   my $name     = shift @param;
   my $type     = shift @param;
   my $udn      = shift @param;
   $hash->{UDN} = $udn;
-  
-  $hash->{helper}{caskeid} = 0;
-  
-  #init caskeid clients for multiroom
-  $hash->{helper}{caskeidClients} = "";
-    
-  
-  Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0";
   
   readingsSingleUpdate($hash,"presence","offline",1);
   readingsSingleUpdate($hash,"state","initialized",1);
@@ -543,6 +588,12 @@ DLNARenderer_Set($@)
     my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
     foreach my $client (@caskeidClients) {
       if(ReadingsVal($client->{NAME}, "friendlyName", "") eq $param[2]) {
+        my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
+        foreach my $unit (@multiRoomUnits) {
+          #skip if unit is already part of the session
+          return undef if($unit eq $param[2]);
+        }
+        #add unit to session
         DLNARenderer_addUnitToPlay($hash, $dev, substr($client->{UDN},5));
         my $currMultiRoomUnits = ReadingsVal($hash->{NAME}, "multiRoomUnits","");
         if($currMultiRoomUnits ne "") {
@@ -559,7 +610,19 @@ DLNARenderer_Set($@)
   # removeUnit
   if($ctrlParam eq "removeUnit") {
     DLNARenderer_removeUnitToPlay($hash, $dev, $param[2]);
-    readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
+    my $multiRoomUnitsReading = "";
+    my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
+    foreach my $unit (@multiRoomUnits) {
+      $multiRoomUnitsReading .= ",".$unit if($unit ne $param[2]);
+    }
+    $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
+    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
+    return undef;
+  }
+  
+  # save group as
+  if($ctrlParam eq "saveGroupAs") {
+    DLNARenderer_saveGroupAs($hash, $dev, $param[2]);
     return undef;
   }
   
