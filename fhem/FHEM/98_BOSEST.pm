@@ -6,12 +6,17 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.1
+# Version: 1.5.2
 #
 #############################################################
 #
-# v1.5.1 - 201603XX
-#  - FEATURE: support 3-tap press (currently no function implemented: any ideas? :))
+# v1.5.2 - 20160331
+#  - FEATURE: support clock display (SoundTouch 20/30)
+#             set <name> clock enable/disable
+#
+# v1.5.1 - 20160330
+#  - CHANGE: updated documentation (again many thx to Miami!)
+#  - FEATURE: support triple-tap (currently no function implemented: any ideas? :))
 #  - CHANGE: change back channel even after speakOff
 #  - BUGFIX: unitialized value fixed
 #
@@ -147,7 +152,9 @@
 #  - change preset via /key
 #
 # TODO
+#  - speak channel name after preset change (configure per preset)
 #  - adduserattr function??
+#  - support http://... for streaming via DLNA
 #  - TTS code cleanup (group functions logically)
 #  - delete TTS files after 30 days
 #  - define own groups of players
@@ -254,7 +261,7 @@ sub BOSEST_Define($$) {
     $hash->{helper}{supportedBassCmds} = "";
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.1";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.2";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
     }
@@ -301,6 +308,7 @@ sub BOSEST_Set($@) {
                 mute:on,off,toggle recent source:".$hash->{helper}{supportedSourcesCmds}." 
                 nextTrack:noArg prevTrack:noArg playTrack speak speakOff 
                 playEverywhere:noArg stopPlayEverywhere:noArg createZone addToZone removeFromZone 
+                clock:enable,disable 
                 stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 
                 volume:slider,0,1,100 ".$hash->{helper}{supportedBassCmds}." 
                 saveChannel:07,08,09,10,11,12,13,14,15,16,17,18,19,20 
@@ -357,6 +365,11 @@ sub BOSEST_Set($@) {
         return "BOSEST: removeDLNAServer requires DLNA friendly name as additional parameter" if(int(@params) < 1);
         #params[0] = friendly name
         BOSEST_removeDLNAServer($hash, $params[0]);
+    } elsif($workType eq "clock") {
+        return "BOSEST: clock requires enable/disable as additional parameter" if(int(@params) < 1);
+        #check if supported
+        return "BOSEST: clock not supported." if(ReadingsVal($hash->{NAME}, "supportClockDisplay", "false") eq "false");
+        BOSEST_clockSettings($hash, $params[0]);
     } elsif($workType eq "play") {
         BOSEST_play($hash);
     } elsif($workType eq "stop") {
@@ -435,6 +448,24 @@ sub BOSEST_Set($@) {
 }
 
 #DEVELOPNEWFUNCTION-2 (create own function)
+sub BOSEST_clockSettings($$) {
+    my ($hash, $val) = @_;
+    
+    if($val eq "disable") {
+        $val = "false";
+    } else {
+        $val = "true";
+    }
+    
+    my $postXml = "<clockDisplay><clockConfig userEnable=\"$val\"/></clockDisplay>";
+    if(BOSEST_HTTPPOST($hash, '/clockDisplay', $postXml)) {
+        #readingsSingleUpdate($hash, "bass", $bass+10, 1);
+    }
+    #FIXME error handling
+    
+    return undef;
+}
+
 sub BOSEST_addDLNAServer($$) {
     my ($hash, $friendlyName) = @_;
     
@@ -1019,6 +1050,13 @@ sub BOSEST_searchTrack($$$) {
 }
 
 ###### UPDATE VIA HTTP ######
+sub BOSEST_updateClock($$) {
+    my ($hash, $deviceId) = @_;
+    my $clockDisplay = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/clockDisplay");
+    BOSEST_processXml($hash, $clockDisplay);
+    return undef;
+}
+
 sub BOSEST_updateInfo($$) {
     my ($hash, $deviceId) = @_;
     my $info = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/info");
@@ -1144,6 +1182,8 @@ sub BOSEST_processXml($$) {
         } elsif ($wsxml->{updates}->{sourcesUpdated}) {
             #sourcesUpdated is just a notification with no data
             BOSEST_updateSources($hash, $hash->{DEVICEID});
+        } elsif ($wsxml->{updates}->{clockTimeUpdated}) {
+            BOSEST_parseAndUpdateClock($hash, $wsxml->{updates}->{clockTimeUpdated});
         } else {
             Log3 $hash, 4, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
         }
@@ -1161,6 +1201,8 @@ sub BOSEST_processXml($$) {
         BOSEST_parseAndUpdateZone($hash, $wsxml->{zone});
     } elsif($wsxml->{sources}) {
         BOSEST_parseAndUpdateSources($hash, $wsxml->{sources}->{sourceItem});
+    } else {
+        Log3 $hash, 4, "BOSEST: Unknown event, please implement:\n".Dumper($wsxml);
     }
     
     if($hash->{helper}{stateCheck}{enabled}) {
@@ -1174,6 +1216,18 @@ sub BOSEST_processXml($$) {
                 $hash->{helper}{stateCheck}{enabled} = 0;
             }
         }
+    }
+    
+    return undef;
+}
+
+sub BOSEST_parseAndUpdateClock($$) {
+    my ($hash, $clock) = @_;
+    
+    if($clock->{clockTime}->{brightness} eq "0") {
+        readingsSingleUpdate($hash, "clockDisplay", "off", 1);
+    } else {
+        readingsSingleUpdate($hash, "clockDisplay", "on", 1);
     }
     
     return undef;
@@ -1473,8 +1527,14 @@ sub BOSEST_Discovery($) {
                 $return .= ",".$source->{source};
             }
 
-            #set supported capabilities-currently not of intereset
-            #my $capabilities = BOSEST_HTTPGET($hash, $device->address, "/capabilities");
+            #set supported capabilities
+            my $capabilities = BOSEST_HTTPGET($hash, $device->address, "/capabilities");
+            $return .= "|capabilities|$info->{deviceID}";
+            if($capabilities->{capabilities}->{clockDisplay}) {
+                $return .= ",".$capabilities->{capabilities}->{clockDisplay};
+            } else {
+                $return .= ",false";
+            }
 
             #set supported bass capabilities
             my $bassCapabilities = BOSEST_HTTPGET($hash, $device->address, "/bassCapabilities");
@@ -1596,6 +1656,9 @@ sub BOSEST_finishedDiscovery($) {
                 }
             } 
             $deviceHash->{helper}{supportedSourcesCmds} = substr($deviceHash->{helper}{supportedSourcesCmds}, 0, length($deviceHash->{helper}{supportedSourcesCmds})-1);
+        } elsif($command eq "capabilities") {
+            my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
+            readingsSingleUpdate($deviceHash, "supportClockDisplay", $params[0], 1);
         }
     }
 }
@@ -1627,6 +1690,8 @@ sub BOSEST_updateIP($$$) {
         BOSEST_updateZone($deviceHash, $deviceID);
         #get current sources
         BOSEST_updateSources($deviceHash, $deviceID);
+        #get current clock state
+        BOSEST_updateClock($deviceHash, $deviceID);
         #connect websocket
         Log3 $hash, 4, "BOSEST: $deviceHash->{NAME}, start new WebSocket.";
         BOSEST_startWebSocketConnection($deviceHash);
@@ -1939,7 +2004,7 @@ sub BOSEST_XMLUpdate($$$) {
     Example:
     <ul>
       <code>define bosesystem BOSEST</code><br>
-      Defines BOSE SoundTouch system. All speakers will show up after 60s under Unsorted.<br/>
+      Defines BOSE SoundTouch system. All devices/speakers will show up after 60s under "Unsorted" in FHEM.<br/>
     </ul>
 	</ul>
   
@@ -1949,30 +2014,54 @@ sub BOSEST_XMLUpdate($$$) {
   <b>Set</b>
  		<ul>
     <code>set &lt;name&gt; &lt;command&gt; [&lt;parameter&gt;]</code><br>
-        The following commands are defined:<br>
-        <ul>
-          <li><b>on</b> &nbsp;&nbsp;-&nbsp;&nbsp; powers on the device</li>
-          <li><b>off</b> &nbsp;&nbsp;-&nbsp;&nbsp; turns the device off</li>
-          <li><b>power</b> &nbsp;&nbsp;-&nbsp;&nbsp; toggles on/off</li>
-          <li><b>volume</b> 0...100 &nbsp;&nbsp;-&nbsp;&nbsp; sets the volume level in percentage</li>
-          <li><b>channel</b> 0...20 &nbsp;&nbsp;-&nbsp;&nbsp; selects present to play</li>
-          <li><b>play</b> &nbsp;&nbsp;-&nbsp;&nbsp; starts/resumes to play </li>
-          <li><b>pause</b> &nbsp;&nbsp;-&nbsp;&nbsp; pauses the playback</li>
-          <li><b>stop</b> &nbsp;&nbsp;-&nbsp;&nbsp; stops playback</li>
-          <li><b>nextTrack</b> &nbsp;&nbsp;-&nbsp;&nbsp; plays next track</li>
-          <li><b>prevTrack</b> &nbsp;&nbsp;-&nbsp;&nbsp; plays previous track</li>
-          <li><b>mute</b> on,off, toggle &nbsp;&nbsp;-&nbsp;&nbsp; controls volume mute</li>
-          <li><b>bass</b> 1---10 &nbsp;&nbsp;-&nbsp;&nbsp; sets the bass level</li>
-          <li><b>recent</b> x &nbsp;&nbsp;-&nbsp;&nbsp; lists x names in the recent list in readings</li>
-          <li><b>source</b> bluetooth,bt-discover,aux mode&nbsp;&nbsp;-&nbsp;&nbsp; select a local source</li><br>
-        </ul>
-        <ul>Multiroom commands:
-          <li><b>createZone</b> deviceID &nbsp;&nbsp;-&nbsp;&nbsp; creates multiroom zone (defines <code>&lt;name&gt;</code> as zoneMaster) </li>          
-          <li><b>addToZone</b> deviceID &nbsp;&nbsp;-&nbsp;&nbsp; adds device <code>&lt;name&gt;</code> to multiroom zone</li>
-          <li><b>removeFromZone</b> deviceID &nbsp;&nbsp;-&nbsp;&nbsp; removes device <code>&lt;name&gt;</code> from multiroom zone</li>
-          <li><b>playEverywhere</b>  &nbsp;&nbsp;-&nbsp;&nbsp; plays sound of  device <code>&lt;name&gt;</code> on all others devices</li>
-          <li><b>stopPlayEverywhere</b>  &nbsp;&nbsp;-&nbsp;&nbsp; stops playing sound on all devices</li>
-        </ul>
+               The following commands are defined for the devices/speakers (execpt <b>autoAddDLNAServers</b> is for the "main" BOSEST) :<br><br>
+        <ul><u>General commands</u>
+          <li><code><b>on</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device</li>
+          <li><code><b>off</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off</li>          
+          <li><code><b>power</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; toggle on/off</li>
+          <li><code><b>volume</b> [0...100] [+x|-x]</code> &nbsp;&nbsp;-&nbsp;&nbsp; set the volume level in percentage or change volume by ±x from current level</li>
+          <li><code><b>channel</b> 0...20</code> &nbsp;&nbsp;-&nbsp;&nbsp; select present to play</li>
+          <li><code><b>saveChannel</b> 07...20</code> &nbsp;&nbsp;-&nbsp;&nbsp; save current channel to channel 07 to 20</li>
+          <li><code><b>play</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; start/resume to play </li>
+          <li><code><b>pause</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; pause the playback</li>
+          <li><code><b>stop</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; stop playback</li>
+          <li><code><b>nextTrack</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; play next track</li>
+          <li><code><b>prevTrack</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; play previous track</li>
+          <li><code><b>mute</b> on|off|toggle</code> &nbsp;&nbsp;-&nbsp;&nbsp; control volume mute</li>
+          <li><code><b>bass</b> 0...10</code> &nbsp;&nbsp;-&nbsp;&nbsp; set the bass level</li>
+          <li><code><b>recent</b> 0...15</code> &nbsp;&nbsp;-&nbsp;&nbsp; set number of names in the recent list in readings</li>
+          <li><code><b>source</b> bluetooth,bt-discover,aux mode, airplay</code> &nbsp;&nbsp;-&nbsp;&nbsp; select a local source</li><br>
+          <li><code><b>addDLNAServer</b> Name1 [Name2] [Namex]</code> &nbsp;&nbsp;-&nbsp;&nbsp; add DLNA servers Name1 (and Name2 to Namex) to the BOSE library</li>
+          <li><code><b>removeDLNAServer</b> Name1 [Name2] [Namex]</code> &nbsp;&nbsp;-&nbsp;&nbsp; remove DLNA servers Name1 (and Name2 to Namex) to the BOSE library</li>
+         </ul><br>Example: <code>set BOSE_1234567890AB volume 25</code>&nbsp;&nbsp;Set volume on device with the name BOSE_1234567890AB <br><br><br>  
+         	
+         <ul><u>Timer commands:</u>        
+          <li><code><b>on-for-timer</b> 1...x</code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device for x seconds</li>
+          <li><code><b>off-for-timer</b> 1...x</code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off and power on again after x seconds</li>
+          <li><code><b>on-till</b> hh:mm:ss</code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device until defined time</li>
+          <li><code><b>off-till</b> hh:mm:ss</code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off and power on again at defined time</li>
+          <li><code><b>on-till-overneight</b> hh:mm:ss</code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device until defined time on the next day</li>
+          <li><code><b>off-till-overneight</b> hh:mm:ss</code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off at defined time on the next day</li>
+         </ul><br>Example: <code>set BOSE_1234567890AB on-till 23:00:00</code>&nbsp;&nbsp;Switches device with the name BOSE_1234567890AB now on and at 23:00:00 off<br><br><br>
+         	
+         <ul><u>Multiroom commands:</u>
+          <li><code><b>createZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; create multiroom zone (defines <code>&lt;name&gt;</code> as zoneMaster) </li>          
+          <li><code><b>addToZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; add device <code>&lt;name&gt;</code> to multiroom zone</li>
+          <li><code><b>removeFromZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; remove device <code>&lt;name&gt;</code> from multiroom zone</li>
+          <li><code><b>playEverywhere</b></code>  &nbsp;&nbsp;-&nbsp;&nbsp; play sound of  device <code>&lt;name&gt;</code> on all others devices</li>
+          <li><code><b>stopPlayEverywhere</b></code>  &nbsp;&nbsp;-&nbsp;&nbsp; stop playing sound on all devices</li>
+        </ul><br>Example: <code>set BOSE_1234567890AB playEverywhere</code>&nbsp;&nbsp;Starts Multiroom with device with the name BOSE_1234567890AB as master <br><br><br>
+        	
+        <ul><u>TextToSpeach commands (needs Google Translate):</u>
+         <li><code><b>speak</b> "message" [0...100] [+x|-x] [en|de|xx]</code> &nbsp;&nbsp;-&nbsp;&nbsp; Text to speak, optional with volume adjustment and language to use. The message to speak may have up to 100 letters</li>
+         <li><code><b>speakOff</b> "message" [0...100] [+x|-x] [en|de|xx]</code> &nbsp;&nbsp;-&nbsp;&nbsp; Text to speak, optional with volume adjustment and language to use. The message to speak may have up to 100 letters. Device is switched off after speak</li>
+         <li><code><b>ttsVolume</b> [0...100] [+x|-x]</code> &nbsp;&nbsp;-&nbsp;&nbsp; set the TTS volume level in percentage or change volume by ±x from current level</li>
+         <li><code><b>ttsDLNAServer</b> "DLNA Server"</code> &nbsp;&nbsp;-&nbsp;&nbsp;  set DLNA TTS server, only needed if the DLNA server is not the FHEM server, a DLNA server running on the same server as FHEM is automatically added to the BOSE library</li>            
+         <li><code><b>ttsDirectory</b> "directory"</code> &nbsp;&nbsp;-&nbsp;&nbsp; set DLNA TTS directory. FHEM user needs permissions to write to that directory. </li>  
+         <li><code><b>ttsLanguage </b> en|de|xx</code> &nbsp;&nbsp;-&nbsp;&nbsp; set default TTS language (default: en)</li> 
+         <li><code><b>ttsSpeakOnError</b> 0|1</code> &nbsp;&nbsp;-&nbsp;&nbsp; 0=disable to speak "not available" text</li> 
+         <li><code><b>autoAddDLNAServers</b> 0|1</code> &nbsp;&nbsp;-&nbsp;&nbsp; 1=automatically add all DLNA servers to BOSE library. This command is only for "main" BOSEST, not for devices/speakers!</li> <br>
+        </ul><br> Example: <code>set BOSE_1234567890AB speakOff "Music is going to switch off now. Good night." 30 en</code>&nbsp;&nbsp;Speaks message at volume 30 and then switches off device.<br><br> <br>
       </ul><br>
   
     <a name="BOSESTget" id="BOSESTget"></a>
