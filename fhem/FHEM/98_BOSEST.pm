@@ -6,11 +6,16 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.2
+# Version: 1.5.3
 #
 #############################################################
 #
-# v1.5.2 - 20160331
+# v1.5.3 - 201604XX
+#  - FEATURE: support speak channel name
+#             attr <name> speakChannel 2-6
+#             attr <name> speakChannel 2,3,5,6
+#
+# v1.5.2 - 20160403
 #  - FEATURE: support clock display (SoundTouch 20/30)
 #             set <name> clock enable/disable
 #
@@ -152,6 +157,7 @@
 #  - change preset via /key
 #
 # TODO
+#  - support multiroom volume
 #  - speak channel name after preset change (configure per preset)
 #  - adduserattr function??
 #  - support http://... for streaming via DLNA
@@ -164,7 +170,6 @@
 #  - fix usage of bulkupdate vs. singleupdate
 #  - check if Mojolicious::Lite can be used
 #  - check if Mojolicious should be used for HTTPGET/HTTPPOST
-#  - support setExtension on-for-timer, ...
 #  - use frame ping to keep connection alive
 #  - ramp up/down volume support
 #  - "auto-zone" if 2 or more speakers play the same station
@@ -210,7 +215,7 @@ sub BOSEST_Initialize($) {
     $hash->{AttrList} .= 'channel_12 channel_13 channel_14 channel_15 channel_16 ';
     $hash->{AttrList} .= 'channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs ';
     $hash->{AttrList} .= 'ttsDirectory ttsLanguage ttsSpeakOnError ttsDLNAServer ttsVolume ';
-    $hash->{AttrList} .= 'autoAddDLNAServers '.$readingFnAttributes;
+    $hash->{AttrList} .= 'autoAddDLNAServers speakChannel '.$readingFnAttributes;
     
     return undef;
 }
@@ -250,6 +255,9 @@ sub BOSEST_Define($$) {
         #init switchSource
         $hash->{helper}{switchSource} = "";
         
+        #init speak channel functionality
+        $hash->{helper}{lastSpokenChannel} = "";
+        
         #FIXME reset all recent_$i entries on startup (must be done here, otherwise readings are displayed when player wasn't found)
     }
     
@@ -261,7 +269,7 @@ sub BOSEST_Define($$) {
     $hash->{helper}{supportedBassCmds} = "";
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.2";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.3";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
     }
@@ -407,7 +415,7 @@ sub BOSEST_Set($@) {
         }
         #set text (must be within quotes)
         my $text = $params[0];
-        my $volume = AttrVal($hash->{NAME}, "ttsVolume", ReadingsVal($hash->{NAME}, "volume", 20));
+        my $volume = "";
         if(looks_like_number($params[1])) {
             #set volume (default current volume)
             $volume = $params[1] if(defined($params[1]));
@@ -416,7 +424,7 @@ sub BOSEST_Set($@) {
             $params[2] = $params[1];
         }
         #set language (default English)
-        my $lang = AttrVal($hash->{NAME}, "ttsLanguage", "en");
+        my $lang = "";
         $lang = $params[2] if(defined($params[2]));
         #stop after speak?
         my $stopAfterSpeak = 0;
@@ -812,7 +820,6 @@ sub BOSEST_Undef($) {
 
     #kill blocking
     BlockingKill($hash->{helper}{DISCOVERY_PID}) if(defined($hash->{helper}{DISCOVERY_PID}));
-    BlockingKill($hash->{helper}{WEBSOCKET_PID}) if(defined($hash->{helper}{WEBSOCKET_PID}));
     
     return undef;
 }
@@ -821,10 +828,34 @@ sub BOSEST_Get($$) {
     return undef;
 }
 
+sub BOSEST_speakChannel {
+    my ($hash) = @_;
+    
+    my $speakChannel = AttrVal($hash->{NAME}, "speakChannel", "");
+    if($speakChannel ne "") {
+        my $channelNr = ReadingsVal($hash->{NAME}, "channel", "");
+        if($channelNr =~ /[$speakChannel]/g) {
+            my $channelName = ReadingsVal($hash->{NAME}, "contentItemItemName", "");
+            if($channelNr ne "" && $channelName ne "" && $hash->{helper}{lastSpokenChannel} ne $channelName) {
+                #speak channel name
+                $hash->{helper}{lastSpokenChannel} = $channelName;
+                BOSEST_speak($hash, $channelName, "", "", 0);
+            }
+        } else {
+            if($channelNr ne "") {
+                #delete lastSpokenChannel
+                $hash->{helper}{lastSpokenChannel} = "";
+            }
+        }
+    }
+}
+
 sub BOSEST_speak($$$$$) {
     my ($hash, $text, $volume, $lang, $stopAfterSpeak) = @_;
     
     my $ttsDir = AttrVal($hash->{NAME}, "ttsDirectory", "");
+    $lang = AttrVal($hash->{NAME}, "ttsLanguage", "en") if($lang eq "");
+    $volume = AttrVal($hash->{NAME}, "ttsVolume", ReadingsVal($hash->{NAME}, "volume", 20)) if($volume eq "");
     
     #download file and play
     BOSEST_playGoogleTTS($hash, $ttsDir, $text, $volume, $lang, $stopAfterSpeak);
@@ -1109,6 +1140,8 @@ sub BOSEST_updateNowPlaying($$) {
 sub BOSEST_checkDoubleTap($$) {
     my ($hash, $channel) = @_;
     
+    return undef if($channel eq "");
+    
     if(!defined($hash->{helper}{dt_nowSelectionUpdatedTS}) or $channel ne $hash->{helper}{dt_nowSelectionUpdatedCH}) {
         $hash->{helper}{dt_nowSelectionUpdatedTS} = gettimeofday();
         $hash->{helper}{dt_nowSelectionUpdatedCH} = $channel;
@@ -1155,6 +1188,8 @@ sub BOSEST_processXml($$) {
                 BOSEST_parseAndUpdateNowPlaying($hash, $wsxml->{updates}->{nowPlayingUpdated}->{nowPlaying});
                 if($hash->{helper}{switchSource} ne "") {
                     BOSEST_setSource($hash, $hash->{helper}{switchSource});
+                } else {
+                    BOSEST_speakChannel($hash);
                 }
             }
         } elsif ($wsxml->{updates}->{volumeUpdated}) {
@@ -1282,6 +1317,7 @@ sub BOSEST_parseAndUpdateChannel($$) {
     if($preset->{id} ne "0") {
         BOSEST_XMLUpdate($hash, "channel", $preset->{id});
     } else {
+        BOSEST_XMLUpdate($hash, "channel", "");
         $preset->{ContentItem}->{sourceAccount} = "" if(!defined($preset->{ContentItem}->{sourceAccount}));
         
         my $channelString = $preset->{ContentItem}->{itemName}."|".$preset->{ContentItem}->{location}."|".

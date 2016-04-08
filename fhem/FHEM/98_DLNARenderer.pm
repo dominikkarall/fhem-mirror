@@ -1,6 +1,9 @@
 ############################################################################
 # 2016-04-03, v2.0.0 BETA2, dominik.karall@gmail.com $
 #
+# v2.0.0 BETA3 - 201604XX
+# - BUGFIX: XML parsing error "NOT_IMPLEMENTED"
+#
 # v2.0.0 BETA2 - 20160403
 # - FEATURE: support events from DLNA devices
 # - FEATURE: support caskeid group definitions
@@ -35,6 +38,7 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 # TODO
+# - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
 # - SWR3 metadata is handled wrong by player
 # - retrieve stereomode (GetMultiChannel...) every 5 minutes
@@ -261,29 +265,39 @@ sub DLNARenderer_updateMetaData {
   
   if($metaDataAvailable) {
     my $xml;
-    eval {
-      $xml = XMLin($metaData->{val}, KeepRoot => 1, ForceArray => [], KeyAttr => []);
-      Log3 $hash, 4, "DLNARenderer: MetaData: ".Dumper($xml);
-    };
-
-    if(!$@) {
-      DLNARenderer_updateMetaDataItemPart($hash, $prefix."Title", $xml->{"DIDL-Lite"}{item}{"dc:title"});
-      DLNARenderer_updateMetaDataItemPart($hash, $prefix."Artist", $xml->{"DIDL-Lite"}{item}{"dc:creator"});
-      DLNARenderer_updateMetaDataItemPart($hash, $prefix."Album", $xml->{"DIDL-Lite"}{item}{"upnp:album"});
-      DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtist", $xml->{"DIDL-Lite"}{item}{"r:albumArtist"});
-      if($xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"}) {
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtURI", $xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"});
-      } else {
-        readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
-      }
-      DLNARenderer_updateMetaDataItemPart($hash, $prefix."OriginalTrackNumber", $xml->{"DIDL-Lite"}{item}{"upnp:originalTrackNumber"});
-      if($xml->{"DIDL-Lite"}{item}{res}) {
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Duration", $xml->{"DIDL-Lite"}{item}{res}{duration});
-      } else {
-        readingsSingleUpdate($hash, $prefix."Duration", "", 1);
-      }
+    if($metaData->{val} eq "NOT_IMPLEMENTED") {
+      readingsSingleUpdate($hash, $prefix."Title", "", 1);
+      readingsSingleUpdate($hash, $prefix."Artist", "", 1);
+      readingsSingleUpdate($hash, $prefix."Album", "", 1);
+      readingsSingleUpdate($hash, $prefix."AlbumArtist", "", 1);
+      readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
+      readingsSingleUpdate($hash, $prefix."OriginalTrackNumber", "", 1);
+      readingsSingleUpdate($hash, $prefix."Duration", "", 1);
     } else {
-      Log3 $hash, 1, "DLNARenderer: XML parsing error: ".$@;
+      eval {
+        $xml = XMLin($metaData->{val}, KeepRoot => 1, ForceArray => [], KeyAttr => []);
+        Log3 $hash, 4, "DLNARenderer: MetaData: ".Dumper($xml);
+      };
+
+      if(!$@) {
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Title", $xml->{"DIDL-Lite"}{item}{"dc:title"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Artist", $xml->{"DIDL-Lite"}{item}{"dc:creator"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Album", $xml->{"DIDL-Lite"}{item}{"upnp:album"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtist", $xml->{"DIDL-Lite"}{item}{"r:albumArtist"});
+        if($xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"}) {
+          DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtURI", $xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"});
+        } else {
+          readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
+        }
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."OriginalTrackNumber", $xml->{"DIDL-Lite"}{item}{"upnp:originalTrackNumber"});
+        if($xml->{"DIDL-Lite"}{item}{res}) {
+          DLNARenderer_updateMetaDataItemPart($hash, $prefix."Duration", $xml->{"DIDL-Lite"}{item}{res}{duration});
+        } else {
+          readingsSingleUpdate($hash, $prefix."Duration", "", 1);
+        }
+      } else {
+        Log3 $hash, 1, "DLNARenderer: XML parsing error: ".$@;
+      }
     }
   } else {
     #no metadata available -> reset
