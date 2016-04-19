@@ -38,6 +38,7 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 # TODO
+# - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
 # - SWR3 metadata is handled wrong by player

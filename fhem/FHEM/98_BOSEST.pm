@@ -11,9 +11,12 @@
 #############################################################
 #
 # v1.5.3 - 201604XX
-#  - FEATURE: support speak channel name
-#             attr <name> speakChannel 2-6
+#  - FEATURE: support speak channel name (useful for SoundTouch w/o display)
+#             attr <name> speakChannel 1-6
 #             attr <name> speakChannel 2,3,5,6
+#  - BUGFIX: retry websocket setup every 5s if it fails
+#  - BUGFIX: update supportClockDisplay only on reconnect
+#  - CHANGE: remove user attr from main device
 #
 # v1.5.2 - 20160403
 #  - FEATURE: support clock display (SoundTouch 20/30)
@@ -157,16 +160,14 @@
 #  - change preset via /key
 #
 # TODO
+#  - reset volume on offline->online switch when not playing anything
+#  - check speakChannel functionality
 #  - support multiroom volume
-#  - speak channel name after preset change (configure per preset)
-#  - adduserattr function??
-#  - support http://... for streaming via DLNA
+#  - support http://... for streaming via DLNA (.m3u file?)
 #  - TTS code cleanup (group functions logically)
-#  - delete TTS files after 30 days
+#  - delete TTS files after 30 days (http://www.fhemwiki.de/wiki/DevelopmentModuleAPI#setKeyValue)
 #  - define own groups of players
 #  - update readings only on change
-#  - check if websocket finished can be called after websocket re-connected
-#  - cleanup all readings on startup (IP=unknown)
 #  - fix usage of bulkupdate vs. singleupdate
 #  - check if Mojolicious::Lite can be used
 #  - check if Mojolicious should be used for HTTPGET/HTTPPOST
@@ -211,11 +212,6 @@ sub BOSEST_Initialize($) {
     $hash->{GetFn} = 'BOSEST_Get';
     $hash->{SetFn} = 'BOSEST_Set';
     $hash->{AttrFn} = 'BOSEST_Attribute';
-    $hash->{AttrList} = 'channel_07 channel_08 channel_09 channel_10 channel_11 ';
-    $hash->{AttrList} .= 'channel_12 channel_13 channel_14 channel_15 channel_16 ';
-    $hash->{AttrList} .= 'channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs ';
-    $hash->{AttrList} .= 'ttsDirectory ttsLanguage ttsSpeakOnError ttsDLNAServer ttsVolume ';
-    $hash->{AttrList} .= 'autoAddDLNAServers speakChannel '.$readingFnAttributes;
     
     return undef;
 }
@@ -232,11 +228,25 @@ sub BOSEST_Define($$) {
         return 'BOSEST: Wrong syntax, must be define <name> BOSEST [<deviceID>]';
     } elsif(int(@a) == 3) {    
         $name = $a[0];
-        #set device id from parameter
-        $hash->{DEVICEID} = $a[2];
-        #set IP to unknown
-        $hash->{helper}{IP} = "unknown";
-        readingsSingleUpdate($hash, "IP", "unknown", 1);
+        my $param = $a[2];
+        if($param =~ /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) {
+            #set IP to param
+            $hash->{helper}{IP} = "unknown";
+            $hash->{helper}{staticIP} = $param;
+            readingsSingleUpdate($hash, "IP", "unknown", 1);
+            
+            my $info = BOSEST_HTTPGET($hash, $hash->{helper}{staticIP}, "/info");
+            return "BOSEST: Couldn't retrieve device ID via /info." if (!defined($info->{info}->{deviceID}));
+            $hash->{DEVICEID} = $info->{info}->{deviceID};
+        } else {
+            #set device id from parameter
+            $hash->{DEVICEID} = $param;
+            
+            #set IP to unknown
+            $hash->{helper}{IP} = "unknown";
+            $hash->{helper}{staticIP} = "";
+            readingsSingleUpdate($hash, "IP", "unknown", 1);
+        }
         
         #TODO cleanup all readings on startup (updateIP?)
         
@@ -257,6 +267,14 @@ sub BOSEST_Define($$) {
         
         #init speak channel functionality
         $hash->{helper}{lastSpokenChannel} = "";
+        
+        foreach my $attrname (qw(channel_07 channel_08 channel_09 channel_10 channel_11
+                                channel_12 channel_13 channel_14 channel_15 channel_16
+                                channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs
+                                ttsDirectory ttsLanguage ttsSpeakOnError ttsDLNAServer ttsVolume
+                                autoAddDLNAServers speakChannel)) {
+          addToDevAttrList($name, $attrname);
+        }
         
         #FIXME reset all recent_$i entries on startup (must be done here, otherwise readings are displayed when player wasn't found)
     }
@@ -1532,91 +1550,112 @@ sub BOSEST_startDiscoveryProcess($) {
     }
 }
 
+sub BOSEST_handleDeviceByIp {
+    my ($hash, $ip) = @_;
+    my $return = "";
+    
+    my $info = BOSEST_HTTPGET($hash, $ip, "/info");
+    #remove info tag to reduce line length
+    $info = $info->{info} if (defined($info->{info}));
+    #skip entry if no deviceid was found
+    next if (!defined($info->{deviceID}));
+    
+    #TODO return if the device is already defined and IP is the same
+    #     make sure that this can be done and no further code below is needed
+    
+    #create new device if it doesn't exist
+    if(!defined(BOSEST_getBosePlayerByDeviceId($hash, $info->{deviceID}))) {
+        $info->{name} = Encode::encode('UTF-8',$info->{name});
+        Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
+        $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
+    }
+
+    #MOVE THIS PART INTO THE IF ABOVE FOR NEXT VERSION
+    #set supported sources
+    my $sources = BOSEST_HTTPGET($hash, $ip, "/sources");
+    $return .= "|supportedSources|$info->{deviceID}";
+    foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
+        $return .= ",".$source->{source};
+    }
+
+    #set supported capabilities
+    my $capabilities = BOSEST_HTTPGET($hash, $ip, "/capabilities");
+    $return .= "|capabilities|$info->{deviceID}";
+    if($capabilities->{capabilities}->{clockDisplay}) {
+        $return .= ",".$capabilities->{capabilities}->{clockDisplay};
+    } else {
+        $return .= ",false";
+    }
+
+    #set supported bass capabilities
+    my $bassCapabilities = BOSEST_HTTPGET($hash, $ip, "/bassCapabilities");
+    $return .= "|bassCapabilities|$info->{deviceID}";
+    if($bassCapabilities->{bassCapabilities}) {
+        my $bassCap = $bassCapabilities->{bassCapabilities};
+        $return .= ",".$bassCap->{bassAvailable}.",".$bassCap->{bassMin}.",".
+                   $bassCap->{bassMax}.",".$bassCap->{bassDefault};
+    }
+
+    #TODO create own function (add own DLNA server)
+    my $myIp = BOSEST_getMyIp($hash);
+    my $listMediaServers = BOSEST_HTTPGET($hash, $ip, "/listMediaServers");
+
+    my $returnListMediaServers = "|listMediaServers|".$info->{deviceID};
+    foreach my $mediaServer (@{ $listMediaServers->{ListMediaServersResponse}->{media_server} }) {
+        $returnListMediaServers .= ",".$mediaServer->{friendly_name};
+        
+        #check if it is already connected
+        my $isConnected = 0;
+        foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
+            next if($source->{source} ne "STORED_MUSIC");
+            
+            if(substr($source->{sourceAccount}, 0, length($mediaServer->{id})) eq $mediaServer->{id}) {
+                #already connected
+                $isConnected = 1;
+                next;
+            }
+        }
+        
+        next if($isConnected);
+        
+        if(($myIp eq $mediaServer->{ip}) ||
+           (AttrVal($hash->{NAME}, "autoAddDLNAServers", "0") eq "1" )) {
+            $return = $return."|setMusicServiceAccount|".$info->{deviceID}.",".$mediaServer->{friendly_name}.",".$mediaServer->{id};
+            Log3 $hash, 3, "BOSEST: DLNA Server ".$mediaServer->{friendly_name}." added.";
+        }
+    }
+    
+    #append listMediaServers
+    $return .= $returnListMediaServers;
+
+    #update IP address of the device
+    $return = $return."|updateIP|".$info->{deviceID}.",".$ip;
+    
+    return $return;
+}
+
 sub BOSEST_Discovery($) {
     my ($string) = @_;
     my ($name, $hash) = split("\\|", $string);
     my $return = "$name";
     
+    $hash = $main::defs{$name};
+    
     eval {
         my $res = Net::Bonjour->new('soundtouch');
         $res->discover;
         foreach my $device ($res->entries) {
-            my $info = BOSEST_HTTPGET($hash, $device->address, "/info");
-            my $sources = BOSEST_HTTPGET($hash, $device->address, "/sources");
-            #remove info tag to reduce line length
-            $info = $info->{info} if (defined($info->{info}));
-            #skip entry if no deviceid was found
-            next if (!defined($info->{deviceID}));
-            
-            #create new device if it doesn't exist
-            if(!defined(BOSEST_getBosePlayerByDeviceId($hash, $info->{deviceID}))) {
-                $info->{name} = Encode::encode('UTF-8',$info->{name});
-                Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
-                $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
-
-            }
-
-            #MOVE THIS PART INTO THE IF ABOVE IN FOR NEXT VERSION
-            #set supported sources
-            $return .= "|supportedSources|$info->{deviceID}";
-            foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
-                $return .= ",".$source->{source};
-            }
-
-            #set supported capabilities
-            my $capabilities = BOSEST_HTTPGET($hash, $device->address, "/capabilities");
-            $return .= "|capabilities|$info->{deviceID}";
-            if($capabilities->{capabilities}->{clockDisplay}) {
-                $return .= ",".$capabilities->{capabilities}->{clockDisplay};
-            } else {
-                $return .= ",false";
-            }
-
-            #set supported bass capabilities
-            my $bassCapabilities = BOSEST_HTTPGET($hash, $device->address, "/bassCapabilities");
-            $return .= "|bassCapabilities|$info->{deviceID}";
-            if($bassCapabilities->{bassCapabilities}) {
-                my $bassCap = $bassCapabilities->{bassCapabilities};
-                $return .= ",".$bassCap->{bassAvailable}.",".$bassCap->{bassMin}.",".
-                           $bassCap->{bassMax}.",".$bassCap->{bassDefault};
-            }
-
-            #TODO create own function
-            my $myIp = BOSEST_getMyIp($hash);
-            my $listMediaServers = BOSEST_HTTPGET($hash, $device->address, "/listMediaServers");
-
-            my $returnListMediaServers = "|listMediaServers|".$info->{deviceID};
-            foreach my $mediaServer (@{ $listMediaServers->{ListMediaServersResponse}->{media_server} }) {
-                $returnListMediaServers .= ",".$mediaServer->{friendly_name};
-                
-                #check if it is already connected
-                my $isConnected = 0;
-                foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
-                    next if($source->{source} ne "STORED_MUSIC");
-                    
-                    if(substr($source->{sourceAccount}, 0, length($mediaServer->{id})) eq $mediaServer->{id}) {
-                        #already connected
-                        $isConnected = 1;
-                        next;
-                    }
-                }
-                
-                next if($isConnected);
-                
-                if(($myIp eq $mediaServer->{ip}) ||
-                   (AttrVal($name, "autoAddDLNAServers", "0") eq "1" )) {
-                    $return = $return."|setMusicServiceAccount|".$info->{deviceID}.",".$mediaServer->{friendly_name}.",".$mediaServer->{id};
-                    Log3 $hash, 3, "BOSEST: DLNA Server ".$mediaServer->{friendly_name}." added.";
-                }
-            }
-            
-            #append listMediaServers
-            $return .= $returnListMediaServers;
-
-            #update IP address of the device
-            $return = $return."|updateIP|".$info->{deviceID}.",".$device->address;
+            $return .= BOSEST_handleDeviceByIp($hash, $device->address);
         }
     };
+    
+    #update static players
+    my @players = BOSEST_getAllBosePlayers($hash);
+    foreach my $player (@players) {
+        if($player->{helper}{staticIP} ne "") {
+            $return .= BOSEST_handleDeviceByIp($hash, $player->{helper}{staticIP});
+        }
+    }
 
     if($@) {
         Log3 $hash, 3, "BOSEST: Discovery failed with: $@";
@@ -1694,7 +1733,9 @@ sub BOSEST_finishedDiscovery($) {
             $deviceHash->{helper}{supportedSourcesCmds} = substr($deviceHash->{helper}{supportedSourcesCmds}, 0, length($deviceHash->{helper}{supportedSourcesCmds})-1);
         } elsif($command eq "capabilities") {
             my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
-            readingsSingleUpdate($deviceHash, "supportClockDisplay", $params[0], 1);
+            if(ReadingsVal($deviceHash->{NAME}, "supportClockDisplay", "") ne $params[0]) {
+                readingsSingleUpdate($deviceHash, "supportClockDisplay", $params[0], 1);
+            }
         }
     }
 }
@@ -1842,13 +1883,19 @@ sub BOSEST_startWebSocketConnection($) {
         Log3 $hash, 3, "BOSEST: Prevent new connections.";
         return undef;
     }
+
+    eval {
+      $hash->{helper}{bosewebsocket} = $hash->{helper}{useragent}->websocket('ws://'.$hash->{helper}{IP}.':8080'
+          => ['gabbo'] => sub {
+              my ($ua, $tx) = @_;
+              BOSEST_webSocketCallback($hash, $ua, $tx);
+              return undef;
+      });
+    };
     
-    $hash->{helper}{bosewebsocket} = $hash->{helper}{useragent}->websocket('ws://'.$hash->{helper}{IP}.':8080'
-        => ['gabbo'] => sub {
-            my ($ua, $tx) = @_;
-            BOSEST_webSocketCallback($hash, $ua, $tx);
-            return undef;
-    });
+    if($@) {
+      InternalTimer(gettimeofday()+5, "BOSEST_startWebSocketConnection", $hash, 1);
+    }
     
     $hash->{helper}{useragent}->inactivity_timeout(25);
     $hash->{helper}{useragent}->request_timeout(10);
