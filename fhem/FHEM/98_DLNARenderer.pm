@@ -1,8 +1,17 @@
 ############################################################################
-# 2016-04-03, v2.0.0 BETA2, dominik.karall@gmail.com $
+# 2016-05-04, v2.0.0 BETA4, dominik.karall@gmail.com $
 #
-# v2.0.0 BETA3 - 201604XX
+# v2.0.0 BEAT4 - 201605XX
+# - CHANGE: change state to offline/playing/stopped/paused/online
+# - CHANGE: play is NOT setting AVTransport any more
+# - FEATURE: support pauseToggle
+#
+# v2.0.0 BETA3 - 20160504
 # - BUGFIX: XML parsing error "NOT_IMPLEMENTED"
+# - CHANGE: change readings to lowcaseUppercase format
+# - FEATURE: support pause
+# - FEATURE: support seek REL_TIME
+# - FEATURE: support next/prev
 #
 # v2.0.0 BETA2 - 20160403
 # - FEATURE: support events from DLNA devices
@@ -38,6 +47,7 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 # TODO
+# - 500 Can't connect to 192.168.0.23:8080 at FHEM/lib/UPnP/ControlPoint.pm line 847
 # - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
@@ -342,17 +352,28 @@ sub DLNARenderer_processEventXml {
         #process AV Transport
         my $e = $xml->{Event}{InstanceID};
         #DLNARenderer_updateReadingByEvent($hash, "NumberOfTracks", $e->{NumberOfTracks});
-        DLNARenderer_updateReadingByEvent($hash, "TransportState", $e->{TransportState});
-        DLNARenderer_updateReadingByEvent($hash, "TransportStatus", $e->{TransportStatus});
+        DLNARenderer_updateReadingByEvent($hash, "transportState", $e->{TransportState});
+        if($e->{TransportState} eq "PAUSED_PLAYBACK") {
+            readingsSingleUpdate($hash, "state", "paused", 1);
+        } elsif($e->{TransportState} eq "PLAYING") {
+            readingsSingleUpdate($hash, "state", "playing", 1);
+        } elsif($e->{TransportState} eq "TRANSITIONING") {
+            readingsSingleUpdate($hash, "state", "buffering", 1);
+        } elsif($e->{TransportState} eq "STOPPED") {
+            readingsSingleUpdate($hash, "state", "stopped", 1);
+        } elsif($e->{TransportState} eq "NO_MEDIA_PRESENT") {
+            readingsSingleUpdate($hash, "state", "online", 1);
+        }
+        DLNARenderer_updateReadingByEvent($hash, "transportStatus", $e->{TransportStatus});
         #DLNARenderer_updateReadingByEvent($hash, "TransportPlaySpeed", $e->{TransportPlaySpeed});
         #DLNARenderer_updateReadingByEvent($hash, "PlaybackStorageMedium", $e->{PlaybackStorageMedium});
         #DLNARenderer_updateReadingByEvent($hash, "RecordStorageMedium", $e->{RecordStorageMedium});
         #DLNARenderer_updateReadingByEvent($hash, "RecordMediumWriteStatus", $e->{RecordMediumWriteStatus});
         #DLNARenderer_updateReadingByEvent($hash, "CurrentRecordQualityMode", $e->{CurrentRecordQualityMode});
         #DLNARenderer_updateReadingByEvent($hash, "PossibleRecordQualityMode", $e->{PossibleRecordQualityMode});
-        DLNARenderer_updateReadingByEvent($hash, "CurrentTrackURI", $e->{CurrentTrackURI});
+        DLNARenderer_updateReadingByEvent($hash, "currentTrackURI", $e->{CurrentTrackURI});
         #DLNARenderer_updateReadingByEvent($hash, "AVTransportURI", $e->{AVTransportURI});
-        DLNARenderer_updateReadingByEvent($hash, "NextAVTransportURI", $e->{NextAVTransportURI});
+        DLNARenderer_updateReadingByEvent($hash, "nextAVTransportURI", $e->{NextAVTransportURI});
         #DLNARenderer_updateReadingByEvent($hash, "RelativeTimePosition", $e->{RelativeTimePosition});
         #DLNARenderer_updateReadingByEvent($hash, "AbsoluteTimePosition", $e->{AbsoluteTimePosition});
         #DLNARenderer_updateReadingByEvent($hash, "RelativeCounterPosition", $e->{RelativeCounterPosition});
@@ -402,6 +423,7 @@ sub DLNARenderer_removedDevice($$) {
   my $deviceHash = DLNARenderer_getHashByUDN($hash, $device->UDN());
   
   readingsSingleUpdate($deviceHash, "presence", "offline", 1);
+  readingsSingleUpdate($deviceHash, "state", "offline", 1);
 }
 
 sub DLNARenderer_renewSubscriptions {
@@ -500,6 +522,9 @@ sub DLNARenderer_addedDevice {
       #set render_service
       $DLNARendererHash->{helper}{render_service} = $dev->getService("urn:upnp-org:serviceId:RenderingControl");;
       readingsSingleUpdate($DLNARendererHash,"presence","online",1);
+      if(ReadingsVal($DLNARendererHash->{NAME}, "state", "") eq "offline") {
+        readingsSingleUpdate($DLNARendererHash,"state","online",1);
+      }
       
       #check caskeid
       if($dev->getService('urn:pure-com:serviceId:SessionManagement')) {
@@ -621,8 +646,6 @@ sub DLNARenderer_play($) {
     my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
     $avtrans_ctrlproxy->Play(0, 1);
   }
-  
-  readingsSingleUpdate($hash,"state","on",1);
   
   return undef;
 }
@@ -846,7 +869,7 @@ sub DLNARenderer_Define($$) {
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA2";
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA3";
     $hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
     DLNARenderer_doDlnaSearch($hash);
     DLNARenderer_handleControlpoint($hash);
@@ -889,13 +912,14 @@ sub DLNARenderer_Set($@) {
   if ($ctrlParam eq "?") {
     if($hash->{helper}{caskeid}) {
       return "Unknown argument, choose one of on:noArg off:noArg play:noArg stop:noArg stream volume:slider,0,1,100 ".
+             "pause:noArg next:noArg previous:noArg seek ".
              "addUnit:".$hash->{helper}{caskeidClients}." ".
              "playEverywhere:noArg stopPlayEverywhere:noArg ".
              "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
              "enableBTCaskeid:noArg disableBTCaskeid:noArg saveGroupAs loadGroup ".
              "stereo standalone:noArg";
     } else {
-      return "Unknown argument, choose one of on:noArg off:noArg play:noArg stop:noArg stream volume:slider,0,1,100";
+      return "Unknown argument, choose one of on:noArg off:noArg play:noArg stop:noArg stream pause:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
     }
   }
     
@@ -913,6 +937,56 @@ sub DLNARenderer_Set($@) {
     return "DLNARenderer: Missing argument for volume." if (int(@param) < 3);
     $render_service->controlProxy()->SetVolume(0, "Master", $param[2]);
     readingsSingleUpdate($hash, "volume", $param[2], 1);
+    return undef;
+  }
+  
+  #pause
+  if($ctrlParam eq "pause") {
+    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
+    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
+    $avtrans_ctrlproxy->Pause(0);
+    return undef;
+  }
+  
+  #pauseToggle
+  if($ctrlParam eq "pauseToggle") {
+    if($hash->{READINGS}{state} eq "paused") {
+        DLNARenderer_play($hash);
+    } else {
+        my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
+        my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
+        $avtrans_ctrlproxy->Pause(0);
+    }
+    return undef;
+  }
+  
+  #play
+  if($ctrlParam eq "play") {
+    DLNARenderer_play($hash);
+    return undef;
+  }
+  
+  #next
+  if($ctrlParam eq "next") {
+    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
+    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
+    $avtrans_ctrlproxy->Next(0);
+    return undef;
+  }
+  
+  #previous
+  if($ctrlParam eq "previous") {
+    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
+    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
+    $avtrans_ctrlproxy->Previous(0);
+    return undef;
+  }
+  
+  #seek
+  if($ctrlParam eq "seek") {
+    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
+    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
+    $avtrans_ctrlproxy->Seek(0, "REL_TIME", $param[2]);
     return undef;
   }
   
@@ -1009,7 +1083,6 @@ sub DLNARenderer_Set($@) {
     my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
     my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
     $avtrans_ctrlproxy->Stop(0);
-    readingsSingleUpdate($hash,"state","off",1);
     return undef;
   }
   
@@ -1039,8 +1112,8 @@ sub DLNARenderer_Set($@) {
     return undef;
   }
   
-  # on/play
-  if($ctrlParam eq "on" || $ctrlParam eq "play"){
+  # on
+  if($ctrlParam eq "on"){
     if (defined($hash->{READINGS}{stream})) {
       my $lastStream = $hash->{READINGS}{stream}{VAL};
       if ($lastStream) {
@@ -1054,8 +1127,6 @@ sub DLNARenderer_Set($@) {
     $streamURI = $param[2];
   }
 
-  readingsSingleUpdate($hash, "state", "buffering", 1);
-  
   BlockingCall('DLNARenderer_setAVTransportBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportBlocking');
   
   return undef;

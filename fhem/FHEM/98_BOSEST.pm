@@ -10,12 +10,20 @@
 #
 #############################################################
 #
-# v1.5.3 - 201604XX
+# v1.5.4 - 201605XX
+#  - FEATURE: restore volume when speaker goes online
+#             allows to power off the box completely without loosing
+#             previous volume settings
+#
+#
+# v1.5.3 - 20160425
+#  - FEATURE: support static IPs (should only be used if device can't be discovered)
+#             attr bose_system staticIPs 192.168.1.52,192.168.1.53
 #  - FEATURE: support speak channel name (useful for SoundTouch w/o display)
 #             attr <name> speakChannel 1-6
 #             attr <name> speakChannel 2,3,5,6
 #  - BUGFIX: retry websocket setup every 5s if it fails
-#  - BUGFIX: update supportClockDisplay only on reconnect
+#  - BUGFIX: update supportClockDisplay reading only on reconnect
 #  - CHANGE: remove user attr from main device
 #
 # v1.5.2 - 20160403
@@ -160,8 +168,7 @@
 #  - change preset via /key
 #
 # TODO
-#  - reset volume on offline->online switch when not playing anything
-#  - check speakChannel functionality
+#  - reset zone when changing to bluetooth on slave/master?
 #  - support multiroom volume
 #  - support http://... for streaming via DLNA (.m3u file?)
 #  - TTS code cleanup (group functions logically)
@@ -219,7 +226,7 @@ sub BOSEST_Initialize($) {
 sub BOSEST_Define($$) {
     my ($hash, $def) = @_;
     my @a = split("[ \t]+", $def);
-    my $name;
+    my $name = $a[0];
     
     $hash->{DEVICEID} = "0";
     $hash->{STATE} = "initialized";
@@ -227,26 +234,13 @@ sub BOSEST_Define($$) {
     if (int(@a) > 3) {
         return 'BOSEST: Wrong syntax, must be define <name> BOSEST [<deviceID>]';
     } elsif(int(@a) == 3) {    
-        $name = $a[0];
         my $param = $a[2];
-        if($param =~ /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) {
-            #set IP to param
-            $hash->{helper}{IP} = "unknown";
-            $hash->{helper}{staticIP} = $param;
-            readingsSingleUpdate($hash, "IP", "unknown", 1);
-            
-            my $info = BOSEST_HTTPGET($hash, $hash->{helper}{staticIP}, "/info");
-            return "BOSEST: Couldn't retrieve device ID via /info." if (!defined($info->{info}->{deviceID}));
-            $hash->{DEVICEID} = $info->{info}->{deviceID};
-        } else {
-            #set device id from parameter
-            $hash->{DEVICEID} = $param;
-            
-            #set IP to unknown
-            $hash->{helper}{IP} = "unknown";
-            $hash->{helper}{staticIP} = "";
-            readingsSingleUpdate($hash, "IP", "unknown", 1);
-        }
+        #set device id from parameter
+        $hash->{DEVICEID} = $param;
+        
+        #set IP to unknown
+        $hash->{helper}{IP} = "unknown";
+        readingsSingleUpdate($hash, "IP", "unknown", 1);
         
         #TODO cleanup all readings on startup (updateIP?)
         
@@ -290,6 +284,10 @@ sub BOSEST_Define($$) {
         Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.3";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
+        
+        foreach my $attrname (qw(staticIPs)) {
+          addToDevAttrList($name, $attrname);
+        }
     }
     
     return undef;
@@ -1554,6 +1552,8 @@ sub BOSEST_handleDeviceByIp {
     my ($hash, $ip) = @_;
     my $return = "";
     
+    #TODO check if device exists by IP
+    
     my $info = BOSEST_HTTPGET($hash, $ip, "/info");
     #remove info tag to reduce line length
     $info = $info->{info} if (defined($info->{info}));
@@ -1650,11 +1650,9 @@ sub BOSEST_Discovery($) {
     };
     
     #update static players
-    my @players = BOSEST_getAllBosePlayers($hash);
-    foreach my $player (@players) {
-        if($player->{helper}{staticIP} ne "") {
-            $return .= BOSEST_handleDeviceByIp($hash, $player->{helper}{staticIP});
-        }
+    my @staticIPs = split(",", AttrVal($hash->{NAME}, "staticIPs", ""));
+    foreach my $ip (@staticIPs) {
+        $return .= BOSEST_handleDeviceByIp($hash, $ip);
     }
 
     if($@) {
@@ -1757,6 +1755,10 @@ sub BOSEST_updateIP($$$) {
         BOSEST_updateInfo($deviceHash, $deviceID);
         #get now_playing
         BOSEST_updateNowPlaying($deviceHash, $deviceID);
+        #set previous volume if not playing anything
+        if(ReadingsVal($deviceHash->{NAME}, "state", "") eq "online") {
+            BOSEST_setVolume($deviceHash, ReadingsVal($deviceHash->{NAME}, "volume", 10));
+        }
         #get current volume
         BOSEST_updateVolume($deviceHash, $deviceID);
         #get current presets
