@@ -49,10 +49,8 @@
 #    define dlnadevices DLNARenderer
 # and look for devices in Unsorted section after 2 minutes.
 #
-# TODO
-# - 500 Can't connect to 192.168.0.23:8080 at FHEM/lib/UPnP/ControlPoint.pm line 847
-# - move all controlproxy->CALLs into own forked process including eval {} block
-# - move all UPnP stuff into own packages UPnP::AVTransport, UPnP::SessionManagement, UPnP::RenderingControl, ...
+#TODO
+# - move all controlproxy->CALLs into own forked process
 # - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
@@ -510,8 +508,7 @@ sub DLNARenderer_addedDevice {
         $DLNARendererHash->{helper}{speakerManagementSubscription} = $dev->getService("urn:pure-com:serviceId:SpeakerManagement")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
       }
       
-      #set render_service
-      $DLNARendererHash->{helper}{render_service} = $dev->getService("urn:upnp-org:serviceId:RenderingControl");;
+      #set online
       readingsSingleUpdate($DLNARendererHash,"presence","online",1);
       if(ReadingsVal($DLNARendererHash->{NAME}, "state", "") eq "offline") {
         readingsSingleUpdate($DLNARendererHash,"state","online",1);
@@ -584,21 +581,6 @@ sub DLNARenderer_getAllDLNARenderersWithCaskeid($) {
   return @caskeidClients;
 }
 
-sub DLNARenderer_updateVolume($) {
-  my ($hash) = @_;
-  my $render_service = $hash->{helper}{render_service};
-  
-  #get current volume
-  if ($render_service) {
-    my $currVolume = $render_service->controlProxy()->GetVolume(0, "Master")->getValue("CurrentVolume");
-    if (defined($hash->{READINGS}{volume}) and $hash->{READINGS}{volume}{VAL} ne $currVolume) {
-      readingsSingleUpdate($hash, "volume", $currVolume, 1);
-    }
-  }
-  
-  return undef;
-}
-
 ###################################
 sub DLNARenderer_setAVTransportURIBlocking($) {
   my ($string) = @_;
@@ -635,107 +617,6 @@ sub DLNARenderer_play($) {
   }
   
   return undef;
-}
-
-sub DLNARenderer_upnpPause {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "Pause", 0);
-}
-
-sub DLNARenderer_upnpSetAVTransportURI {
-  my ($hash, $stream) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "SetAVTransportURI", 0, $stream, "");
-}
-
-sub DLNARenderer_upnpStop {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "Stop", 0);
-}
-
-sub DLNARenderer_upnpSeek {
-  my ($hash, $seekTime) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "Seek", 0, "REL_TIME", $seekTime);
-}
-
-sub DLNARenderer_upnpNext {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallAVTrasnport($hash, "Next", 0);
-}
-
-sub DLNARenderer_upnpPrevious {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallAVTrasnport($hash, "Previous", 0);
-}
-
-sub DLNARenderer_upnpPlay {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "Play", 0, 1);
-}
-
-sub DLNARenderer_upnpSyncPlay($$) {
-  my ($hash, $dev) = @_;
-  return DLNARenderer_upnpCallAVTransport($hash, "SyncPlay", 0, 1, "REL_TIME", "", "", "", "DeviceClockId");
-}
-
-sub DLNARenderer_upnpCallAVTransport {
-  my ($hash, $method, @args) = @_;
-  return DLNARenderer_upnpCall($hash, 'urn:upnp-org:serviceId:AVTransport', $method, @args);
-}
-
-sub DLNARenderer_upnpSetMultiChannelSpeaker {
-  my ($hash, @args) = @_;
-  return DLNARenderer_upnpCallSpeakerManagement($hash, "SetMultiChannelSpeaker", @args);
-}
-
-sub DLNARenderer_upnpCallSpeakerManagement {
-  my ($hash, $method, @args) = @_;
-  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SpeakerManagement', $method, @args);
-}
-
-sub DLNARenderer_upnpAddUnitToSession {
-  my ($hash, $session, $uuid) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "AddUnitToSession", $session, $uuid);
-}
-
-sub DLNARenderer_upnpRemoveUnitToSession {
-  my ($hash, $session, $uuid) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "RemoveUnitToSession", $session, $uuid);
-}
-
-sub DLNARenderer_upnpDestroySession {
-  my ($hash, $session) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "DestroySession", $session);
-}
-
-sub DLNARenderer_upnpCreateSession {
-  my ($hash, $name) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "CreateSession", $name);
-}
-
-sub DLNARenderer_upnpGetSession {
-  my ($hash) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "GetSession");
-}
-
-sub DLNARenderer_upnpCallSessionManagement {
-  my ($hash, $method, @args) = @_;
-  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SessionManagement', $method, @args);
-}
-
-sub DLNARenderer_upnpCall {
-  my ($hash, $service, $method, @args) = @_;
-  my $upnpService = $hash->{helper}{device}->getService($service);
-  my $upnpServiceCtrlProxy = $upnpService->controlProxy();
-  
-  eval {
-    $upnpServiceCtrlProxy->$method(@args);
-    Log3 $hash, 5, "DLNARenderer: $service, $method(".join(",",@args).") succeed.";
-  };
-  
-  if($@) {
-    Log3 $hash, 3, "DLNARenderer: $service, $method(".join(",",@args).") failed, $@";
-    return "DLNARenderer: $method failed.";
-  }
 }
 
 sub DLNARenderer_enableBTCaskeid {
@@ -977,7 +858,6 @@ sub DLNARenderer_Undef($) {
 sub DLNARenderer_Set($@) {
   my ($hash, $name, @params) = @_;
   my $dev = $hash->{helper}{device};
-  my $render_service = $hash->{helper}{render_service};
   my $streamURI = "";
   
   # check parameters
@@ -999,12 +879,8 @@ sub DLNARenderer_Set($@) {
   
   # set volume
   if($ctrlParam eq "volume"){
-    if(!$render_service) {
-      Log3 $hash, 3, "DLNARenderer: No volume control possible for this device";
-      return undef;
-    }
     return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
-    $render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
+    DLNARenderer_upnpSetVolume($hash, $params[0]);
     readingsSingleUpdate($hash, "volume", $params[0], 1);
     return undef;
   }
@@ -1051,10 +927,6 @@ sub DLNARenderer_Set($@) {
   
   #TODO set multiRoomVolume
   if($ctrlParam eq "multiRoomVolume"){
-    if(!$render_service) {
-      Log3 $hash, 3, "DLNARenderer: No volume control possible for this device";
-      return undef;
-    }
     return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
     #handle volume for all devices in the current group
     #iterate through group and change volume relative to the current volume
@@ -1221,6 +1093,120 @@ sub DLNARenderer_addUnit {
     }
   }
   return "DLNARenderer: No unit $unitName found.";
+}
+
+##############################
+####### UPNP FUNCTIONS #######
+##############################
+sub DLNARenderer_upnpPause {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Pause", 0);
+}
+
+sub DLNARenderer_upnpSetAVTransportURI {
+  my ($hash, $stream) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "SetAVTransportURI", 0, $stream, "");
+}
+
+sub DLNARenderer_upnpStop {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Stop", 0);
+}
+
+sub DLNARenderer_upnpSeek {
+  my ($hash, $seekTime) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Seek", 0, "REL_TIME", $seekTime);
+}
+
+sub DLNARenderer_upnpNext {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTrasnport($hash, "Next", 0);
+}
+
+sub DLNARenderer_upnpPrevious {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTrasnport($hash, "Previous", 0);
+}
+
+sub DLNARenderer_upnpPlay {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Play", 0, 1);
+}
+
+sub DLNARenderer_upnpSyncPlay($$) {
+  my ($hash, $dev) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "SyncPlay", 0, 1, "REL_TIME", "", "", "", "DeviceClockId");
+}
+
+sub DLNARenderer_upnpCallAVTransport {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:upnp-org:serviceId:AVTransport', $method, @args);
+}
+
+sub DLNARenderer_upnpSetMultiChannelSpeaker {
+  my ($hash, @args) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "SetMultiChannelSpeaker", @args);
+}
+
+sub DLNARenderer_upnpCallSpeakerManagement {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SpeakerManagement', $method, @args);
+}
+
+sub DLNARenderer_upnpAddUnitToSession {
+  my ($hash, $session, $uuid) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "AddUnitToSession", $session, $uuid);
+}
+
+sub DLNARenderer_upnpRemoveUnitToSession {
+  my ($hash, $session, $uuid) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "RemoveUnitToSession", $session, $uuid);
+}
+
+sub DLNARenderer_upnpDestroySession {
+  my ($hash, $session) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "DestroySession", $session);
+}
+
+sub DLNARenderer_upnpCreateSession {
+  my ($hash, $name) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "CreateSession", $name);
+}
+
+sub DLNARenderer_upnpGetSession {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "GetSession");
+}
+
+sub DLNARenderer_upnpCallSessionManagement {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SessionManagement', $method, @args);
+}
+
+sub DLNARenderer_upnpSetVolume {
+  my ($hash, $targetVolume) = @_;
+  return DLNARenderer_upnpCallRenderingControl($hash, "SetVolume", 0, "Master", $targetVolume);
+}
+
+sub DLNARenderer_upnpCallRenderingControl {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:upnp-org:serviceId:RenderingControl', $method, @args);
+}
+
+sub DLNARenderer_upnpCall {
+  my ($hash, $service, $method, @args) = @_;
+  my $upnpService = $hash->{helper}{device}->getService($service);
+  my $upnpServiceCtrlProxy = $upnpService->controlProxy();
+  
+  eval {
+    $upnpServiceCtrlProxy->$method(@args);
+    Log3 $hash, 5, "DLNARenderer: $service, $method(".join(",",@args).") succeed.";
+  };
+  
+  if($@) {
+    Log3 $hash, 3, "DLNARenderer: $service, $method(".join(",",@args).") failed, $@";
+    return "DLNARenderer: $method failed.";
+  }
 }
 
 1;
