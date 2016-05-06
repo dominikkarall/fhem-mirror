@@ -5,6 +5,9 @@
 # - CHANGE: change state to offline/playing/stopped/paused/online
 # - CHANGE: play is NOT setting AVTransport any more
 # - FEATURE: support pauseToggle
+# - CHANGE: set timeout for subscription registration/renewal
+# - CHANGE: code cleanup
+# - FEATURE: support SetExtensions (on-for-timer, off-for-timer, ...)
 #
 # v2.0.0 BETA3 - 20160504
 # - BUGFIX: XML parsing error "NOT_IMPLEMENTED"
@@ -48,6 +51,8 @@
 #
 # TODO
 # - 500 Can't connect to 192.168.0.23:8080 at FHEM/lib/UPnP/ControlPoint.pm line 847
+# - move all controlproxy->CALLs into own forked process including eval {} block
+# - move all UPnP stuff into own packages UPnP::AVTransport, UPnP::SessionManagement, UPnP::RenderingControl, ...
 # - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
@@ -74,6 +79,7 @@ use strict;
 use warnings;
 
 use Blocking;
+use SetExtensions;
 
 use HTML::Entities;
 use XML::Simple;
@@ -231,9 +237,6 @@ sub DLNARenderer_updateReadingByEvent {
     if($val ne $currVal) {
       readingsSingleUpdate($hash, $readingName, $val, 1);
     }
-  } else {
-    #reset values only if the value itself is ""
-    #readingsSingleUpdate($hash, $readingName, "", 1);
   }
   
   return undef;
@@ -310,16 +313,6 @@ sub DLNARenderer_updateMetaData {
         Log3 $hash, 1, "DLNARenderer: XML parsing error: ".$@;
       }
     }
-  } else {
-    #no metadata available -> reset
-    #reset only if empty metadata has been received
-    #readingsSingleUpdate($hash, $prefix."Title", "", 1);
-    #readingsSingleUpdate($hash, $prefix."Artist", "", 1);
-    #readingsSingleUpdate($hash, $prefix."Album", "", 1);
-    #readingsSingleUpdate($hash, $prefix."AlbumArtist", "", 1);
-    #readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
-    #readingsSingleUpdate($hash, $prefix."OriginalTrackNumber", "", 1);
-    #readingsSingleUpdate($hash, $prefix."Duration", "", 1);
   }
 
   return undef;
@@ -334,10 +327,8 @@ sub DLNARenderer_updateMetaDataItemPart {
     if($currVal ne $item) {
       readingsSingleUpdate($hash, $readingName, $item, 1);
     }
-  } else {
-    #update only if empty received
-    #readingsSingleUpdate($hash, $readingName, "", 1);
   }
+  
   return undef;
 }
 
@@ -438,21 +429,21 @@ sub DLNARenderer_renewSubscriptions {
   #urn:upnp-org:serviceId:AVTransport
   eval {
     if(defined($hash->{helper}{avTransportSubscription})) {
-      $hash->{helper}{avTransportSubscription}->renew();
+      $hash->{helper}{avTransportSubscription}->renew(3);
     }
   };
   
   #urn:upnp-org:serviceId:RenderingControl
   eval {
     if(defined($hash->{helper}{renderingControlSubscription})) {
-      $hash->{helper}{renderingControlSubscription}->renew();
+      $hash->{helper}{renderingControlSubscription}->renew(3);
     }
   };
   
   #urn:pure-com:serviceId:SpeakerManagement
   eval {
     if(defined($hash->{helper}{speakerManagementSubscription})) {
-      $hash->{helper}{speakerManagementSubscription}->renew();
+      $hash->{helper}{speakerManagementSubscription}->renew(3);
     }
   };
   
@@ -476,7 +467,7 @@ sub DLNARenderer_addedDevice {
       $foundDevice = 1;
     }
   }
-    
+
   if(!$foundDevice) {
     my $uniqueDeviceName = "DLNA_".substr($dev->UDN(),29,12);
     CommandDefine(undef, "$uniqueDeviceName DLNARenderer ".$dev->UDN());
@@ -508,15 +499,15 @@ sub DLNARenderer_addedDevice {
       #register callbacks
       #urn:upnp-org:serviceId:AVTransport
       if($dev->getService("urn:upnp-org:serviceId:AVTransport")) {
-        $DLNARendererHash->{helper}{avTransportSubscription} = $dev->getService("urn:upnp-org:serviceId:AVTransport")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+        $DLNARendererHash->{helper}{avTransportSubscription} = $dev->getService("urn:upnp-org:serviceId:AVTransport")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
       }
       #urn:upnp-org:serviceId:RenderingControl
       if($dev->getService("urn:upnp-org:serviceId:RenderingControl")) {
-        $DLNARendererHash->{helper}{renderingControlSubscription} = $dev->getService("urn:upnp-org:serviceId:RenderingControl")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+        $DLNARendererHash->{helper}{renderingControlSubscription} = $dev->getService("urn:upnp-org:serviceId:RenderingControl")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
       }
       #urn:pure-com:serviceId:SpeakerManagement
       if($dev->getService("urn:pure-com:serviceId:SpeakerManagement")) {
-        $DLNARendererHash->{helper}{speakerManagementSubscription} = $dev->getService("urn:pure-com:serviceId:SpeakerManagement")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+        $DLNARendererHash->{helper}{speakerManagementSubscription} = $dev->getService("urn:pure-com:serviceId:SpeakerManagement")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
       }
       
       #set render_service
@@ -609,20 +600,18 @@ sub DLNARenderer_updateVolume($) {
 }
 
 ###################################
-sub DLNARenderer_setAVTransportBlocking($) {
+sub DLNARenderer_setAVTransportURIBlocking($) {
   my ($string) = @_;
   my ($name, $streamURI) = split("\\|", $string);
   my $hash = $main::defs{$name};
   my $return = "$name|$streamURI";
   
-  my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-  my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-  $avtrans_ctrlproxy->SetAVTransportURI(0, $streamURI, "");
+  DLNARenderer_upnpSetAVTransportURI($hash, $streamURI);
 
   return $return;
 }
 
-sub DLNARenderer_finishedSetAVTransportBlocking($) {
+sub DLNARenderer_finishedSetAVTransportURIBlocking($) {
   my ($string) = @_;
   my @params = split("\\|", $string);
   my $name = $params[0];
@@ -640,45 +629,134 @@ sub DLNARenderer_play($) {
   
   #start play
   if($hash->{helper}{caskeid}) {
-    DLNARenderer_syncPlay($hash, $hash->{helper}{device});
+    DLNARenderer_upnpSyncPlay($hash, $hash->{helper}{device});
   } else {
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Play(0, 1);
+    DLNARenderer_upnpPlay($hash);
   }
   
   return undef;
 }
 
-sub DLNARenderer_syncPlay($$) {
+sub DLNARenderer_upnpPause {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Pause", 0);
+}
+
+sub DLNARenderer_upnpSetAVTransportURI {
+  my ($hash, $stream) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "SetAVTransportURI", 0, $stream, "");
+}
+
+sub DLNARenderer_upnpStop {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Stop", 0);
+}
+
+sub DLNARenderer_upnpSeek {
+  my ($hash, $seekTime) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Seek", 0, "REL_TIME", $seekTime);
+}
+
+sub DLNARenderer_upnpNext {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTrasnport($hash, "Next", 0);
+}
+
+sub DLNARenderer_upnpPrevious {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTrasnport($hash, "Previous", 0);
+}
+
+sub DLNARenderer_upnpPlay {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallAVTransport($hash, "Play", 0, 1);
+}
+
+sub DLNARenderer_upnpSyncPlay($$) {
   my ($hash, $dev) = @_;
-  my $avtrans_service = $dev->getService('urn:upnp-org:serviceId:AVTransport');
-  my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-  $avtrans_ctrlproxy->SyncPlay(0, 1, "REL_TIME", "", "", "", "DeviceClockId");
+  return DLNARenderer_upnpCallAVTransport($hash, "SyncPlay", 0, 1, "REL_TIME", "", "", "", "DeviceClockId");
+}
+
+sub DLNARenderer_upnpCallAVTransport {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:upnp-org:serviceId:AVTransport', $method, @args);
+}
+
+sub DLNARenderer_upnpSetMultiChannelSpeaker {
+  my ($hash, @args) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "SetMultiChannelSpeaker", @args);
+}
+
+sub DLNARenderer_upnpCallSpeakerManagement {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SpeakerManagement', $method, @args);
+}
+
+sub DLNARenderer_upnpAddUnitToSession {
+  my ($hash, $session, $uuid) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "AddUnitToSession", $session, $uuid);
+}
+
+sub DLNARenderer_upnpRemoveUnitToSession {
+  my ($hash, $session, $uuid) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "RemoveUnitToSession", $session, $uuid);
+}
+
+sub DLNARenderer_upnpDestroySession {
+  my ($hash, $session) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "DestroySession", $session);
+}
+
+sub DLNARenderer_upnpCreateSession {
+  my ($hash, $name) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "CreateSession", $name);
+}
+
+sub DLNARenderer_upnpGetSession {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallSessionManagement($hash, "GetSession");
+}
+
+sub DLNARenderer_upnpCallSessionManagement {
+  my ($hash, $method, @args) = @_;
+  return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SessionManagement', $method, @args);
+}
+
+sub DLNARenderer_upnpCall {
+  my ($hash, $service, $method, @args) = @_;
+  my $upnpService = $hash->{helper}{device}->getService($service);
+  my $upnpServiceCtrlProxy = $upnpService->controlProxy();
+  
+  eval {
+    $upnpServiceCtrlProxy->$method(@args);
+    Log3 $hash, 5, "DLNARenderer: $service, $method(".join(",",@args).") succeed.";
+  };
+  
+  if($@) {
+    Log3 $hash, 3, "DLNARenderer: $service, $method(".join(",",@args).") failed, $@";
+    return "DLNARenderer: $method failed.";
+  }
 }
 
 sub DLNARenderer_enableBTCaskeid {
   my ($hash, $dev) = @_;
-  DLNARenderer_addUnitToGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth");
+  DLNARenderer_upnpAddUnitToGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth");
 }
 
 sub DLNARenderer_disableBTCaskeid {
   my ($hash, $dev) = @_;
-  DLNARenderer_removeUnitFromGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66");
+  DLNARenderer_upnpRemoveUnitFromGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66");
 }
 
 ### DLNA SpeakerManagement ###
-sub DLNARenderer_addUnitToGroup {
+sub DLNARenderer_upnpAddUnitToGroup {
   my ($hash, $dev, $unit, $name) = @_;
-  my $service = $dev->getService('urn:pure-com:serviceId:SpeakerManagement')->controlProxy();
-  $service->AddToGroup($unit, $name, "");
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "AddUnitToGroup", $unit, $name, "");
 }
 
-sub DLNARenderer_removeUnitFromGroup {
+sub DLNARenderer_upnpRemoveUnitFromGroup {
   my ($hash, $dev, $unit) = @_;
-  my $service = $dev->getService('urn:pure-com:serviceId:SpeakerManagement')->controlProxy();
-  $service->RemoveFromGroup($unit);
-  return undef;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "RemoveUnitToGroup", $unit);
 }
 
 sub DLNARenderer_setStereoMode {
@@ -740,15 +818,14 @@ sub DLNARenderer_createUuid {
 
 sub DLNARenderer_setMultiChannelSpeaker {
   my ($hash, $mode, $uuid, $name) = @_;
-  my $service = $hash->{helper}{device}->getService('urn:pure-com:serviceId:SpeakerManagement')->controlProxy();
   my $uuidStr;
   
   if($mode eq "standalone") {
-    $service->SetMultiChannelSpeaker("STANDALONE", "", "", "STANDALONE_SPEAKER");
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STANDALONE", "", "", "STANDALONE_SPEAKER");
   } elsif($mode eq "left") {
-    $service->SetMultiChannelSpeaker("STEREO", $uuid, $name, "LEFT_FRONT");
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "LEFT_FRONT");
   } elsif($mode eq "right") {
-    $service->SetMultiChannelSpeaker("STEREO", $uuid, $name, "RIGHT_FRONT");
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "RIGHT_FRONT");
   }
   
   return undef;  
@@ -789,32 +866,30 @@ sub DLNARenderer_destroyCurrentSession {
 
 sub DLNARenderer_createSession {
   my ($hash, $dev) = @_;
-  my $conn_service = $dev->getService('urn:pure-com:serviceId:SessionManagement')->controlProxy();
-  return $conn_service->CreateSession("FHEM Session")->getValue("SessionID");
+  return DLNARenderer_upnpCreateSession($hash, "FHEM_Session")->getValue("SessionID");
 }
 
 sub DLNARenderer_getSession {
   my ($hash, $dev) = @_;
-  my $conn_service = $dev->getService('urn:pure-com:serviceId:SessionManagement')->controlProxy();
-  return $conn_service->GetSession()->getValue("SessionID");
+  return DLNARenderer_upnpGetSession($hash)->getValue("SessionID");
 }
 
 sub DLNARenderer_addUnitToSession {
   my ($hash, $dev, $uuid, $session) = @_;
-  my $conn_service = $dev->getService('urn:pure-com:serviceId:SessionManagement')->controlProxy();
-  $conn_service->AddUnitToSession($session, $uuid);
+  
+  return DLNARenderer_upnpAddUnitToSession($hash, $session, $uuid);
 }
 
 sub DLNARenderer_removeUnitFromSession {
   my ($hash, $dev, $uuid, $session) = @_;
-  my $conn_service = $dev->getService('urn:pure-com:serviceId:SessionManagement')->controlProxy();
-  $conn_service->RemoveUnitFromSession($session, $uuid);
+  
+  return DLNARenderer_upnpRemoveUnitFromSession($hash, $session, $uuid);
 }
 
 sub DLNARenderer_destroySession {
-  my ($hash, $dev, $sessionId) = @_;
-  my $conn_service = $dev->getService('urn:pure-com:serviceId:SessionManagement')->controlProxy();
-  $conn_service->DestroySession($sessionId);
+  my ($hash, $dev, $session) = @_;
+  
+  return DLNARenderer_upnpDestroySession($hash, $session);
 }
 
 sub DLNARenderer_getGroupDefinition {
@@ -869,7 +944,7 @@ sub DLNARenderer_Define($$) {
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA3";
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA4";
     $hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
     DLNARenderer_doDlnaSearch($hash);
     DLNARenderer_handleControlpoint($hash);
@@ -900,29 +975,23 @@ sub DLNARenderer_Undef($) {
 }
 ###################################
 sub DLNARenderer_Set($@) {
-  my ($hash, @param) = @_;
+  my ($hash, $name, @params) = @_;
   my $dev = $hash->{helper}{device};
   my $render_service = $hash->{helper}{render_service};
   my $streamURI = "";
   
   # check parameters
-  return "no set value specified" if(int(@param) < 1);
-  my $ctrlParam = $param[1];
+  return "no set value specified" if(int(@params) < 1);
+  my $ctrlParam = shift(@params);
   
-  if ($ctrlParam eq "?") {
-    if($hash->{helper}{caskeid}) {
-      return "Unknown argument, choose one of on:noArg off:noArg play:noArg stop:noArg stream volume:slider,0,1,100 ".
-             "pause:noArg next:noArg previous:noArg seek ".
-             "addUnit:".$hash->{helper}{caskeidClients}." ".
-             "playEverywhere:noArg stopPlayEverywhere:noArg ".
-             "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
-             "enableBTCaskeid:noArg disableBTCaskeid:noArg saveGroupAs loadGroup ".
-             "stereo standalone:noArg";
-    } else {
-      return "Unknown argument, choose one of on:noArg off:noArg play:noArg stop:noArg stream pause:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
-    }
-  }
-    
+  my $stdCommandList = "on:noArg off:noArg play:noArg stop:noArg stream pause:noArg pauseToggle:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
+  my $caskeidCommandList = "addUnit:".$hash->{helper}{caskeidClients}." ".
+                           "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
+                           "playEverywhere:noArg stopPlayEverywhere:noArg ".
+                           "enableBTCaskeid:noArg disableBTCaskeid:noArg ".
+                           "saveGroupAs loadGroup ".
+                           "stereo standalone:noArg";
+  
   # check device presence
   if (!defined($dev) or ReadingsVal($hash->{NAME}, "presence", "") eq "offline") {
     return "DLNARenderer: Currently searching for device...";
@@ -934,17 +1003,15 @@ sub DLNARenderer_Set($@) {
       Log3 $hash, 3, "DLNARenderer: No volume control possible for this device";
       return undef;
     }
-    return "DLNARenderer: Missing argument for volume." if (int(@param) < 3);
-    $render_service->controlProxy()->SetVolume(0, "Master", $param[2]);
-    readingsSingleUpdate($hash, "volume", $param[2], 1);
+    return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
+    $render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
+    readingsSingleUpdate($hash, "volume", $params[0], 1);
     return undef;
   }
   
   #pause
   if($ctrlParam eq "pause") {
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Pause(0);
+    DLNARenderer_upnpPause($hash);
     return undef;
   }
   
@@ -953,9 +1020,7 @@ sub DLNARenderer_Set($@) {
     if($hash->{READINGS}{state} eq "paused") {
         DLNARenderer_play($hash);
     } else {
-        my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-        my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-        $avtrans_ctrlproxy->Pause(0);
+        DLNARenderer_upnpPause($hash);
     }
     return undef;
   }
@@ -968,25 +1033,19 @@ sub DLNARenderer_Set($@) {
   
   #next
   if($ctrlParam eq "next") {
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Next(0);
+    DLNARenderer_upnpNext($hash);
     return undef;
   }
   
   #previous
   if($ctrlParam eq "previous") {
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Previous(0);
+    DLNARenderer_upnpPrevious($hash);
     return undef;
   }
   
   #seek
   if($ctrlParam eq "seek") {
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Seek(0, "REL_TIME", $param[2]);
+    DLNARenderer_upnpSeek($hash, $params[0]);
     return undef;
   }
   
@@ -996,20 +1055,20 @@ sub DLNARenderer_Set($@) {
       Log3 $hash, 3, "DLNARenderer: No volume control possible for this device";
       return undef;
     }
-    return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@param) < 3);
+    return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
     #handle volume for all devices in the current group
     #iterate through group and change volume relative to the current volume
-    my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $param[2];
+    my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $params[0];
     #get grouped devices
       #set volume for each device
-    #$render_service->controlProxy()->SetVolume(0, "Master", $param[2]);
-    #readingsSingleUpdate($hash, "volume", $param[2], 1);
+    #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
+    #readingsSingleUpdate($hash, "volume", $params[1], 1);
     return undef;
   }
   
   # stereo mode
   if($ctrlParam eq "stereo") {
-    DLNARenderer_setStereoMode($hash, $param[2], $param[3], $param[4]);
+    DLNARenderer_setStereoMode($hash, $params[0], $params[1], $params[2]);
     return undef;
   }
   
@@ -1044,16 +1103,16 @@ sub DLNARenderer_Set($@) {
   
   # addUnit
   if($ctrlParam eq "addUnit") {
-    return DLNARenderer_addUnit($hash, $param[2]);
+    return DLNARenderer_addUnit($hash, $params[0]);
   }
   
   # removeUnit
   if($ctrlParam eq "removeUnit") {
-    DLNARenderer_removeUnitToPlay($hash, $dev, $param[2]);
+    DLNARenderer_removeUnitToPlay($hash, $dev, $params[0]);
     my $multiRoomUnitsReading = "";
     my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
     foreach my $unit (@multiRoomUnits) {
-      $multiRoomUnitsReading .= ",".$unit if($unit ne $param[2]);
+      $multiRoomUnitsReading .= ",".$unit if($unit ne $params[0]);
     }
     $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
     readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
@@ -1062,7 +1121,7 @@ sub DLNARenderer_Set($@) {
   
   # save group as
   if($ctrlParam eq "saveGroupAs") {
-    DLNARenderer_saveGroupAs($hash, $dev, $param[2]);
+    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
     return undef;
   }
   
@@ -1080,16 +1139,14 @@ sub DLNARenderer_Set($@) {
  
   # off/stop
   if($ctrlParam eq "off" || $ctrlParam eq "stop" ){
-    my $avtrans_service = $hash->{helper}{device}->getService('urn:upnp-org:serviceId:AVTransport');
-    my $avtrans_ctrlproxy = $avtrans_service->controlProxy();
-    $avtrans_ctrlproxy->Stop(0);
+    DLNARenderer_upnpStop($hash);
     return undef;
   }
   
   # loadGroup
   if($ctrlParam eq "loadGroup") {
-    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($param[2]));
-    my $groupName = $param[2];
+    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
+    my $groupName = $params[0];
     my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
     return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
     
@@ -1112,22 +1169,31 @@ sub DLNARenderer_Set($@) {
     return undef;
   }
   
-  # on
+  # on (=play last stream)
   if($ctrlParam eq "on"){
     if (defined($hash->{READINGS}{stream})) {
       my $lastStream = $hash->{READINGS}{stream}{VAL};
       if ($lastStream) {
         $streamURI = $lastStream;
+        BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+        return undef;
       }
     }
+    return "DLNARenderer: No last stream defined.";
   }
   
-  # set streamURI
-  if (!$streamURI && $ctrlParam eq "stream") {
-    $streamURI = $param[2];
+  # set streamURI and play
+  if ($ctrlParam eq "stream") {
+    $streamURI = $params[0];
+    BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+    return undef;
   }
-
-  BlockingCall('DLNARenderer_setAVTransportBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportBlocking');
+  
+  if($hash->{helper}{caskeid}) {
+    return SetExtensions($hash, $caskeidCommandList." ".$stdCommandList, $name, $ctrlParam, @params);       
+  } else {
+    return SetExtensions($hash, $stdCommandList, $name, $ctrlParam, @params);
+  }
   
   return undef;
 }
