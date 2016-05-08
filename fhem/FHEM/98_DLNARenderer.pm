@@ -3,10 +3,10 @@
 #
 # v2.0.0 BEAT4 - 201605XX
 # - CHANGE: change state to offline/playing/stopped/paused/online
+# - CHANGE: removed on/off devstateicon on creation due to changed state values
 # - CHANGE: play is NOT setting AVTransport any more
-# - FEATURE: support pauseToggle
-# - CHANGE: set timeout for subscription registration/renewal
 # - CHANGE: code cleanup
+# - FEATURE: support pauseToggle
 # - FEATURE: support SetExtensions (on-for-timer, off-for-timer, ...)
 #
 # v2.0.0 BETA3 - 20160504
@@ -50,23 +50,18 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 #TODO
-# - move all controlproxy->CALLs into own forked process
+# - use blocking call for all upnpCalls
 # - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
 # - SWR3 metadata is handled wrong by player
 # - retrieve stereomode (GetMultiChannel...) every 5 minutes
-# - add socket to mainloop with separate hash
-# - map TransportState to state (online, offline, playing, stopped, ...)
-# - use eval for all controlProxy functions to prevent crashes
 # - support channels (radio stations) with attributes
 # - support relative volume (+/-10)
 # - use bulk update for readings
 # - support multiprocess and InternalTimer for ControlPoint
-# - support SetExtensions
 # - support relative volume for all multiroom devices (multiRoomVolume)
 # - implement speak functions
-# - check Standby -> Online signal
 # - remove attributes (scanInterval, ignoreUDNs, multiRoomGroups) from play devices
 #
 ############################################################################
@@ -96,12 +91,12 @@ use lib ($gPath.'/lib', $gPath.'/FHEM/lib', './FHEM/lib', './lib', './FHEM', './
 
 use UPnP::ControlPoint;
 
-###################################
 sub DLNARenderer_Initialize($) {
   my ($hash) = @_;
 
   $hash->{SetFn}     = "DLNARenderer_Set";
   $hash->{DefFn}     = "DLNARenderer_Define";
+  $hash->{ReadFn}    = "DLNARenderer_Read";
   $hash->{UndefFn}   = "DLNARenderer_Undef";
   $hash->{AttrFn}    = "DLNARenderer_Attribute";
   $hash->{AttrList}  = "ignoreUDNs scanInterval multiRoomGroups ".$readingFnAttributes;
@@ -124,464 +119,240 @@ sub DLNARenderer_Attribute {
   return undef;
 }
 
-sub DLNARenderer_handleControlpoint {
-  my ($hash) = @_;
+sub DLNARenderer_Define($$) {
+  my ($hash, $def) = @_;
+  my @param = split("[ \t][ \t]*", $def);
   
-  eval {
-    my $cp = $hash->{helper}{controlpoint};
-    my @sockets = $cp->sockets();
-    my $select = IO::Select->new(@sockets);
-    my @sock = $select->can_read(1);
-    foreach my $s (@sock) {
-      $cp->handleOnce($s);
-    }
-  };
-  my $error = $@;
+  #init caskeid clients for multiroom
+  $hash->{helper}{caskeidClients} = "";
+  $hash->{helper}{caskeid} = 0;
   
-  if($error) {
-    #setup a new controlpoint on error
-    #undef($hash->{helper}{controlpoint});
-    Log3 $hash, 3, "DLNARenderer: Create new controlpoint due to error, $error";
-    #$hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
+  if(@param < 3) {
+    #main
+    $hash->{UDN} = 0;
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA4";
+    $hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
+    DLNARenderer_doDlnaSearch($hash);
+    DLNARenderer_handleControlpoint($hash);
+    readingsSingleUpdate($hash,"state","initialized",1);
+    return undef;
   }
   
-  InternalTimer(gettimeofday() + 1, 'DLNARenderer_handleControlpoint', $hash, 0);
+  #device specific
+  my $name     = shift @param;
+  my $type     = shift @param;
+  my $udn      = shift @param;
+  $hash->{UDN} = $udn;
   
-  return undef;
-}
-
-sub DLNARenderer_setupControlpoint {
-  my ($hash) = @_;
-  my %empty = ();
-  my $error;
-  my $cp;
-  
-  do {
-    eval {
-      $cp = UPnP::ControlPoint->new(SearchPort => 0, SubscriptionPort => 0, MaxWait => 30, UsedOnlyIP => \%empty, IgnoreIP => \%empty);
-    };
-    $error = $@;
-  } while($error);
-  
-  return $cp;
-}
-
-sub DLNARenderer_doDlnaSearch {
-  my ($hash) = @_;
-
-  #research every 30 minutes
-  InternalTimer(gettimeofday() + 1800, 'DLNARenderer_doDlnaSearch', $hash, 0);
-
-  eval {
-    $hash->{helper}{controlpoint}->searchByType('urn:schemas-upnp-org:device:MediaRenderer:1', sub { DLNARenderer_discoverCallback($hash, @_); });
-  };
-  if($@) {
-    Log3 $hash, 2, "DLNARenderer: Search failed with error $@";
-  }
-  return undef;
-}
-
-sub DLNARenderer_discoverCallback {
-  my ($hash, $search, $device, $action) = @_;
-  
-  Log3 $hash, 4, "DLNARenderer: $action, ".$device->friendlyName();
-
-  if($action eq "deviceAdded") {
-    DLNARenderer_addedDevice($hash, $device);
-  } elsif($action eq "deviceRemoved") {
-    DLNARenderer_removedDevice($hash, $device);
-  }
-  return undef;
-}
-
-sub DLNARenderer_subscriptionCallback {
-  my ($hash, $service, %properties) = @_;
-  
-  Log3 $hash, 4, "DLNARenderer: Received event: ".Dumper(%properties);
-  
-  foreach my $property (keys %properties) {
-    
-    $properties{$property} = decode_entities($properties{$property});
-    
-    my $xml;
-    eval {
-      if($properties{$property} =~ /xml/) {
-        $xml = XMLin($properties{$property}, KeepRoot => 1, ForceArray => [qw(Volume Mute Loudness VolumeDB group)], KeyAttr => []);
-      } else {
-        $xml = $properties{$property};
-      }
-    };
-    
-    if($@) {
-      Log3 $hash, 2, "DLNARenderer: XML formatting error: ".$@.", ".$properties{$property};
-      next;
-    }
-    
-    DLNARenderer_processEventXml($hash, $property, $xml);
-  }
-  
-  return undef;
-}
-
-sub DLNARenderer_updateReadingByEvent {
-  my ($hash, $readingName, $xmlEvent) = @_;
-  
-  my $currVal = ReadingsVal($hash->{NAME}, $readingName, "");
-  
-  if($xmlEvent) {
-    Log3 $hash, 4, "DLNARenderer: Update reading $readingName with ".$xmlEvent->{val};
-    my $val = $xmlEvent->{val};
-    $val = "" if(ref $val eq ref {});
-    if($val ne $currVal) {
-      readingsSingleUpdate($hash, $readingName, $val, 1);
-    }
-  }
-  
-  return undef;
-}
-
-sub DLNARenderer_updateVolumeByEvent {
-  my ($hash, $readingName, $volume) = @_;
-  my $balance = 0;
-  my $balanceSupport = 0;
-  
-  foreach my $vol (@{$volume}) {
-    my $channel = $vol->{Channel} ? $vol->{Channel} : $vol->{channel};
-    if($channel) {
-      if($channel eq "Master") {
-        DLNARenderer_updateReadingByEvent($hash, $readingName, $vol);
-      } elsif($channel eq "LF") {
-        $balance -= $vol->{val};
-        $balanceSupport = 1;
-      } elsif($channel eq "RF") {
-        $balance += $vol->{val};
-        $balanceSupport = 1;
-      }
-    } else {
-      DLNARenderer_updateReadingByEvent($hash, $readingName, $vol);
-    }
-  }
-  
-  if($readingName eq "volume" && $balanceSupport == 1) {
-    readingsSingleUpdate($hash, "balance", $balance, 1);
-  }
-  
-  return undef;
-}
-
-sub DLNARenderer_updateMetaData {
-  my ($hash, $prefix, $metaData) = @_;
-  my $metaDataAvailable = 0;
-
-  $metaDataAvailable = 1 if(defined($metaData) && $metaData->{val} && $metaData->{val} ne "");
-  
-  if($metaDataAvailable) {
-    my $xml;
-    if($metaData->{val} eq "NOT_IMPLEMENTED") {
-      readingsSingleUpdate($hash, $prefix."Title", "", 1);
-      readingsSingleUpdate($hash, $prefix."Artist", "", 1);
-      readingsSingleUpdate($hash, $prefix."Album", "", 1);
-      readingsSingleUpdate($hash, $prefix."AlbumArtist", "", 1);
-      readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
-      readingsSingleUpdate($hash, $prefix."OriginalTrackNumber", "", 1);
-      readingsSingleUpdate($hash, $prefix."Duration", "", 1);
-    } else {
-      eval {
-        $xml = XMLin($metaData->{val}, KeepRoot => 1, ForceArray => [], KeyAttr => []);
-        Log3 $hash, 4, "DLNARenderer: MetaData: ".Dumper($xml);
-      };
-
-      if(!$@) {
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Title", $xml->{"DIDL-Lite"}{item}{"dc:title"});
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Artist", $xml->{"DIDL-Lite"}{item}{"dc:creator"});
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Album", $xml->{"DIDL-Lite"}{item}{"upnp:album"});
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtist", $xml->{"DIDL-Lite"}{item}{"r:albumArtist"});
-        if($xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"}) {
-          DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtURI", $xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"});
-        } else {
-          readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
-        }
-        DLNARenderer_updateMetaDataItemPart($hash, $prefix."OriginalTrackNumber", $xml->{"DIDL-Lite"}{item}{"upnp:originalTrackNumber"});
-        if($xml->{"DIDL-Lite"}{item}{res}) {
-          DLNARenderer_updateMetaDataItemPart($hash, $prefix."Duration", $xml->{"DIDL-Lite"}{item}{res}{duration});
-        } else {
-          readingsSingleUpdate($hash, $prefix."Duration", "", 1);
-        }
-      } else {
-        Log3 $hash, 1, "DLNARenderer: XML parsing error: ".$@;
-      }
-    }
-  }
-
-  return undef;
-}
-
-sub DLNARenderer_updateMetaDataItemPart {
-  my ($hash, $readingName, $item) = @_;
-
-  my $currVal = ReadingsVal($hash->{NAME}, $readingName, "");
-  if($item) {
-    $item = "" if(ref $item eq ref {});
-    if($currVal ne $item) {
-      readingsSingleUpdate($hash, $readingName, $item, 1);
-    }
-  }
-  
-  return undef;
-}
-
-sub DLNARenderer_processEventXml {
-  my ($hash, $property, $xml) = @_;
-
-  Log3 $hash, 4, "DLNARenderer: ".Dumper($xml);
-  
-  if($property eq "LastChange") {
-    if($xml->{Event}) {
-      if($xml->{Event}{xmlns} eq "urn:schemas-upnp-org:metadata-1-0/AVT/") {
-        #process AV Transport
-        my $e = $xml->{Event}{InstanceID};
-        #DLNARenderer_updateReadingByEvent($hash, "NumberOfTracks", $e->{NumberOfTracks});
-        DLNARenderer_updateReadingByEvent($hash, "transportState", $e->{TransportState});
-        if($e->{TransportState} eq "PAUSED_PLAYBACK") {
-            readingsSingleUpdate($hash, "state", "paused", 1);
-        } elsif($e->{TransportState} eq "PLAYING") {
-            readingsSingleUpdate($hash, "state", "playing", 1);
-        } elsif($e->{TransportState} eq "TRANSITIONING") {
-            readingsSingleUpdate($hash, "state", "buffering", 1);
-        } elsif($e->{TransportState} eq "STOPPED") {
-            readingsSingleUpdate($hash, "state", "stopped", 1);
-        } elsif($e->{TransportState} eq "NO_MEDIA_PRESENT") {
-            readingsSingleUpdate($hash, "state", "online", 1);
-        }
-        DLNARenderer_updateReadingByEvent($hash, "transportStatus", $e->{TransportStatus});
-        #DLNARenderer_updateReadingByEvent($hash, "TransportPlaySpeed", $e->{TransportPlaySpeed});
-        #DLNARenderer_updateReadingByEvent($hash, "PlaybackStorageMedium", $e->{PlaybackStorageMedium});
-        #DLNARenderer_updateReadingByEvent($hash, "RecordStorageMedium", $e->{RecordStorageMedium});
-        #DLNARenderer_updateReadingByEvent($hash, "RecordMediumWriteStatus", $e->{RecordMediumWriteStatus});
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentRecordQualityMode", $e->{CurrentRecordQualityMode});
-        #DLNARenderer_updateReadingByEvent($hash, "PossibleRecordQualityMode", $e->{PossibleRecordQualityMode});
-        DLNARenderer_updateReadingByEvent($hash, "currentTrackURI", $e->{CurrentTrackURI});
-        #DLNARenderer_updateReadingByEvent($hash, "AVTransportURI", $e->{AVTransportURI});
-        DLNARenderer_updateReadingByEvent($hash, "nextAVTransportURI", $e->{NextAVTransportURI});
-        #DLNARenderer_updateReadingByEvent($hash, "RelativeTimePosition", $e->{RelativeTimePosition});
-        #DLNARenderer_updateReadingByEvent($hash, "AbsoluteTimePosition", $e->{AbsoluteTimePosition});
-        #DLNARenderer_updateReadingByEvent($hash, "RelativeCounterPosition", $e->{RelativeCounterPosition});
-        #DLNARenderer_updateReadingByEvent($hash, "AbsoluteCounterPosition", $e->{AbsoluteCounterPosition});
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrack", $e->{CurrentTrack});
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentMediaDuration", $e->{CurrentMediaDuration});
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrackDuration", $e->{CurrentTrackDuration});
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentPlayMode", $e->{CurrentPlayMode});
-        #handle metadata
-        #DLNARenderer_updateReadingByEvent($hash, "AVTransportURIMetaData", $e->{AVTransportURIMetaData});
-        #DLNARenderer_updateMetaData($hash, "current", $e->{AVTransportURIMetaData});
-        #DLNARenderer_updateReadingByEvent($hash, "NextAVTransportURIMetaData", $e->{NextAVTransportURIMetaData});
-        DLNARenderer_updateMetaData($hash, "next", $e->{NextAVTransportURIMetaData});
-        #use only CurrentTrackMetaData instead of AVTransportURIMetaData
-        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrackMetaData", $e->{CurrentTrackMetaData});
-        DLNARenderer_updateMetaData($hash, "current", $e->{CurrentTrackMetaData});
-      } elsif ($xml->{Event}{xmlns} eq "urn:schemas-upnp-org:metadata-1-0/RCS/") {
-        #process RenderingControl
-        my $e = $xml->{Event}{InstanceID};
-        DLNARenderer_updateVolumeByEvent($hash, "mute", $e->{Mute});
-        DLNARenderer_updateVolumeByEvent($hash, "volume", $e->{Volume});
-      } elsif ($xml->{Event}{xmlns} eq "FIXME SpeakerManagement") {
-        #process SpeakerManagement
-      }
-    }
-  } elsif($property eq "Groups") {
-    #handle BTCaskeid
-    my $btCaskeidState = 0;
-    foreach my $group (@{$xml->{groups}{group}}) {
-      #"4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth"
-      if($group->{id} eq "4DAA44C0-8291-11E3-BAA7-0800200C9A66") {
-        $btCaskeidState = 1;
-      }
-    }
-    #TODO update only if changed
-    readingsSingleUpdate($hash, "btCaskeid", $btCaskeidState, 1);
-  } elsif($property eq "SessionID") {
-    #TODO search for other speakers with same sessionId and add them to multiRoomUnits
-    readingsSingleUpdate($hash, "sessionId", $xml, 1);
-  }
-  
-  return undef;
-}
-
-sub DLNARenderer_removedDevice($$) {
-  my ($hash, $device) = @_;
-  my $deviceHash = DLNARenderer_getHashByUDN($hash, $device->UDN());
-  
-  readingsSingleUpdate($deviceHash, "presence", "offline", 1);
-  readingsSingleUpdate($deviceHash, "state", "offline", 1);
-}
-
-sub DLNARenderer_renewSubscriptions {
-  my ($hash) = @_;
-  my $dev = $hash->{helper}{device};
+  readingsSingleUpdate($hash,"presence","offline",1);
+  readingsSingleUpdate($hash,"state","offline",1);
   
   InternalTimer(gettimeofday() + 200, 'DLNARenderer_renewSubscriptions', $hash, 0);
   
-  return undef if(!defined($dev));
+  return undef;
+}
+
+sub DLNARenderer_Undef($) {
+  my ($hash) = @_;
   
-  #register callbacks
-  #urn:upnp-org:serviceId:AVTransport
+  RemoveInternalTimer($hash);
+  return undef;
+}
+
+sub DLNARenderer_Read($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+  my $phash = $hash->{pash};
+  my $cp = $phash->{helper}{controlpoint};
+  
   eval {
-    if(defined($hash->{helper}{avTransportSubscription})) {
-      $hash->{helper}{avTransportSubscription}->renew(3);
-    }
+    $cp->handleOnce($hash->{CD});
   };
   
-  #urn:upnp-org:serviceId:RenderingControl
-  eval {
-    if(defined($hash->{helper}{renderingControlSubscription})) {
-      $hash->{helper}{renderingControlSubscription}->renew(3);
-    }
-  };
+  if($@) {
+    Log3 $hash, 3, "DLNARenderer: handleOnce failed, $@";
+  }
   
-  #urn:pure-com:serviceId:SpeakerManagement
-  eval {
-    if(defined($hash->{helper}{speakerManagementSubscription})) {
-      $hash->{helper}{speakerManagementSubscription}->renew(3);
+  my @sockets = $cp->sockets();
+  #prüfen ob der socket schon in selectlist ist
+  #wenn nicht, dann chash hinzufügen
+  foreach my $s (@sockets) {
+    my $socketExits = 0;
+    foreach my $s2 (@{$phash->{helper}{sockets}}) {
+      if($s eq $s2) {
+        $socketExists = 1;
+      }
     }
-  };
+    
+    if(!$socketExists) {
+      #create chash and add to selectlist
+      my $chash = DLNARenderer_newChash($hash, $s, {NAME => "DLNASocket"});
+      push @{$phash->{helper}{sockets}}, $chash;
+    }
+    #prüfen ob der socket noch gebraucht wird
+    #wenn nicht, dann aus selectlist löschen
+  }
   
   return undef;
 }
 
-sub DLNARenderer_addedDevice {
-  my ($hash, $dev) = @_;
+sub DLNARenderer_Set($@) {
+  my ($hash, $name, @params) = @_;
+  my $dev = $hash->{helper}{device};
+  my $streamURI = "";
   
-  my $udn = $dev->UDN();
-
-  #TODO check for BOSE UDN
-
-  #ignoreUDNs
-  return undef if(AttrVal($hash->{NAME}, "ignoreUDNs", "") =~ /$udn/);
-    
-  my $foundDevice = 0;
-  my @allDLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
-  foreach my $DLNARendererHash (@allDLNARenderers) {
-    if($DLNARendererHash->{UDN} eq $dev->UDN()) {
-      $foundDevice = 1;
+  # check parameters
+  return "no set value specified" if(int(@params) < 1);
+  my $ctrlParam = shift(@params);
+  
+  my $stdCommandList = "on:noArg off:noArg play:noArg stop:noArg stream pause:noArg pauseToggle:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
+  my $caskeidCommandList = "addUnit:".$hash->{helper}{caskeidClients}." ".
+                           "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
+                           "playEverywhere:noArg stopPlayEverywhere:noArg ".
+                           "enableBTCaskeid:noArg disableBTCaskeid:noArg ".
+                           "saveGroupAs loadGroup ".
+                           "stereo standalone:noArg";
+  
+  # check device presence
+  if ($ctrlParam ne "?" and (!defined($dev) or ReadingsVal($hash->{NAME}, "presence", "") eq "offline")) {
+    return "DLNARenderer: Currently searching for device...";
+  }
+  
+  if($ctrlParam eq "volume"){
+    #volume
+    return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
+    DLNARenderer_upnpSetVolume($hash, $params[0]);
+    readingsSingleUpdate($hash, "volume", $params[0], 1);
+  } elsif($ctrlParam eq "pause") {
+    #pause
+    DLNARenderer_upnpPause($hash);
+  } elsif($ctrlParam eq "pauseToggle") {
+    #pauseToggle
+    if($hash->{READINGS}{state} eq "paused") {
+        DLNARenderer_play($hash);
+    } else {
+        DLNARenderer_upnpPause($hash);
     }
-  }
-
-  if(!$foundDevice) {
-    my $uniqueDeviceName = "DLNA_".substr($dev->UDN(),29,12);
-    CommandDefine(undef, "$uniqueDeviceName DLNARenderer ".$dev->UDN());
-    CommandAttr(undef,"$uniqueDeviceName alias ".$dev->friendlyName());
-    CommandAttr(undef,"$uniqueDeviceName devStateIcon on:audio_volume_high off:audio_volume_mute");
-    CommandAttr(undef,"$uniqueDeviceName webCmd volume");
-    Log3 $hash, 3, "DLNARenderer: Created device $uniqueDeviceName for ".$dev->friendlyName();
+  } elsif($ctrlParam eq "play") {
+    #play
+    DLNARenderer_play($hash);
+  } elsif($ctrlParam eq "next") {
+    #next
+    DLNARenderer_upnpNext($hash);
+  } elsif($ctrlParam eq "previous") {
+    #prev
+    DLNARenderer_upnpPrevious($hash);
+  } elsif($ctrlParam eq "seek") {
+    #seek
+    DLNARenderer_upnpSeek($hash, $params[0]);
+  } elsif($ctrlParam eq "multiRoomVolume"){
+    #multiroomvolume
+    return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
+    #handle volume for all devices in the current group
+    #iterate through group and change volume relative to the current volume
+    my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $params[0];
+    #get grouped devices
+      #set volume for each device
+    #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
+    #readingsSingleUpdate($hash, "volume", $params[1], 1);
+  } elsif($ctrlParam eq "stereo") {
+    #stereo
+    DLNARenderer_setStereoMode($hash, $params[0], $params[1], $params[2]);
+  } elsif($ctrlParam eq "standalone") {
+    #standalone
+    DLNARenderer_setStandaloneMode($hash);
+  } elsif($ctrlParam eq "playEverywhere") {
+    #playEverywhere
+    my $multiRoomUnits = "";
+    my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
+    foreach my $client (@caskeidClients) {
+      if($client->{UDN} ne $hash->{UDN}) {
+        DLNARenderer_addUnitToPlay($hash, $dev, substr($client->{UDN},5));
+        $multiRoomUnits .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
+      }
+    }
+    #remove first comma
+    $multiRoomUnits = substr($multiRoomUnits, 1);
+    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
+  } elsif($ctrlParam eq "stopPlayEverywhere") {
+    #stopPlayEverywhere
+    DLNARenderer_destroyCurrentSession($hash, $dev);
+    readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
+  } elsif($ctrlParam eq "addUnit") {
+    #addUnit
+    DLNARenderer_addUnit($hash, $params[0]);
+  } elsif($ctrlParam eq "removeUnit") {
+    #removeUnit
+    DLNARenderer_removeUnitToPlay($hash, $dev, $params[0]);
+    my $multiRoomUnitsReading = "";
+    my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
+    foreach my $unit (@multiRoomUnits) {
+      $multiRoomUnitsReading .= ",".$unit if($unit ne $params[0]);
+    }
+    $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
+    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
+  } elsif($ctrlParam eq "saveGroupAs") {
+    #saveGroupAs
+    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
+  } elsif($ctrlParam eq "enableBTCaskeid") {
+    #enableBTCaskeid
+    DLNARenderer_enableBTCaskeid($hash, $dev);
+  } elsif($ctrlParam eq "disableBTCaskeid") {
+    #disableBTCaskeid
+    DLNARenderer_disableBTCaskeid($hash, $dev);
+  } elsif($ctrlParam eq "off" || $ctrlParam eq "stop" ){
+    #off/stop
+    DLNARenderer_upnpStop($hash);
+  } elsif($ctrlParam eq "loadGroup") {
+    #loadGroup
+    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
+    my $groupName = $params[0];
+    my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
+    return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
     
-    #update list
-    @allDLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
-  }
-  
-  foreach my $DLNARendererHash (@allDLNARenderers) {
-    if($DLNARendererHash->{UDN} eq $dev->UDN()) {
-      #device found, update data
-      $DLNARendererHash->{helper}{device} = $dev;
-      
-      #update device information (FIXME only on change)
-      readingsSingleUpdate($DLNARendererHash, "friendlyName", $dev->friendlyName(), 1);
-      readingsSingleUpdate($DLNARendererHash, "manufacturer", $dev->manufacturer(), 1);
-      readingsSingleUpdate($DLNARendererHash, "modelDescription", $dev->modelDescription(), 1);
-      readingsSingleUpdate($DLNARendererHash, "modelName", $dev->modelName(), 1);
-      readingsSingleUpdate($DLNARendererHash, "modelNumber", $dev->modelNumber(), 1);
-      readingsSingleUpdate($DLNARendererHash, "modelURL", $dev->modelURL(), 1);
-      readingsSingleUpdate($DLNARendererHash, "manufacturerURL", $dev->manufacturerURL(), 1);
-      readingsSingleUpdate($DLNARendererHash, "presentationURL", $dev->presentationURL(), 1);
-      readingsSingleUpdate($DLNARendererHash, "manufacturer", $dev->manufacturer(), 1);
-      
-      #register callbacks
-      #urn:upnp-org:serviceId:AVTransport
-      if($dev->getService("urn:upnp-org:serviceId:AVTransport")) {
-        $DLNARendererHash->{helper}{avTransportSubscription} = $dev->getService("urn:upnp-org:serviceId:AVTransport")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
-      }
-      #urn:upnp-org:serviceId:RenderingControl
-      if($dev->getService("urn:upnp-org:serviceId:RenderingControl")) {
-        $DLNARendererHash->{helper}{renderingControlSubscription} = $dev->getService("urn:upnp-org:serviceId:RenderingControl")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
-      }
-      #urn:pure-com:serviceId:SpeakerManagement
-      if($dev->getService("urn:pure-com:serviceId:SpeakerManagement")) {
-        $DLNARendererHash->{helper}{speakerManagementSubscription} = $dev->getService("urn:pure-com:serviceId:SpeakerManagement")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); }, 5);
-      }
-      
-      #set online
-      readingsSingleUpdate($DLNARendererHash,"presence","online",1);
-      if(ReadingsVal($DLNARendererHash->{NAME}, "state", "") eq "offline") {
-        readingsSingleUpdate($DLNARendererHash,"state","online",1);
-      }
-      
-      #check caskeid
-      if($dev->getService('urn:pure-com:serviceId:SessionManagement')) {
-        $DLNARendererHash->{helper}{caskeid} = 1;
-        readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","1",1);
+    #create new session and add each group member
+    my @groupMembersArray = split(",", $groupMembers);
+    DLNARenderer_destroyCurrentSession($hash, $dev);
+    my $leftSpeaker;
+    my $rightSpeaker;
+    foreach my $member (@groupMembersArray) {
+      if($member =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
+        $rightSpeaker = $1;
+      } elsif($member =~ /^L:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
+        $leftSpeaker = $1;
       } else {
-        readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","0",1);
+        DLNARenderer_addUnit($hash, $member);
       }
-      
-      #update list of caskeid clients
-      my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
-      $DLNARendererHash->{helper}{caskeidClients} = "";
-      foreach my $client (@caskeidClients) {
-        #do not add myself
-        if($client->{UDN} ne $DLNARendererHash->{UDN}) {
-          $DLNARendererHash->{helper}{caskeidClients} .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
-        }
-      }
-      $DLNARendererHash->{helper}{caskeidClients} = substr($DLNARendererHash->{helper}{caskeidClients}, 1) if($DLNARendererHash->{helper}{caskeidClients} ne "");
     }
+    DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
+  } elsif($ctrlParam eq "on") {
+    #on = play last stream
+    if (defined($hash->{READINGS}{stream})) {
+      my $lastStream = $hash->{READINGS}{stream}{VAL};
+      if ($lastStream) {
+        $streamURI = $lastStream;
+        BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+      }
+    }
+  } elsif ($ctrlParam eq "stream") {
+    #stream = set stream URI and play
+    $streamURI = $params[0];
+    BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+  } else {
+      if($hash->{helper}{caskeid}) {
+        return SetExtensions($hash, $caskeidCommandList." ".$stdCommandList, $name, $ctrlParam, @params);       
+      } else {
+        return SetExtensions($hash, $stdCommandList, $name, $ctrlParam, @params);
+      }
   }
   
   return undef;
 }
 
-sub DLNARenderer_getMainDLNARenderer($) {
-  my ($hash) = @_;
-    
-  foreach my $fhem_dev (sort keys %main::defs) { 
-    return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq "0");
-  }
-		
-  return undef;
-}
-
-sub DLNARenderer_getHashByUDN($$) {
-  my ($hash, $udn) = @_;
-  
-  foreach my $fhem_dev (sort keys %main::defs) { 
-    return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq $udn);
-  }
-		
-  return undef;
-}
-
-sub DLNARenderer_getAllDLNARenderers($) {
-  my ($hash) = @_;
-  my @DLNARenderers = ();
-    
-  foreach my $fhem_dev (sort keys %main::defs) { 
-    push @DLNARenderers, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} ne "0");
-  }
-		
-  return @DLNARenderers;
-}
-
-sub DLNARenderer_getAllDLNARenderersWithCaskeid($) {
-  my ($hash) = @_;
-  my @caskeidClients = ();
-  
-  my @DLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
-  foreach my $DLNARenderer (@DLNARenderers) {
-    push @caskeidClients, $DLNARenderer if($DLNARenderer->{helper}{caskeid});
-  }
-  
-  return @caskeidClients;
-}
-
-###################################
+##############################
+##### SET FUNCTIONS ##########
+##############################
+#TODO move everything from _Set to set functions
 sub DLNARenderer_setAVTransportURIBlocking($) {
   my ($string) = @_;
   my ($name, $streamURI) = split("\\|", $string);
@@ -605,7 +376,7 @@ sub DLNARenderer_finishedSetAVTransportURIBlocking($) {
   
   return undef;
 }
-###################################
+
 sub DLNARenderer_play($) {
   my ($hash) = @_;
   
@@ -619,6 +390,10 @@ sub DLNARenderer_play($) {
   return undef;
 }
 
+###########################
+##### CASKEID #############
+###########################
+# BTCaskeid
 sub DLNARenderer_enableBTCaskeid {
   my ($hash, $dev) = @_;
   DLNARenderer_upnpAddUnitToGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth");
@@ -629,17 +404,7 @@ sub DLNARenderer_disableBTCaskeid {
   DLNARenderer_upnpRemoveUnitFromGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66");
 }
 
-### DLNA SpeakerManagement ###
-sub DLNARenderer_upnpAddUnitToGroup {
-  my ($hash, $dev, $unit, $name) = @_;
-  return DLNARenderer_upnpCallSpeakerManagement($hash, "AddUnitToGroup", $unit, $name, "");
-}
-
-sub DLNARenderer_upnpRemoveUnitFromGroup {
-  my ($hash, $dev, $unit) = @_;
-  return DLNARenderer_upnpCallSpeakerManagement($hash, "RemoveUnitToGroup", $unit);
-}
-
+# Stereo Mode
 sub DLNARenderer_setStereoMode {
   my ($hash, $leftSpeaker, $rightSpeaker, $name) = @_;
   
@@ -659,6 +424,21 @@ sub DLNARenderer_setStereoMode {
   readingsSingleUpdate($hash, "stereoDevices", "R:$rightSpeaker,L:$leftSpeaker", 1);
   
   return undef;
+}
+
+sub DLNARenderer_setMultiChannelSpeaker {
+  my ($hash, $mode, $uuid, $name) = @_;
+  my $uuidStr;
+  
+  if($mode eq "standalone") {
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STANDALONE", "", "", "STANDALONE_SPEAKER");
+  } elsif($mode eq "left") {
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "LEFT_FRONT");
+  } elsif($mode eq "right") {
+    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "RIGHT_FRONT");
+  }
+  
+  return undef;  
 }
 
 sub DLNARenderer_setStandaloneMode {
@@ -697,22 +477,33 @@ sub DLNARenderer_createUuid {
   return $uuidStr;
 }
 
-sub DLNARenderer_setMultiChannelSpeaker {
-  my ($hash, $mode, $uuid, $name) = @_;
-  my $uuidStr;
-  
-  if($mode eq "standalone") {
-    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STANDALONE", "", "", "STANDALONE_SPEAKER");
-  } elsif($mode eq "left") {
-    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "LEFT_FRONT");
-  } elsif($mode eq "right") {
-    DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "RIGHT_FRONT");
-  }
-  
-  return undef;  
+# SessionManagement
+sub DLNARenderer_createSession {
+  my ($hash, $dev) = @_;
+  return DLNARenderer_upnpCreateSession($hash, "FHEM_Session")->getValue("SessionID");
 }
 
-### DLNA SessionManagement ###
+sub DLNARenderer_getSession {
+  my ($hash, $dev) = @_;
+  return DLNARenderer_upnpGetSession($hash)->getValue("SessionID");
+}
+
+sub DLNARenderer_destroySession {
+  my ($hash, $dev, $session) = @_;
+  
+  return DLNARenderer_upnpDestroySession($hash, $session);
+}
+
+sub DLNARenderer_destroyCurrentSession {
+  my ($hash, $dev) = @_;
+  
+  my $session = DLNARenderer_getSession($hash, $dev);
+  
+  if($session ne "") {
+    DLNARenderer_destroySession($hash, $dev, $session);
+  }
+}
+
 sub DLNARenderer_addUnitToPlay {
   my ($hash, $dev, $unit) = @_;
   
@@ -735,26 +526,6 @@ sub DLNARenderer_removeUnitToPlay {
   }
 }
 
-sub DLNARenderer_destroyCurrentSession {
-  my ($hash, $dev) = @_;
-  
-  my $session = DLNARenderer_getSession($hash, $dev);
-  
-  if($session ne "") {
-    DLNARenderer_destroySession($hash, $dev, $session);
-  }
-}
-
-sub DLNARenderer_createSession {
-  my ($hash, $dev) = @_;
-  return DLNARenderer_upnpCreateSession($hash, "FHEM_Session")->getValue("SessionID");
-}
-
-sub DLNARenderer_getSession {
-  my ($hash, $dev) = @_;
-  return DLNARenderer_upnpGetSession($hash)->getValue("SessionID");
-}
-
 sub DLNARenderer_addUnitToSession {
   my ($hash, $dev, $uuid, $session) = @_;
   
@@ -767,12 +538,7 @@ sub DLNARenderer_removeUnitFromSession {
   return DLNARenderer_upnpRemoveUnitFromSession($hash, $session, $uuid);
 }
 
-sub DLNARenderer_destroySession {
-  my ($hash, $dev, $session) = @_;
-  
-  return DLNARenderer_upnpDestroySession($hash, $session);
-}
-
+# Group Definitions
 sub DLNARenderer_getGroupDefinition {
   #used for ... play Bad ...
   my ($hash, $groupName) = @_;
@@ -809,263 +575,6 @@ sub DLNARenderer_saveGroupAs {
     
   #save current session as group
   CommandAttr(undef, "$hash->{NAME} multiRoomGroups $groupDefinition");
-  
-  return undef;
-}
-
-###################################
-sub DLNARenderer_Define($$) {
-  my ($hash, $def) = @_;
-  my @param = split("[ \t][ \t]*", $def);
-  
-  #init caskeid clients for multiroom
-  $hash->{helper}{caskeidClients} = "";
-  $hash->{helper}{caskeid} = 0;
-  
-  if(@param < 3) {
-    #main
-    $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA4";
-    $hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
-    DLNARenderer_doDlnaSearch($hash);
-    DLNARenderer_handleControlpoint($hash);
-    readingsSingleUpdate($hash,"state","initialized",1);
-    return undef;
-  }
-  
-  #device specific
-  my $name     = shift @param;
-  my $type     = shift @param;
-  my $udn      = shift @param;
-  $hash->{UDN} = $udn;
-  
-  readingsSingleUpdate($hash,"presence","offline",1);
-  readingsSingleUpdate($hash,"state","initialized",1);
-  
-  InternalTimer(gettimeofday() + 200, 'DLNARenderer_renewSubscriptions', $hash, 0);
-  
-  return undef;
-}
-
-###################################
-sub DLNARenderer_Undef($) {
-  my ($hash) = @_;
-  
-  RemoveInternalTimer($hash);
-  return undef;
-}
-###################################
-sub DLNARenderer_Set($@) {
-  my ($hash, $name, @params) = @_;
-  my $dev = $hash->{helper}{device};
-  my $streamURI = "";
-  
-  # check parameters
-  return "no set value specified" if(int(@params) < 1);
-  my $ctrlParam = shift(@params);
-  
-  my $stdCommandList = "on:noArg off:noArg play:noArg stop:noArg stream pause:noArg pauseToggle:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
-  my $caskeidCommandList = "addUnit:".$hash->{helper}{caskeidClients}." ".
-                           "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
-                           "playEverywhere:noArg stopPlayEverywhere:noArg ".
-                           "enableBTCaskeid:noArg disableBTCaskeid:noArg ".
-                           "saveGroupAs loadGroup ".
-                           "stereo standalone:noArg";
-  
-  # check device presence
-  if (!defined($dev) or ReadingsVal($hash->{NAME}, "presence", "") eq "offline") {
-    return "DLNARenderer: Currently searching for device...";
-  }
-  
-  # set volume
-  if($ctrlParam eq "volume"){
-    return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
-    DLNARenderer_upnpSetVolume($hash, $params[0]);
-    readingsSingleUpdate($hash, "volume", $params[0], 1);
-    return undef;
-  }
-  
-  #pause
-  if($ctrlParam eq "pause") {
-    DLNARenderer_upnpPause($hash);
-    return undef;
-  }
-  
-  #pauseToggle
-  if($ctrlParam eq "pauseToggle") {
-    if($hash->{READINGS}{state} eq "paused") {
-        DLNARenderer_play($hash);
-    } else {
-        DLNARenderer_upnpPause($hash);
-    }
-    return undef;
-  }
-  
-  #play
-  if($ctrlParam eq "play") {
-    DLNARenderer_play($hash);
-    return undef;
-  }
-  
-  #next
-  if($ctrlParam eq "next") {
-    DLNARenderer_upnpNext($hash);
-    return undef;
-  }
-  
-  #previous
-  if($ctrlParam eq "previous") {
-    DLNARenderer_upnpPrevious($hash);
-    return undef;
-  }
-  
-  #seek
-  if($ctrlParam eq "seek") {
-    DLNARenderer_upnpSeek($hash, $params[0]);
-    return undef;
-  }
-  
-  #TODO set multiRoomVolume
-  if($ctrlParam eq "multiRoomVolume"){
-    return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
-    #handle volume for all devices in the current group
-    #iterate through group and change volume relative to the current volume
-    my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $params[0];
-    #get grouped devices
-      #set volume for each device
-    #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
-    #readingsSingleUpdate($hash, "volume", $params[1], 1);
-    return undef;
-  }
-  
-  # stereo mode
-  if($ctrlParam eq "stereo") {
-    DLNARenderer_setStereoMode($hash, $params[0], $params[1], $params[2]);
-    return undef;
-  }
-  
-  # standalone mode
-  if($ctrlParam eq "standalone") {
-    DLNARenderer_setStandaloneMode($hash);
-    return undef;
-  }
-  
-  # playEverywhere
-  if($ctrlParam eq "playEverywhere") {
-    my $multiRoomUnits = "";
-    my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
-    foreach my $client (@caskeidClients) {
-      if($client->{UDN} ne $hash->{UDN}) {
-        DLNARenderer_addUnitToPlay($hash, $dev, substr($client->{UDN},5));
-        $multiRoomUnits .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
-      }
-    }
-    #remove first comma
-    $multiRoomUnits = substr($multiRoomUnits, 1);
-    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
-    return undef;
-  }
-  
-  # stopPlayEverywhere
-  if($ctrlParam eq "stopPlayEverywhere") {
-    DLNARenderer_destroyCurrentSession($hash, $dev);
-    readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
-    return undef;
-  }
-  
-  # addUnit
-  if($ctrlParam eq "addUnit") {
-    return DLNARenderer_addUnit($hash, $params[0]);
-  }
-  
-  # removeUnit
-  if($ctrlParam eq "removeUnit") {
-    DLNARenderer_removeUnitToPlay($hash, $dev, $params[0]);
-    my $multiRoomUnitsReading = "";
-    my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
-    foreach my $unit (@multiRoomUnits) {
-      $multiRoomUnitsReading .= ",".$unit if($unit ne $params[0]);
-    }
-    $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
-    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
-    return undef;
-  }
-  
-  # save group as
-  if($ctrlParam eq "saveGroupAs") {
-    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
-    return undef;
-  }
-  
-  # enableBTCaskeid
-  if($ctrlParam eq "enableBTCaskeid") {
-    DLNARenderer_enableBTCaskeid($hash, $dev);
-    return undef;
-  }
-  
-  # disableBTCaskeid
-  if($ctrlParam eq "disableBTCaskeid") {
-    DLNARenderer_disableBTCaskeid($hash, $dev);
-    return undef;
-  }
- 
-  # off/stop
-  if($ctrlParam eq "off" || $ctrlParam eq "stop" ){
-    DLNARenderer_upnpStop($hash);
-    return undef;
-  }
-  
-  # loadGroup
-  if($ctrlParam eq "loadGroup") {
-    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
-    my $groupName = $params[0];
-    my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
-    return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
-    
-    #create new session and add each group member
-    my @groupMembersArray = split(",", $groupMembers);
-    DLNARenderer_destroyCurrentSession($hash, $dev);
-    my $leftSpeaker;
-    my $rightSpeaker;
-    foreach my $member (@groupMembersArray) {
-      if($member =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-        $rightSpeaker = $1;
-      } elsif($member =~ /^L:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-        $leftSpeaker = $1;
-      } else {
-        DLNARenderer_addUnit($hash, $member);
-      }
-    }
-    DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
-    
-    return undef;
-  }
-  
-  # on (=play last stream)
-  if($ctrlParam eq "on"){
-    if (defined($hash->{READINGS}{stream})) {
-      my $lastStream = $hash->{READINGS}{stream}{VAL};
-      if ($lastStream) {
-        $streamURI = $lastStream;
-        BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
-        return undef;
-      }
-    }
-    return "DLNARenderer: No last stream defined.";
-  }
-  
-  # set streamURI and play
-  if ($ctrlParam eq "stream") {
-    $streamURI = $params[0];
-    BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
-    return undef;
-  }
-  
-  if($hash->{helper}{caskeid}) {
-    return SetExtensions($hash, $caskeidCommandList." ".$stdCommandList, $name, $ctrlParam, @params);       
-  } else {
-    return SetExtensions($hash, $stdCommandList, $name, $ctrlParam, @params);
-  }
   
   return undef;
 }
@@ -1178,6 +687,16 @@ sub DLNARenderer_upnpGetSession {
   return DLNARenderer_upnpCallSessionManagement($hash, "GetSession");
 }
 
+sub DLNARenderer_upnpAddUnitToGroup {
+  my ($hash, $dev, $unit, $name) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "AddUnitToGroup", $unit, $name, "");
+}
+
+sub DLNARenderer_upnpRemoveUnitFromGroup {
+  my ($hash, $dev, $unit) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "RemoveUnitToGroup", $unit);
+}
+
 sub DLNARenderer_upnpCallSessionManagement {
   my ($hash, $method, @args) = @_;
   return DLNARenderer_upnpCall($hash, 'urn:pure-com:serviceId:SessionManagement', $method, @args);
@@ -1207,6 +726,502 @@ sub DLNARenderer_upnpCall {
     Log3 $hash, 3, "DLNARenderer: $service, $method(".join(",",@args).") failed, $@";
     return "DLNARenderer: $method failed.";
   }
+}
+
+##############################
+####### EVENT HANDLING #######
+##############################
+sub DLNARenderer_processEventXml {
+  my ($hash, $property, $xml) = @_;
+
+  Log3 $hash, 4, "DLNARenderer: ".Dumper($xml);
+  
+  if($property eq "LastChange") {
+    if($xml->{Event}) {
+      if($xml->{Event}{xmlns} eq "urn:schemas-upnp-org:metadata-1-0/AVT/") {
+        #process AV Transport
+        my $e = $xml->{Event}{InstanceID};
+        #DLNARenderer_updateReadingByEvent($hash, "NumberOfTracks", $e->{NumberOfTracks});
+        DLNARenderer_updateReadingByEvent($hash, "transportState", $e->{TransportState});
+        DLNARenderer_updateReadingByEvent($hash, "transportStatus", $e->{TransportStatus});
+        #DLNARenderer_updateReadingByEvent($hash, "TransportPlaySpeed", $e->{TransportPlaySpeed});
+        #DLNARenderer_updateReadingByEvent($hash, "PlaybackStorageMedium", $e->{PlaybackStorageMedium});
+        #DLNARenderer_updateReadingByEvent($hash, "RecordStorageMedium", $e->{RecordStorageMedium});
+        #DLNARenderer_updateReadingByEvent($hash, "RecordMediumWriteStatus", $e->{RecordMediumWriteStatus});
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentRecordQualityMode", $e->{CurrentRecordQualityMode});
+        #DLNARenderer_updateReadingByEvent($hash, "PossibleRecordQualityMode", $e->{PossibleRecordQualityMode});
+        DLNARenderer_updateReadingByEvent($hash, "currentTrackURI", $e->{CurrentTrackURI});
+        #DLNARenderer_updateReadingByEvent($hash, "AVTransportURI", $e->{AVTransportURI});
+        DLNARenderer_updateReadingByEvent($hash, "nextAVTransportURI", $e->{NextAVTransportURI});
+        #DLNARenderer_updateReadingByEvent($hash, "RelativeTimePosition", $e->{RelativeTimePosition});
+        #DLNARenderer_updateReadingByEvent($hash, "AbsoluteTimePosition", $e->{AbsoluteTimePosition});
+        #DLNARenderer_updateReadingByEvent($hash, "RelativeCounterPosition", $e->{RelativeCounterPosition});
+        #DLNARenderer_updateReadingByEvent($hash, "AbsoluteCounterPosition", $e->{AbsoluteCounterPosition});
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrack", $e->{CurrentTrack});
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentMediaDuration", $e->{CurrentMediaDuration});
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrackDuration", $e->{CurrentTrackDuration});
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentPlayMode", $e->{CurrentPlayMode});
+        #handle metadata
+        #DLNARenderer_updateReadingByEvent($hash, "AVTransportURIMetaData", $e->{AVTransportURIMetaData});
+        #DLNARenderer_updateMetaData($hash, "current", $e->{AVTransportURIMetaData});
+        #DLNARenderer_updateReadingByEvent($hash, "NextAVTransportURIMetaData", $e->{NextAVTransportURIMetaData});
+        DLNARenderer_updateMetaData($hash, "next", $e->{NextAVTransportURIMetaData});
+        #use only CurrentTrackMetaData instead of AVTransportURIMetaData
+        #DLNARenderer_updateReadingByEvent($hash, "CurrentTrackMetaData", $e->{CurrentTrackMetaData});
+        DLNARenderer_updateMetaData($hash, "current", $e->{CurrentTrackMetaData});
+        
+        #update state
+        my $transportState = ReadingsVal($hash->{NAME}, "transportState", "");
+        if(ReadingsVal($hash->{NAME}, "presence", "") ne "offline") {
+          if($transportState eq "PAUSED_PLAYBACK") {
+              readingsSingleUpdate($hash, "state", "paused", 1);
+          } elsif($transportState eq "PLAYING") {
+              readingsSingleUpdate($hash, "state", "playing", 1);
+          } elsif($transportState eq "TRANSITIONING") {
+              readingsSingleUpdate($hash, "state", "buffering", 1);
+          } elsif($transportState eq "STOPPED") {
+              readingsSingleUpdate($hash, "state", "stopped", 1);
+          } elsif($transportState eq "NO_MEDIA_PRESENT") {
+              readingsSingleUpdate($hash, "state", "online", 1);
+          }
+        }
+      } elsif ($xml->{Event}{xmlns} eq "urn:schemas-upnp-org:metadata-1-0/RCS/") {
+        #process RenderingControl
+        my $e = $xml->{Event}{InstanceID};
+        DLNARenderer_updateVolumeByEvent($hash, "mute", $e->{Mute});
+        DLNARenderer_updateVolumeByEvent($hash, "volume", $e->{Volume});
+      } elsif ($xml->{Event}{xmlns} eq "FIXME SpeakerManagement") {
+        #process SpeakerManagement
+      }
+    }
+  } elsif($property eq "Groups") {
+    #handle BTCaskeid
+    my $btCaskeidState = 0;
+    foreach my $group (@{$xml->{groups}{group}}) {
+      #"4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth"
+      if($group->{id} eq "4DAA44C0-8291-11E3-BAA7-0800200C9A66") {
+        $btCaskeidState = 1;
+      }
+    }
+    #TODO update only if changed
+    readingsSingleUpdate($hash, "btCaskeid", $btCaskeidState, 1);
+  } elsif($property eq "SessionID") {
+    #TODO search for other speakers with same sessionId and add them to multiRoomUnits
+    readingsSingleUpdate($hash, "sessionId", $xml, 1);
+  }
+  
+  return undef;
+}
+
+sub DLNARenderer_updateReadingByEvent {
+  my ($hash, $readingName, $xmlEvent) = @_;
+  
+  my $currVal = ReadingsVal($hash->{NAME}, $readingName, "");
+  
+  if($xmlEvent) {
+    Log3 $hash, 4, "DLNARenderer: Update reading $readingName with ".$xmlEvent->{val};
+    my $val = $xmlEvent->{val};
+    $val = "" if(ref $val eq ref {});
+    if($val ne $currVal) {
+      readingsSingleUpdate($hash, $readingName, $val, 1);
+    }
+  }
+  
+  return undef;
+}
+
+sub DLNARenderer_updateVolumeByEvent {
+  my ($hash, $readingName, $volume) = @_;
+  my $balance = 0;
+  my $balanceSupport = 0;
+  
+  foreach my $vol (@{$volume}) {
+    my $channel = $vol->{Channel} ? $vol->{Channel} : $vol->{channel};
+    if($channel) {
+      if($channel eq "Master") {
+        DLNARenderer_updateReadingByEvent($hash, $readingName, $vol);
+      } elsif($channel eq "LF") {
+        $balance -= $vol->{val};
+        $balanceSupport = 1;
+      } elsif($channel eq "RF") {
+        $balance += $vol->{val};
+        $balanceSupport = 1;
+      }
+    } else {
+      DLNARenderer_updateReadingByEvent($hash, $readingName, $vol);
+    }
+  }
+  
+  if($readingName eq "volume" && $balanceSupport == 1) {
+    readingsSingleUpdate($hash, "balance", $balance, 1);
+  }
+  
+  return undef;
+}
+
+sub DLNARenderer_updateMetaData {
+  my ($hash, $prefix, $metaData) = @_;
+  my $metaDataAvailable = 0;
+
+  $metaDataAvailable = 1 if(defined($metaData) && $metaData->{val} && $metaData->{val} ne "");
+  
+  if($metaDataAvailable) {
+    my $xml;
+    if($metaData->{val} eq "NOT_IMPLEMENTED") {
+      readingsSingleUpdate($hash, $prefix."Title", "", 1);
+      readingsSingleUpdate($hash, $prefix."Artist", "", 1);
+      readingsSingleUpdate($hash, $prefix."Album", "", 1);
+      readingsSingleUpdate($hash, $prefix."AlbumArtist", "", 1);
+      readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
+      readingsSingleUpdate($hash, $prefix."OriginalTrackNumber", "", 1);
+      readingsSingleUpdate($hash, $prefix."Duration", "", 1);
+    } else {
+      eval {
+        $xml = XMLin($metaData->{val}, KeepRoot => 1, ForceArray => [], KeyAttr => []);
+        Log3 $hash, 4, "DLNARenderer: MetaData: ".Dumper($xml);
+      };
+
+      if(!$@) {
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Title", $xml->{"DIDL-Lite"}{item}{"dc:title"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Artist", $xml->{"DIDL-Lite"}{item}{"dc:creator"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."Album", $xml->{"DIDL-Lite"}{item}{"upnp:album"});
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtist", $xml->{"DIDL-Lite"}{item}{"r:albumArtist"});
+        if($xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"}) {
+          DLNARenderer_updateMetaDataItemPart($hash, $prefix."AlbumArtURI", $xml->{"DIDL-Lite"}{item}{"upnp:albumArtURI"});
+        } else {
+          readingsSingleUpdate($hash, $prefix."AlbumArtURI", "", 1);
+        }
+        DLNARenderer_updateMetaDataItemPart($hash, $prefix."OriginalTrackNumber", $xml->{"DIDL-Lite"}{item}{"upnp:originalTrackNumber"});
+        if($xml->{"DIDL-Lite"}{item}{res}) {
+          DLNARenderer_updateMetaDataItemPart($hash, $prefix."Duration", $xml->{"DIDL-Lite"}{item}{res}{duration});
+        } else {
+          readingsSingleUpdate($hash, $prefix."Duration", "", 1);
+        }
+      } else {
+        Log3 $hash, 1, "DLNARenderer: XML parsing error: ".$@;
+      }
+    }
+  }
+
+  return undef;
+}
+
+sub DLNARenderer_updateMetaDataItemPart {
+  my ($hash, $readingName, $item) = @_;
+
+  my $currVal = ReadingsVal($hash->{NAME}, $readingName, "");
+  if($item) {
+    $item = "" if(ref $item eq ref {});
+    if($currVal ne $item) {
+      readingsSingleUpdate($hash, $readingName, $item, 1);
+    }
+  }
+  
+  return undef;
+}
+
+##############################
+####### DISCOVERY ############
+##############################
+sub DLNARenderer_handleControlpoint {
+  my ($hash) = @_;
+  
+  eval {
+    my $cp = $hash->{helper}{controlpoint};
+    my @sockets = $cp->sockets();
+    my $select = IO::Select->new(@sockets);
+    my @sock = $select->can_read(1);
+    foreach my $s (@sock) {
+      $cp->handleOnce($s);
+    }
+  };
+  my $error = $@;
+  
+  if($error) {
+    #setup a new controlpoint on error
+    #undef($hash->{helper}{controlpoint});
+    Log3 $hash, 3, "DLNARenderer: Create new controlpoint due to error, $error";
+    #$hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
+  }
+  
+  InternalTimer(gettimeofday() + 1, 'DLNARenderer_handleControlpoint', $hash, 0);
+  
+  return undef;
+}
+
+sub DLNARenderer_setupControlpoint {
+  my ($hash) = @_;
+  my %empty = ();
+  my $error;
+  my $cp;
+  
+  do {
+    eval {
+      $cp = UPnP::ControlPoint->new(SearchPort => 0, SubscriptionPort => 0, MaxWait => 30, UsedOnlyIP => \%empty, IgnoreIP => \%empty);
+    };
+    $error = $@;
+  } while($error);
+  
+  return $cp;
+}
+
+sub DLNARenderer_doDlnaSearch {
+  my ($hash) = @_;
+
+  #research every 30 minutes
+  InternalTimer(gettimeofday() + 1800, 'DLNARenderer_doDlnaSearch', $hash, 0);
+
+  eval {
+    $hash->{helper}{controlpoint}->searchByType('urn:schemas-upnp-org:device:MediaRenderer:1', sub { DLNARenderer_discoverCallback($hash, @_); });
+  };
+  if($@) {
+    Log3 $hash, 2, "DLNARenderer: Search failed with error $@";
+  }
+  return undef;
+}
+
+sub DLNARenderer_discoverCallback {
+  my ($hash, $search, $device, $action) = @_;
+  
+  Log3 $hash, 4, "DLNARenderer: $action, ".$device->friendlyName();
+
+  if($action eq "deviceAdded") {
+    DLNARenderer_addedDevice($hash, $device);
+  } elsif($action eq "deviceRemoved") {
+    DLNARenderer_removedDevice($hash, $device);
+  }
+  return undef;
+}
+
+sub DLNARenderer_subscriptionCallback {
+  my ($hash, $service, %properties) = @_;
+  
+  Log3 $hash, 4, "DLNARenderer: Received event: ".Dumper(%properties);
+  
+  foreach my $property (keys %properties) {
+    
+    $properties{$property} = decode_entities($properties{$property});
+    
+    my $xml;
+    eval {
+      if($properties{$property} =~ /xml/) {
+        $xml = XMLin($properties{$property}, KeepRoot => 1, ForceArray => [qw(Volume Mute Loudness VolumeDB group)], KeyAttr => []);
+      } else {
+        $xml = $properties{$property};
+      }
+    };
+    
+    if($@) {
+      Log3 $hash, 2, "DLNARenderer: XML formatting error: ".$@.", ".$properties{$property};
+      next;
+    }
+    
+    DLNARenderer_processEventXml($hash, $property, $xml);
+  }
+  
+  return undef;
+}
+
+sub DLNARenderer_renewSubscriptions {
+  my ($hash) = @_;
+  my $dev = $hash->{helper}{device};
+  
+  InternalTimer(gettimeofday() + 200, 'DLNARenderer_renewSubscriptions', $hash, 0);
+  
+  return undef if(!defined($dev));
+  
+  #register callbacks
+  #urn:upnp-org:serviceId:AVTransport
+  eval {
+    if(defined($hash->{helper}{avTransportSubscription})) {
+      $hash->{helper}{avTransportSubscription}->renew();
+    }
+  };
+  
+  #urn:upnp-org:serviceId:RenderingControl
+  eval {
+    if(defined($hash->{helper}{renderingControlSubscription})) {
+      $hash->{helper}{renderingControlSubscription}->renew();
+    }
+  };
+  
+  #urn:pure-com:serviceId:SpeakerManagement
+  eval {
+    if(defined($hash->{helper}{speakerManagementSubscription})) {
+      $hash->{helper}{speakerManagementSubscription}->renew();
+    }
+  };
+  
+  return undef;
+}
+
+sub DLNARenderer_addedDevice {
+  my ($hash, $dev) = @_;
+  
+  my $udn = $dev->UDN();
+
+  #TODO check for BOSE UDN
+
+  #ignoreUDNs
+  return undef if(AttrVal($hash->{NAME}, "ignoreUDNs", "") =~ /$udn/);
+    
+  my $foundDevice = 0;
+  my @allDLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
+  foreach my $DLNARendererHash (@allDLNARenderers) {
+    if($DLNARendererHash->{UDN} eq $dev->UDN()) {
+      $foundDevice = 1;
+    }
+  }
+
+  if(!$foundDevice) {
+    my $uniqueDeviceName = "DLNA_".substr($dev->UDN(),29,12);
+    CommandDefine(undef, "$uniqueDeviceName DLNARenderer ".$dev->UDN());
+    CommandAttr(undef,"$uniqueDeviceName alias ".$dev->friendlyName());
+    CommandAttr(undef,"$uniqueDeviceName webCmd volume");
+    Log3 $hash, 3, "DLNARenderer: Created device $uniqueDeviceName for ".$dev->friendlyName();
+    
+    #update list
+    @allDLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
+  }
+  
+  foreach my $DLNARendererHash (@allDLNARenderers) {
+    if($DLNARendererHash->{UDN} eq $dev->UDN()) {
+      #device found, update data
+      $DLNARendererHash->{helper}{device} = $dev;
+      
+      #update device information (FIXME only on change)
+      readingsSingleUpdate($DLNARendererHash, "friendlyName", $dev->friendlyName(), 1);
+      readingsSingleUpdate($DLNARendererHash, "manufacturer", $dev->manufacturer(), 1);
+      readingsSingleUpdate($DLNARendererHash, "modelDescription", $dev->modelDescription(), 1);
+      readingsSingleUpdate($DLNARendererHash, "modelName", $dev->modelName(), 1);
+      readingsSingleUpdate($DLNARendererHash, "modelNumber", $dev->modelNumber(), 1);
+      readingsSingleUpdate($DLNARendererHash, "modelURL", $dev->modelURL(), 1);
+      readingsSingleUpdate($DLNARendererHash, "manufacturerURL", $dev->manufacturerURL(), 1);
+      readingsSingleUpdate($DLNARendererHash, "presentationURL", $dev->presentationURL(), 1);
+      readingsSingleUpdate($DLNARendererHash, "manufacturer", $dev->manufacturer(), 1);
+      
+      #register callbacks
+      #urn:upnp-org:serviceId:AVTransport
+      if($dev->getService("urn:upnp-org:serviceId:AVTransport")) {
+        $DLNARendererHash->{helper}{avTransportSubscription} = $dev->getService("urn:upnp-org:serviceId:AVTransport")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+      }
+      #urn:upnp-org:serviceId:RenderingControl
+      if($dev->getService("urn:upnp-org:serviceId:RenderingControl")) {
+        $DLNARendererHash->{helper}{renderingControlSubscription} = $dev->getService("urn:upnp-org:serviceId:RenderingControl")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+      }
+      #urn:pure-com:serviceId:SpeakerManagement
+      if($dev->getService("urn:pure-com:serviceId:SpeakerManagement")) {
+        $DLNARendererHash->{helper}{speakerManagementSubscription} = $dev->getService("urn:pure-com:serviceId:SpeakerManagement")->subscribe(sub { DLNARenderer_subscriptionCallback($DLNARendererHash, @_); });
+      }
+      
+      #set online
+      readingsSingleUpdate($DLNARendererHash,"presence","online",1);
+      if(ReadingsVal($DLNARendererHash->{NAME}, "state", "") eq "offline") {
+        readingsSingleUpdate($DLNARendererHash,"state","online",1);
+      }
+      
+      #check caskeid
+      if($dev->getService('urn:pure-com:serviceId:SessionManagement')) {
+        $DLNARendererHash->{helper}{caskeid} = 1;
+        readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","1",1);
+      } else {
+        readingsSingleUpdate($DLNARendererHash,"multiRoomSupport","0",1);
+      }
+      
+      #update list of caskeid clients
+      my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
+      $DLNARendererHash->{helper}{caskeidClients} = "";
+      foreach my $client (@caskeidClients) {
+        #do not add myself
+        if($client->{UDN} ne $DLNARendererHash->{UDN}) {
+          $DLNARendererHash->{helper}{caskeidClients} .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
+        }
+      }
+      $DLNARendererHash->{helper}{caskeidClients} = substr($DLNARendererHash->{helper}{caskeidClients}, 1) if($DLNARendererHash->{helper}{caskeidClients} ne "");
+    }
+  }
+  
+  return undef;
+}
+
+sub DLNARenderer_removedDevice($$) {
+  my ($hash, $device) = @_;
+  my $deviceHash = DLNARenderer_getHashByUDN($hash, $device->UDN());
+  
+  readingsSingleUpdate($deviceHash, "presence", "offline", 1);
+  readingsSingleUpdate($deviceHash, "state", "offline", 1);
+}
+
+###############################
+##### GET PLAYER FUNCTIONS ####
+###############################
+sub DLNARenderer_getMainDLNARenderer($) {
+  my ($hash) = @_;
+    
+  foreach my $fhem_dev (sort keys %main::defs) { 
+    return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq "0");
+  }
+		
+  return undef;
+}
+
+sub DLNARenderer_getHashByUDN($$) {
+  my ($hash, $udn) = @_;
+  
+  foreach my $fhem_dev (sort keys %main::defs) { 
+    return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq $udn);
+  }
+		
+  return undef;
+}
+
+sub DLNARenderer_getAllDLNARenderers($) {
+  my ($hash) = @_;
+  my @DLNARenderers = ();
+    
+  foreach my $fhem_dev (sort keys %main::defs) { 
+    push @DLNARenderers, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} ne "0");
+  }
+		
+  return @DLNARenderers;
+}
+
+sub DLNARenderer_getAllDLNARenderersWithCaskeid($) {
+  my ($hash) = @_;
+  my @caskeidClients = ();
+  
+  my @DLNARenderers = DLNARenderer_getAllDLNARenderers($hash);
+  foreach my $DLNARenderer (@DLNARenderers) {
+    push @caskeidClients, $DLNARenderer if($DLNARenderer->{helper}{caskeid});
+  }
+  
+  return @caskeidClients;
+}
+
+###############################
+###### UTILITY FUNCTIONS ######
+###############################
+sub DLNARenderer_newChash($$$)
+{
+  my ($hash,$socket,$chash) = @_;
+
+  $chash->{TYPE}  = $hash->{TYPE};
+
+  $chash->{NR}    = $devcount++;
+
+  $chash->{phash} = $hash;
+  $chash->{PNAME} = $hash->{NAME};
+
+  $chash->{CD}    = $socket;
+  $chash->{FD}    = $socket->fileno();
+
+  $chash->{PORT}  = $socket->sockport if( $socket->sockport );
+
+  $chash->{TEMPORARY} = 1;
+  $attr{$chash->{NAME}}{room} = 'hidden';
+
+  $defs{$chash->{NAME}}       = $chash;
+  $selectlist{$chash->{NAME}} = $chash;
 }
 
 1;
