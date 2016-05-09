@@ -6,25 +6,25 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.3
+# Version: 1.5.4
 #
 #############################################################
 #
 # v1.5.4 - 201605XX
-#  - FEATURE: restore volume when speaker goes online
+# - FEATURE: restore volume when speaker goes online
 #             allows to power off the box completely without loosing
 #             previous volume settings
-#
+# - BUGFIX: fix possible unitialized value
 #
 # v1.5.3 - 20160425
-#  - FEATURE: support static IPs (should only be used if device can't be discovered)
+# - FEATURE: support static IPs (should only be used if device can't be discovered)
 #             attr bose_system staticIPs 192.168.1.52,192.168.1.53
-#  - FEATURE: support speak channel name (useful for SoundTouch w/o display)
+# - FEATURE: support speak channel name (useful for SoundTouch w/o display)
 #             attr <name> speakChannel 1-6
 #             attr <name> speakChannel 2,3,5,6
-#  - BUGFIX: retry websocket setup every 5s if it fails
-#  - BUGFIX: update supportClockDisplay reading only on reconnect
-#  - CHANGE: remove user attr from main device
+# - BUGFIX: retry websocket setup every 5s if it fails
+# - BUGFIX: update supportClockDisplay reading only on reconnect
+# - CHANGE: remove user attr from main device
 #
 # v1.5.2 - 20160403
 #  - FEATURE: support clock display (SoundTouch 20/30)
@@ -281,7 +281,7 @@ sub BOSEST_Define($$) {
     $hash->{helper}{supportedBassCmds} = "";
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.3";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.4";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
         
@@ -1334,6 +1334,9 @@ sub BOSEST_parseAndUpdateChannel($$) {
         BOSEST_XMLUpdate($hash, "channel", $preset->{id});
     } else {
         BOSEST_XMLUpdate($hash, "channel", "");
+        $preset->{ContentItem}->{itemName} = "" if(!defined($preset->{ContentItem}->{itemName}));
+        $preset->{ContentItem}->{location} = "" if(!defined($preset->{ContentItem}->{location}));
+        $preset->{ContentItem}->{source} = "" if(!defined($preset->{ContentItem}->{source}));
         $preset->{ContentItem}->{sourceAccount} = "" if(!defined($preset->{ContentItem}->{sourceAccount}));
         
         my $channelString = $preset->{ContentItem}->{itemName}."|".$preset->{ContentItem}->{location}."|".

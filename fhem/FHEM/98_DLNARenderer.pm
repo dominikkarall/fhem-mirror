@@ -1,13 +1,16 @@
 ############################################################################
-# 2016-05-04, v2.0.0 BETA4, dominik.karall@gmail.com $
+# 2016-05-09, v2.0.0 RC1, dominik.karall@gmail.com $
 #
-# v2.0.0 BEAT4 - 201605XX
+# v2.0.0 RC1 - 20160509
 # - CHANGE: change state to offline/playing/stopped/paused/online
 # - CHANGE: removed on/off devstateicon on creation due to changed state values
 # - CHANGE: play is NOT setting AVTransport any more
 # - CHANGE: code cleanup
+# - CHANGE: handle socket via fhem main loop instead of InternalTimer
+# - BUGFIX: do not create new search objects every 30 minutes
 # - FEATURE: support pauseToggle
 # - FEATURE: support SetExtensions (on-for-timer, off-for-timer, ...)
+# - FEATURE: support relative volume changes (e.g. set <device> volume +10)
 #
 # v2.0.0 BETA3 - 20160504
 # - BUGFIX: XML parsing error "NOT_IMPLEMENTED"
@@ -51,18 +54,15 @@
 #
 #TODO
 # - use blocking call for all upnpCalls
-# - handle sockets via main event loop
 # - FIX Loading device description failed
 # - redesign multiroom functionality (virtual devices?)
 # - SWR3 metadata is handled wrong by player
 # - retrieve stereomode (GetMultiChannel...) every 5 minutes
 # - support channels (radio stations) with attributes
-# - support relative volume (+/-10)
 # - use bulk update for readings
-# - support multiprocess and InternalTimer for ControlPoint
 # - support relative volume for all multiroom devices (multiRoomVolume)
 # - implement speak functions
-# - remove attributes (scanInterval, ignoreUDNs, multiRoomGroups) from play devices
+# - remove attributes (ignoreUDNs, multiRoomGroups) from play devices
 #
 ############################################################################
 
@@ -99,7 +99,7 @@ sub DLNARenderer_Initialize($) {
   $hash->{ReadFn}    = "DLNARenderer_Read";
   $hash->{UndefFn}   = "DLNARenderer_Undef";
   $hash->{AttrFn}    = "DLNARenderer_Attribute";
-  $hash->{AttrList}  = "ignoreUDNs scanInterval multiRoomGroups ".$readingFnAttributes;
+  $hash->{AttrList}  = "ignoreUDNs multiRoomGroups ".$readingFnAttributes;
 }
 
 sub DLNARenderer_Attribute {
@@ -107,11 +107,7 @@ sub DLNARenderer_Attribute {
   #ignoreUDNs, scanInterval, multiRoomGroups
   
   if($mode eq "set") {
-    if($attrName eq "scanInterval") {
-      if($attrValue > 86400) {
-        return "DLNARenderer: Max scan intervall is 24 hours (86400s).";
-      }
-    }
+    
   } elsif($mode eq "del") {
     
   }
@@ -130,10 +126,9 @@ sub DLNARenderer_Define($$) {
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 BETA4";
-    $hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
-    DLNARenderer_doDlnaSearch($hash);
-    DLNARenderer_handleControlpoint($hash);
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 RC1";
+    DLNARenderer_setupControlpoint($hash);
+    DLNARenderer_startDlnaRendererSearch($hash);
     readingsSingleUpdate($hash,"state","initialized",1);
     return undef;
   }
@@ -162,7 +157,7 @@ sub DLNARenderer_Undef($) {
 sub DLNARenderer_Read($) {
   my ($hash) = @_;
   my $name = $hash->{NAME};
-  my $phash = $hash->{pash};
+  my $phash = $hash->{phash};
   my $cp = $phash->{helper}{controlpoint};
   
   eval {
@@ -173,33 +168,12 @@ sub DLNARenderer_Read($) {
     Log3 $hash, 3, "DLNARenderer: handleOnce failed, $@";
   }
   
-  my @sockets = $cp->sockets();
-  #prüfen ob der socket schon in selectlist ist
-  #wenn nicht, dann chash hinzufügen
-  foreach my $s (@sockets) {
-    my $socketExits = 0;
-    foreach my $s2 (@{$phash->{helper}{sockets}}) {
-      if($s eq $s2) {
-        $socketExists = 1;
-      }
-    }
-    
-    if(!$socketExists) {
-      #create chash and add to selectlist
-      my $chash = DLNARenderer_newChash($hash, $s, {NAME => "DLNASocket"});
-      push @{$phash->{helper}{sockets}}, $chash;
-    }
-    #prüfen ob der socket noch gebraucht wird
-    #wenn nicht, dann aus selectlist löschen
-  }
-  
   return undef;
 }
 
 sub DLNARenderer_Set($@) {
   my ($hash, $name, @params) = @_;
   my $dev = $hash->{helper}{device};
-  my $streamURI = "";
   
   # check parameters
   return "no set value specified" if(int(@params) < 1);
@@ -219,125 +193,72 @@ sub DLNARenderer_Set($@) {
   }
   
   if($ctrlParam eq "volume"){
-    #volume
     return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
-    DLNARenderer_upnpSetVolume($hash, $params[0]);
-    readingsSingleUpdate($hash, "volume", $params[0], 1);
+    DLNARenderer_setVolume($hash, $params[0]);
+    
   } elsif($ctrlParam eq "pause") {
-    #pause
     DLNARenderer_upnpPause($hash);
+    
   } elsif($ctrlParam eq "pauseToggle") {
-    #pauseToggle
-    if($hash->{READINGS}{state} eq "paused") {
-        DLNARenderer_play($hash);
-    } else {
-        DLNARenderer_upnpPause($hash);
-    }
+    DLNARenderer_pauseToggle($hash);
+    
   } elsif($ctrlParam eq "play") {
-    #play
     DLNARenderer_play($hash);
+    
   } elsif($ctrlParam eq "next") {
-    #next
     DLNARenderer_upnpNext($hash);
+    
   } elsif($ctrlParam eq "previous") {
-    #prev
     DLNARenderer_upnpPrevious($hash);
+    
   } elsif($ctrlParam eq "seek") {
-    #seek
     DLNARenderer_upnpSeek($hash, $params[0]);
+    
   } elsif($ctrlParam eq "multiRoomVolume"){
-    #multiroomvolume
     return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
-    #handle volume for all devices in the current group
-    #iterate through group and change volume relative to the current volume
-    my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $params[0];
-    #get grouped devices
-      #set volume for each device
-    #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
-    #readingsSingleUpdate($hash, "volume", $params[1], 1);
+    DLNARenderer_setMultiRoomVolume($hash, $params[0]);
+    
   } elsif($ctrlParam eq "stereo") {
-    #stereo
     DLNARenderer_setStereoMode($hash, $params[0], $params[1], $params[2]);
+    
   } elsif($ctrlParam eq "standalone") {
-    #standalone
     DLNARenderer_setStandaloneMode($hash);
+    
   } elsif($ctrlParam eq "playEverywhere") {
-    #playEverywhere
-    my $multiRoomUnits = "";
-    my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
-    foreach my $client (@caskeidClients) {
-      if($client->{UDN} ne $hash->{UDN}) {
-        DLNARenderer_addUnitToPlay($hash, $dev, substr($client->{UDN},5));
-        $multiRoomUnits .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
-      }
-    }
-    #remove first comma
-    $multiRoomUnits = substr($multiRoomUnits, 1);
-    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
+    DLNARenderer_playEverywhere($hash);
+    
   } elsif($ctrlParam eq "stopPlayEverywhere") {
-    #stopPlayEverywhere
     DLNARenderer_destroyCurrentSession($hash, $dev);
     readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
-  } elsif($ctrlParam eq "addUnit") {
-    #addUnit
-    DLNARenderer_addUnit($hash, $params[0]);
-  } elsif($ctrlParam eq "removeUnit") {
-    #removeUnit
-    DLNARenderer_removeUnitToPlay($hash, $dev, $params[0]);
-    my $multiRoomUnitsReading = "";
-    my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
-    foreach my $unit (@multiRoomUnits) {
-      $multiRoomUnitsReading .= ",".$unit if($unit ne $params[0]);
-    }
-    $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
-    readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
-  } elsif($ctrlParam eq "saveGroupAs") {
-    #saveGroupAs
-    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
-  } elsif($ctrlParam eq "enableBTCaskeid") {
-    #enableBTCaskeid
-    DLNARenderer_enableBTCaskeid($hash, $dev);
-  } elsif($ctrlParam eq "disableBTCaskeid") {
-    #disableBTCaskeid
-    DLNARenderer_disableBTCaskeid($hash, $dev);
-  } elsif($ctrlParam eq "off" || $ctrlParam eq "stop" ){
-    #off/stop
-    DLNARenderer_upnpStop($hash);
-  } elsif($ctrlParam eq "loadGroup") {
-    #loadGroup
-    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
-    my $groupName = $params[0];
-    my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
-    return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
     
-    #create new session and add each group member
-    my @groupMembersArray = split(",", $groupMembers);
-    DLNARenderer_destroyCurrentSession($hash, $dev);
-    my $leftSpeaker;
-    my $rightSpeaker;
-    foreach my $member (@groupMembersArray) {
-      if($member =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-        $rightSpeaker = $1;
-      } elsif($member =~ /^L:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-        $leftSpeaker = $1;
-      } else {
-        DLNARenderer_addUnit($hash, $member);
-      }
-    }
-    DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
+  } elsif($ctrlParam eq "addUnit") {
+    DLNARenderer_addUnit($hash, $params[0]);
+    
+  } elsif($ctrlParam eq "removeUnit") {
+    DLNARenderer_removeUnit($hash, $params[0]);
+    
+  } elsif($ctrlParam eq "saveGroupAs") {
+    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
+    
+  } elsif($ctrlParam eq "enableBTCaskeid") {
+    DLNARenderer_enableBTCaskeid($hash, $dev);
+    
+  } elsif($ctrlParam eq "disableBTCaskeid") {
+    DLNARenderer_disableBTCaskeid($hash, $dev);
+    
+  } elsif($ctrlParam eq "off" || $ctrlParam eq "stop" ){
+    DLNARenderer_upnpStop($hash);
+    
+  } elsif($ctrlParam eq "loadGroup") {
+    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
+    DLNARenderer_loadGroup($hash, $params[0]);
+    
   } elsif($ctrlParam eq "on") {
-    #on = play last stream
-    if (defined($hash->{READINGS}{stream})) {
-      my $lastStream = $hash->{READINGS}{stream}{VAL};
-      if ($lastStream) {
-        $streamURI = $lastStream;
-        BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
-      }
-    }
+    DLNARenderer_on($hash);
+    
   } elsif ($ctrlParam eq "stream") {
-    #stream = set stream URI and play
-    $streamURI = $params[0];
-    BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$streamURI, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+    DLNARenderer_stream($hash, $params[0]);
+    
   } else {
       if($hash->{helper}{caskeid}) {
         return SetExtensions($hash, $caskeidCommandList." ".$stdCommandList, $name, $ctrlParam, @params);       
@@ -353,6 +274,96 @@ sub DLNARenderer_Set($@) {
 ##### SET FUNCTIONS ##########
 ##############################
 #TODO move everything from _Set to set functions
+sub DLNARenderer_stream {
+  my ($hash, $stream) = @_;
+  BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$stream, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+}
+
+sub DLNARenderer_on {
+  my ($hash) = @_;
+  if (defined($hash->{READINGS}{stream})) {
+    my $lastStream = $hash->{READINGS}{stream}{VAL};
+    if ($lastStream) {
+      BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$lastStream, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+    }
+  }
+}
+
+sub DLNARenderer_setVolume {
+  my ($hash, $targetVolume) = @_;
+  
+  if(substr($targetVolume, 0, 1) eq "+" or
+     substr($targetVolume, 0, 1) eq "-") {
+      $targetVolume = ReadingsVal($hash->{NAME}, "volume", 0) + $targetVolume;
+  }
+  
+  DLNARenderer_upnpSetVolume($hash, $targetVolume);
+  readingsSingleUpdate($hash, "volume", $targetVolume, 1);
+}
+
+sub DLNARenderer_removeUnit {
+  my ($hash, $unitToRemove) = @_;
+  DLNARenderer_removeUnitToPlay($hash, $hash->{helper}{device}, $unitToRemove);
+  my $multiRoomUnitsReading = "";
+  my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
+  foreach my $unit (@multiRoomUnits) {
+    $multiRoomUnitsReading .= ",".$unit if($unit ne $unitToRemove);
+  }
+  $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
+  readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
+}
+
+sub DLNARenderer_loadGroup {
+  my ($hash, $groupName) = @_;
+  my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
+  return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
+  
+  #create new session and add each group member
+  my @groupMembersArray = split(",", $groupMembers);
+  DLNARenderer_destroyCurrentSession($hash, $hash->{helper}{device});
+  my $leftSpeaker;
+  my $rightSpeaker;
+  foreach my $member (@groupMembersArray) {
+    if($member =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
+      $rightSpeaker = $1;
+    } elsif($member =~ /^L:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
+      $leftSpeaker = $1;
+    } else {
+      DLNARenderer_addUnit($hash, $member);
+    }
+  }
+  DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
+}
+
+sub DLNARenderer_playEverywhere {
+  my ($hash) = @_;
+  my $multiRoomUnits = "";
+  my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
+  foreach my $client (@caskeidClients) {
+    if($client->{UDN} ne $hash->{UDN}) {
+      DLNARenderer_addUnitToPlay($hash, $hash->{helper}{device}, substr($client->{UDN},5));
+      $multiRoomUnits .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
+    }
+  }
+  #remove first comma
+  $multiRoomUnits = substr($multiRoomUnits, 1);
+  readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
+  return undef;
+}
+
+sub DLNARenderer_setMultiRoomVolume {
+  my ($hash, $targetVolume) = @_;
+  #TODO
+  #handle volume for all devices in the current group
+  #iterate through group and change volume relative to the current volume
+  my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $targetVolume;
+  #get grouped devices
+    #set volume for each device
+  #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
+  #readingsSingleUpdate($hash, "volume", $params[1], 1);
+  return undef;
+}
+
 sub DLNARenderer_setAVTransportURIBlocking($) {
   my ($string) = @_;
   my ($name, $streamURI) = split("\\|", $string);
@@ -375,6 +386,15 @@ sub DLNARenderer_finishedSetAVTransportURIBlocking($) {
   DLNARenderer_play($hash);
   
   return undef;
+}
+
+sub DLNARenderer_pauseToggle {
+  my ($hash) = @_;
+  if($hash->{READINGS}{state} eq "paused") {
+      DLNARenderer_play($hash);
+  } else {
+      DLNARenderer_upnpPause($hash);
+  }
 }
 
 sub DLNARenderer_play($) {
@@ -923,32 +943,6 @@ sub DLNARenderer_updateMetaDataItemPart {
 ##############################
 ####### DISCOVERY ############
 ##############################
-sub DLNARenderer_handleControlpoint {
-  my ($hash) = @_;
-  
-  eval {
-    my $cp = $hash->{helper}{controlpoint};
-    my @sockets = $cp->sockets();
-    my $select = IO::Select->new(@sockets);
-    my @sock = $select->can_read(1);
-    foreach my $s (@sock) {
-      $cp->handleOnce($s);
-    }
-  };
-  my $error = $@;
-  
-  if($error) {
-    #setup a new controlpoint on error
-    #undef($hash->{helper}{controlpoint});
-    Log3 $hash, 3, "DLNARenderer: Create new controlpoint due to error, $error";
-    #$hash->{helper}{controlpoint} = DLNARenderer_setupControlpoint($hash);
-  }
-  
-  InternalTimer(gettimeofday() + 1, 'DLNARenderer_handleControlpoint', $hash, 0);
-  
-  return undef;
-}
-
 sub DLNARenderer_setupControlpoint {
   my ($hash) = @_;
   my %empty = ();
@@ -958,18 +952,18 @@ sub DLNARenderer_setupControlpoint {
   do {
     eval {
       $cp = UPnP::ControlPoint->new(SearchPort => 0, SubscriptionPort => 0, MaxWait => 30, UsedOnlyIP => \%empty, IgnoreIP => \%empty);
+      $hash->{helper}{controlpoint} = $cp;
+      
+      DLNARenderer_addSocketsToMainloop($hash);
     };
     $error = $@;
   } while($error);
   
-  return $cp;
+  return undef;
 }
 
-sub DLNARenderer_doDlnaSearch {
+sub DLNARenderer_startDlnaRendererSearch {
   my ($hash) = @_;
-
-  #research every 30 minutes
-  InternalTimer(gettimeofday() + 1800, 'DLNARenderer_doDlnaSearch', $hash, 0);
 
   eval {
     $hash->{helper}{controlpoint}->searchByType('urn:schemas-upnp-org:device:MediaRenderer:1', sub { DLNARenderer_discoverCallback($hash, @_); });
@@ -1180,7 +1174,7 @@ sub DLNARenderer_getAllDLNARenderers($) {
   my @DLNARenderers = ();
     
   foreach my $fhem_dev (sort keys %main::defs) { 
-    push @DLNARenderers, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} ne "0");
+    push @DLNARenderers, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} ne "0" && $main::defs{$fhem_dev}{UDN} ne "-1");
   }
 		
   return @DLNARenderers;
@@ -1201,11 +1195,11 @@ sub DLNARenderer_getAllDLNARenderersWithCaskeid($) {
 ###############################
 ###### UTILITY FUNCTIONS ######
 ###############################
-sub DLNARenderer_newChash($$$)
-{
+sub DLNARenderer_newChash($$$) {
   my ($hash,$socket,$chash) = @_;
 
   $chash->{TYPE}  = $hash->{TYPE};
+  $chash->{UDN}   = -1;
 
   $chash->{NR}    = $devcount++;
 
@@ -1223,6 +1217,33 @@ sub DLNARenderer_newChash($$$)
   $defs{$chash->{NAME}}       = $chash;
   $selectlist{$chash->{NAME}} = $chash;
 }
+
+sub DLNARenderer_closeSocket($) {
+  my ($hash) = @_;
+  my $name = $hash->{NAME};
+
+  RemoveInternalTimer($hash);
+
+  close($hash->{CD});
+  delete($hash->{CD});
+  delete($selectlist{$name});
+  delete($hash->{FD});
+}
+
+sub DLNARenderer_addSocketsToMainloop {
+  my ($hash) = @_;
+  
+  my @sockets = $hash->{helper}{controlpoint}->sockets();
+  
+  #check if new sockets need to be added to mainloop
+  foreach my $s (@sockets) {
+    #create chash and add to selectlist
+    my $chash = DLNARenderer_newChash($hash, $s, {NAME => "DLNASocket-".$s->fileno()});
+  }
+  
+  return undef;
+}
+
 
 1;
 
