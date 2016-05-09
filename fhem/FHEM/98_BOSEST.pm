@@ -10,11 +10,14 @@
 #
 #############################################################
 #
-# v1.5.4 - 201605XX
+# v1.5.4 - 20160509
 # - FEATURE: restore volume when speaker goes online
 #             allows to power off the box completely without loosing
 #             previous volume settings
 # - BUGFIX: fix possible unitialized value
+# - BUGFIX: fix next which should be return
+# - BUGFIX: sometimes double-tap feature wasn't working due to BOSE not
+#           updating zones for slave speakers
 #
 # v1.5.3 - 20160425
 # - FEATURE: support static IPs (should only be used if device can't be discovered)
@@ -168,7 +171,6 @@
 #  - change preset via /key
 #
 # TODO
-#  - reset zone when changing to bluetooth on slave/master?
 #  - support multiroom volume
 #  - support http://... for streaming via DLNA (.m3u file?)
 #  - TTS code cleanup (group functions logically)
@@ -1357,9 +1359,10 @@ sub BOSEST_parseAndUpdateChannel($$) {
 sub BOSEST_parseAndUpdateZone($$) {
     my ($hash, $zone) = @_;
     readingsBeginUpdate($hash);
-    BOSEST_XMLUpdate($hash, "zoneMaster", $zone->{master});
     
+    #TODO check if zone master is still active
     my $i = 1;
+    BOSEST_XMLUpdate($hash, "zoneMaster", $zone->{master});
     if($zone->{member}) {
         foreach my $member (@{$zone->{member}}) {
             my $player = BOSEST_getBosePlayerByDeviceId($hash, $member->{content});
@@ -1367,15 +1370,29 @@ sub BOSEST_parseAndUpdateZone($$) {
             $i++;
         }
     }
+    readingsEndUpdate($hash, 1);
     
     while ($i < 20) {
         if(defined($hash->{READINGS}{"zoneMember_$i"})) {
+            my $zoneMemberName = ReadingsVal($hash->{NAME}, "zoneMember_$i", "");
+            if($zoneMemberName ne "") {
+                my $memberHash = $main::defs{$zoneMemberName};
+                readingsBeginUpdate($memberHash);
+                BOSEST_XMLUpdate($memberHash, "zoneMaster", "");
+                my $j = 1;
+                while($j < 20) {
+                    BOSEST_XMLUpdate($memberHash, "zoneMember_$j", "") if(defined($hash->{READINGS}{"zoneMember_$j"}));
+                    $j++;
+                }
+                readingsEndUpdate($memberHash, 1);
+            }
+            readingsBeginUpdate($hash);
             BOSEST_XMLUpdate($hash, "zoneMember_$i", "");
+            readingsEndUpdate($hash, 1);
         }
         $i++;
     }
     
-    readingsEndUpdate($hash, 1);
     return undef;
 }
 
@@ -1561,7 +1578,7 @@ sub BOSEST_handleDeviceByIp {
     #remove info tag to reduce line length
     $info = $info->{info} if (defined($info->{info}));
     #skip entry if no deviceid was found
-    next if (!defined($info->{deviceID}));
+    return if (!defined($info->{deviceID}));
     
     #TODO return if the device is already defined and IP is the same
     #     make sure that this can be done and no further code below is needed
