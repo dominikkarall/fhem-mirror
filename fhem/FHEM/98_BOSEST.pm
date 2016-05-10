@@ -6,9 +6,12 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.4
+# Version: 1.5.5
 #
 #############################################################
+#
+# v1.5.5 - 20160510
+# - BUGFIX: fix unitiliazed value in handleDeviceByIp
 #
 # v1.5.4 - 20160509
 # - FEATURE: restore volume when speaker goes online
@@ -283,7 +286,7 @@ sub BOSEST_Define($$) {
     $hash->{helper}{supportedBassCmds} = "";
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.4";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.5";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
         
@@ -1358,10 +1361,18 @@ sub BOSEST_parseAndUpdateChannel($$) {
 
 sub BOSEST_parseAndUpdateZone($$) {
     my ($hash, $zone) = @_;
-    readingsBeginUpdate($hash);
     
-    #TODO check if zone master is still active
+    #check if zone master is still active
+    if(defined($zone->{master})) {
+        my $masterHash = BOSEST_getBosePlayerByDeviceId($hash, $zone->{master});
+        my $masterZoneMaster = ReadingsVal($masterHash->{NAME}, "zoneMaster", "");
+        if($masterZoneMaster eq "") {
+            return undef;
+        }
+    }
+    
     my $i = 1;
+    readingsBeginUpdate($hash);
     BOSEST_XMLUpdate($hash, "zoneMaster", $zone->{master});
     if($zone->{member}) {
         foreach my $member (@{$zone->{member}}) {
@@ -1578,7 +1589,7 @@ sub BOSEST_handleDeviceByIp {
     #remove info tag to reduce line length
     $info = $info->{info} if (defined($info->{info}));
     #skip entry if no deviceid was found
-    return if (!defined($info->{deviceID}));
+    return "" if (!defined($info->{deviceID}));
     
     #TODO return if the device is already defined and IP is the same
     #     make sure that this can be done and no further code below is needed

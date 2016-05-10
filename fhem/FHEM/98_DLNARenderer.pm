@@ -1,5 +1,8 @@
 ############################################################################
-# 2016-05-09, v2.0.0 RC1, dominik.karall@gmail.com $
+# 2016-05-10, v2.0.0 RC2, dominik.karall@gmail.com $
+#
+# v2.0.0 RC2 - 20160510
+# - BUGFIX: fix multiroom for MUNET/Caskeid devices
 #
 # v2.0.0 RC1 - 20160509
 # - CHANGE: change state to offline/playing/stopped/paused/online
@@ -126,7 +129,7 @@ sub DLNARenderer_Define($$) {
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 RC1";
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 RC2";
     DLNARenderer_setupControlpoint($hash);
     DLNARenderer_startDlnaRendererSearch($hash);
     readingsSingleUpdate($hash,"state","initialized",1);
@@ -736,9 +739,10 @@ sub DLNARenderer_upnpCall {
   my ($hash, $service, $method, @args) = @_;
   my $upnpService = $hash->{helper}{device}->getService($service);
   my $upnpServiceCtrlProxy = $upnpService->controlProxy();
+  my $ret = undef;
   
   eval {
-    $upnpServiceCtrlProxy->$method(@args);
+    $ret = $upnpServiceCtrlProxy->$method(@args);
     Log3 $hash, 5, "DLNARenderer: $service, $method(".join(",",@args).") succeed.";
   };
   
@@ -746,6 +750,7 @@ sub DLNARenderer_upnpCall {
     Log3 $hash, 3, "DLNARenderer: $service, $method(".join(",",@args).") failed, $@";
     return "DLNARenderer: $method failed.";
   }
+  return $ret;
 }
 
 ##############################

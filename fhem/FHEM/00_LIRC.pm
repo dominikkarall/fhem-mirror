@@ -23,6 +23,7 @@ LIRC_Initialize($)
 # Consumer
   $hash->{DefFn}   = "LIRC_Define";
   $hash->{UndefFn} = "LIRC_Undef";
+  $hash->{SetFn}   = "LIRC_Set";
   $hash->{AttrList}= "";
 }
 
@@ -64,6 +65,13 @@ LIRC_Define($$)
   $hash->{DeviceName} = $name;    
   $hash->{STATE} = "Opened";
 
+  return undef;
+}
+
+sub LIRC_Set($$) {
+  my ($hash, $name, $ctrl, @params) = @_;
+  Log3 $hash, 3, "LIRC: Write msg $params[0] to lirc.";
+  syswrite($hash->{LircObj}->sock, $params[0]); 
   return undef;
 }
 
