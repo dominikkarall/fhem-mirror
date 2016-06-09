@@ -1,5 +1,27 @@
 ############################################################################
-# 2016-05-10, v2.0.0 RC2, dominik.karall@gmail.com $
+# 2016-06-09, v2.0.0 RC3, dominik.karall@gmail.com $
+#
+# v2.0.0 RC3 - 20160609
+# - BUGFIX: check correct number of params for all commands
+# - BUGFIX: fix addUnitToSession/removeUnitFromSession for MUNET/Caskeid devices
+# - BUGFIX: support devices with non-standard UUIDs
+# - CHANGE: use BlockingCall for subscription renewal
+# - CHANGE: remove ignoreUDNs attribute from play devices
+# - CHANGE: remove multiRoomGroups attribute from main device
+# - CHANGE: split stereoDevices reading into stereoLeft/stereoRight
+# - FEATURE: support multiRoomVolume to change volume of all group speakers e.g.
+#              set <name> multiRoomVolume +10
+#              set <name> multiRoomVolume 25
+# - FEATURE: support channel_01-10 attribute
+#              attr <name> channel_01 http://... (save URI to channel_01)
+#              set <name> channel 1 (play channel_01)
+# - FEATURE: support speak functionality via Google Translate
+#              set <name> speak "This is a test."
+#              attr <name> ttsLanguage de
+#              set <name> speak "Das ist ein Test."
+# - FEATURE: automatically retrieve stereo mode from speakers and update stereoId/Left/Right readings
+# - FEATURE: support mute
+#              set <name> mute on/off
 #
 # v2.0.0 RC2 - 20160510
 # - BUGFIX: fix multiroom for MUNET/Caskeid devices
@@ -56,16 +78,11 @@
 # and look for devices in Unsorted section after 2 minutes.
 #
 #TODO
-# - use blocking call for all upnpCalls
-# - FIX Loading device description failed
-# - redesign multiroom functionality (virtual devices?)
-# - SWR3 metadata is handled wrong by player
-# - retrieve stereomode (GetMultiChannel...) every 5 minutes
-# - support channels (radio stations) with attributes
+# - speak: support continue stream after speak finished
+# - redesign multiroom functionality (virtual devices: represent the readings of master device
+#    and send the commands only to the master device (except volume?)
+#    automatically create group before playing
 # - use bulk update for readings
-# - support relative volume for all multiroom devices (multiRoomVolume)
-# - implement speak functions
-# - remove attributes (ignoreUDNs, multiRoomGroups) from play devices
 #
 ############################################################################
 
@@ -87,8 +104,8 @@ my $gPath = '';
 BEGIN {
 	$gPath = substr($0, 0, rindex($0, '/'));
 }
-if (lc(substr($0, -7)) eq 'fhem.pl') { 
-	$gPath = $attr{global}{modpath}.'/FHEM'; 
+if (lc(substr($0, -7)) eq 'fhem.pl') {
+	$gPath = $attr{global}{modpath}.'/FHEM';
 }
 use lib ($gPath.'/lib', $gPath.'/FHEM/lib', './FHEM/lib', './lib', './FHEM', './', '/usr/local/FHEM/share/fhem/FHEM/lib');
 
@@ -102,12 +119,11 @@ sub DLNARenderer_Initialize($) {
   $hash->{ReadFn}    = "DLNARenderer_Read";
   $hash->{UndefFn}   = "DLNARenderer_Undef";
   $hash->{AttrFn}    = "DLNARenderer_Attribute";
-  $hash->{AttrList}  = "ignoreUDNs multiRoomGroups ".$readingFnAttributes;
 }
 
 sub DLNARenderer_Attribute {
   my ($mode, $devName, $attrName, $attrValue) = @_;
-  #ignoreUDNs, scanInterval, multiRoomGroups
+  #ignoreUDNs, multiRoomGroups, channel_01-10
   
   if($mode eq "set") {
     
@@ -129,10 +145,11 @@ sub DLNARenderer_Define($$) {
   if(@param < 3) {
     #main
     $hash->{UDN} = 0;
-    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 RC2";
+    Log3 $hash, 3, "DLNARenderer: DLNA Renderer v2.0.0 RC3";
     DLNARenderer_setupControlpoint($hash);
     DLNARenderer_startDlnaRendererSearch($hash);
     readingsSingleUpdate($hash,"state","initialized",1);
+    addToDevAttrList($hash->{NAME}, "ignoreUDNs");
     return undef;
   }
   
@@ -145,7 +162,21 @@ sub DLNARenderer_Define($$) {
   readingsSingleUpdate($hash,"presence","offline",1);
   readingsSingleUpdate($hash,"state","offline",1);
   
+  addToDevAttrList($hash->{NAME}, "multiRoomGroups");
+  addToDevAttrList($hash->{NAME}, "ttsLanguage");
+  addToDevAttrList($hash->{NAME}, "channel_01");
+  addToDevAttrList($hash->{NAME}, "channel_02");
+  addToDevAttrList($hash->{NAME}, "channel_03");
+  addToDevAttrList($hash->{NAME}, "channel_04");
+  addToDevAttrList($hash->{NAME}, "channel_05");
+  addToDevAttrList($hash->{NAME}, "channel_06");
+  addToDevAttrList($hash->{NAME}, "channel_07");
+  addToDevAttrList($hash->{NAME}, "channel_08");
+  addToDevAttrList($hash->{NAME}, "channel_09");
+  addToDevAttrList($hash->{NAME}, "channel_10");
+  
   InternalTimer(gettimeofday() + 200, 'DLNARenderer_renewSubscriptions', $hash, 0);
+  InternalTimer(gettimeofday() + 60, 'DLNARenderer_updateStereoMode', $hash, 0);
   
   return undef;
 }
@@ -182,104 +213,99 @@ sub DLNARenderer_Set($@) {
   return "no set value specified" if(int(@params) < 1);
   my $ctrlParam = shift(@params);
   
-  my $stdCommandList = "on:noArg off:noArg play:noArg stop:noArg stream pause:noArg pauseToggle:noArg next:noArg previous:noArg seek volume:slider,0,1,100";
-  my $caskeidCommandList = "addUnit:".$hash->{helper}{caskeidClients}." ".
-                           "removeUnit:".ReadingsVal($hash->{NAME}, "multiRoomUnits", "")." ".
-                           "playEverywhere:noArg stopPlayEverywhere:noArg ".
-                           "enableBTCaskeid:noArg disableBTCaskeid:noArg ".
-                           "saveGroupAs loadGroup ".
-                           "stereo standalone:noArg";
-  
   # check device presence
   if ($ctrlParam ne "?" and (!defined($dev) or ReadingsVal($hash->{NAME}, "presence", "") eq "offline")) {
     return "DLNARenderer: Currently searching for device...";
   }
   
-  if($ctrlParam eq "volume"){
-    return "DLNARenderer: Missing argument for volume." if (int(@params) < 1);
-    DLNARenderer_setVolume($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "pause") {
-    DLNARenderer_upnpPause($hash);
-    
-  } elsif($ctrlParam eq "pauseToggle") {
-    DLNARenderer_pauseToggle($hash);
-    
-  } elsif($ctrlParam eq "play") {
-    DLNARenderer_play($hash);
-    
-  } elsif($ctrlParam eq "next") {
-    DLNARenderer_upnpNext($hash);
-    
-  } elsif($ctrlParam eq "previous") {
-    DLNARenderer_upnpPrevious($hash);
-    
-  } elsif($ctrlParam eq "seek") {
-    DLNARenderer_upnpSeek($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "multiRoomVolume"){
-    return "DLNARenderer: Missing argument for multiRoomVolume." if (int(@params) < 1);
-    DLNARenderer_setMultiRoomVolume($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "stereo") {
-    DLNARenderer_setStereoMode($hash, $params[0], $params[1], $params[2]);
-    
-  } elsif($ctrlParam eq "standalone") {
-    DLNARenderer_setStandaloneMode($hash);
-    
-  } elsif($ctrlParam eq "playEverywhere") {
-    DLNARenderer_playEverywhere($hash);
-    
-  } elsif($ctrlParam eq "stopPlayEverywhere") {
-    DLNARenderer_destroyCurrentSession($hash, $dev);
-    readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
-    
-  } elsif($ctrlParam eq "addUnit") {
-    DLNARenderer_addUnit($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "removeUnit") {
-    DLNARenderer_removeUnit($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "saveGroupAs") {
-    DLNARenderer_saveGroupAs($hash, $dev, $params[0]);
-    
-  } elsif($ctrlParam eq "enableBTCaskeid") {
-    DLNARenderer_enableBTCaskeid($hash, $dev);
-    
-  } elsif($ctrlParam eq "disableBTCaskeid") {
-    DLNARenderer_disableBTCaskeid($hash, $dev);
-    
-  } elsif($ctrlParam eq "off" || $ctrlParam eq "stop" ){
-    DLNARenderer_upnpStop($hash);
-    
-  } elsif($ctrlParam eq "loadGroup") {
-    return "DLNARenderer: loadGroup requires multiroom group as additional parameter." if(!defined($params[0]));
-    DLNARenderer_loadGroup($hash, $params[0]);
-    
-  } elsif($ctrlParam eq "on") {
-    DLNARenderer_on($hash);
-    
-  } elsif ($ctrlParam eq "stream") {
-    DLNARenderer_stream($hash, $params[0]);
-    
-  } else {
-      if($hash->{helper}{caskeid}) {
-        return SetExtensions($hash, $caskeidCommandList." ".$stdCommandList, $name, $ctrlParam, @params);       
-      } else {
-        return SetExtensions($hash, $stdCommandList, $name, $ctrlParam, @params);
-      }
+  #get quoted text from params
+  my $blankParams = join(" ", @params);
+  my @params2;
+  while($blankParams =~ /"?((?<!")\S+(?<!")|[^"]+)"?\s*/g) {
+      push(@params2, $1);
   }
+  @params = @params2;
   
+  my $set_method_mapping = {
+    volume            => {method => \&DLNARenderer_volume, args => 1, argdef => "slider,0,1,100"},
+    mute              => {method => \&DLNARenderer_mute, args => 1, argdef => "on,off"},
+    pause             => {method => \&DLNARenderer_upnpPause, args => 0},
+    pauseToggle       => {method => \&DLNARenderer_pauseToggle, args => 0},
+    play              => {method => \&DLNARenderer_play, args => 0},
+    next              => {method => \&DLNARenderer_upnpNext, args => 0},
+    previous          => {method => \&DLNARenderer_upnpPrevious, args => 0},
+    seek              => {method => \&DLNARenderer_seek, args => 1},
+    multiRoomVolume   => {method => \&DLNARenderer_setMultiRoomVolume, args => 1, argdef => "slider,0,1,100", caskeid => 1},
+    stereo            => {method => \&DLNARenderer_setStereoMode, args => 3, caskeid => 1},
+    standalone        => {method => \&DLNARenderer_setStandaloneMode, args => 0, caskeid => 1},
+    playEverywhere    => {method => \&DLNARenderer_playEverywhere, args => 0, caskeid => 1},
+    stopPlayEverywhere => {method => \&DLNARenderer_stopPlayEverywhere, args => 0, caskeid => 1},
+    addUnit           => {method => \&DLNARenderer_addUnit, args => 1, argdef => $hash->{helper}{caskeidClients}, caskeid => 1},
+    removeUnit        => {method => \&DLNARenderer_removeUnit, args => 1, argdef => ReadingsVal($hash->{NAME}, "multiRoomUnits", ""), caskeid => 1},
+    saveGroupAs       => {method => \&DLNARenderer_saveGroupAs, args => 1, caskeid => 1},
+    enableBTCaskeid   => {method => \&DLNARenderer_enableBTCaskeid, args => 0, caskeid => 1},
+    disableBTCaskeid  => {method => \&DLNARenderer_disableBTCaskeid, args => 0, caskeid => 1},
+    off               => {method => \&DLNARenderer_upnpStop, args => 0},
+    stop              => {method => \&DLNARenderer_upnpStop, args => 0},
+    loadGroup         => {method => \&DLNARenderer_loadGroup, args => 1, caskeid => 1},
+    on                => {method => \&DLNARenderer_on, args => 0},
+    stream            => {method => \&DLNARenderer_stream, args => 1},
+    channel           => {method => \&DLNARenderer_channel, args => 1, argdef => "1,2,3,4,5,6,7,8,9,10"},
+    speak             => {method => \&DLNARenderer_speak, args => 1}
+  };
+  
+  if($set_method_mapping->{$ctrlParam}) {
+    if($set_method_mapping->{$ctrlParam}{args} != int(@params)) {
+      return "DLNARenderer: $ctrlParam requires $set_method_mapping->{$ctrlParam}{args} parameter.";
+    }
+    #params array till args number
+    my @args = @params[0 .. $set_method_mapping->{$ctrlParam}{args}];
+    $set_method_mapping->{$ctrlParam}{method}->($hash, @args);
+  } else {
+    my $cmdList;
+    foreach my $cmd (keys %$set_method_mapping) {
+      next if($hash->{helper}{caskeid} == 0 && $set_method_mapping->{$cmd}{caskeid} && $set_method_mapping->{$cmd}{caskeid} == 1);
+      if($set_method_mapping->{$cmd}{args} == 0) {
+        $cmdList .= $cmd.":noArg ";
+      } else {
+        if($set_method_mapping->{$cmd}{argdef}) {
+          $cmdList .= $cmd.":".$set_method_mapping->{$cmd}{argdef}." ";
+        } else {
+          $cmdList .= $cmd." ";
+        }
+      }
+    }
+    return SetExtensions($hash, $cmdList, $name, $ctrlParam, @params);
+  }
   return undef;
 }
 
 ##############################
 ##### SET FUNCTIONS ##########
 ##############################
-#TODO move everything from _Set to set functions
+sub DLNARenderer_speak {
+  my ($hash, $ttsText) = @_;
+  my $ttsLang = AttrVal($hash->{NAME}, "ttsLanguage", "en");
+  return "DLNARenderer: Maximum text length is 100 characters." if(length($ttsText) > 100);
+  
+  DLNARenderer_stream($hash, "http://translate.google.com/translate_tts?tl=$ttsLang&client=tw-ob&q=$ttsText");
+}
+
+sub DLNARenderer_channel {
+  my ($hash, $channelNr) = @_;
+  my $stream = AttrVal($hash->{NAME}, sprintf("channel_%02d", $channelNr), "");
+  if($stream eq "") {
+    return "DLNARenderer: Set channel_XX attribute first.";
+  }
+  DLNARenderer_stream($hash, $stream);
+  readingsSingleUpdate($hash, "channel", $channelNr, 1);
+}
+
 sub DLNARenderer_stream {
   my ($hash, $stream) = @_;
-  BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$stream, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+  DLNARenderer_upnpSetAVTransportURI($hash, $stream);
+  DLNARenderer_play($hash);
+  readingsSingleUpdate($hash, "stream", $stream, 1);
 }
 
 sub DLNARenderer_on {
@@ -287,45 +313,68 @@ sub DLNARenderer_on {
   if (defined($hash->{READINGS}{stream})) {
     my $lastStream = $hash->{READINGS}{stream}{VAL};
     if ($lastStream) {
-      BlockingCall('DLNARenderer_setAVTransportURIBlocking', $hash->{NAME}."|".$lastStream, 'DLNARenderer_finishedSetAVTransportURIBlocking');
+      DLNARenderer_upnpSetAVTransportURI($hash, $lastStream);
+      DLNARenderer_play($hash);
     }
   }
 }
 
-sub DLNARenderer_setVolume {
+sub DLNARenderer_convertVolumeToAbsolute {
   my ($hash, $targetVolume) = @_;
   
   if(substr($targetVolume, 0, 1) eq "+" or
      substr($targetVolume, 0, 1) eq "-") {
       $targetVolume = ReadingsVal($hash->{NAME}, "volume", 0) + $targetVolume;
   }
+  return $targetVolume;
+}
+
+sub DLNARenderer_volume {
+  my ($hash, $targetVolume) = @_;
+  
+  $targetVolume = DLNARenderer_convertVolumeToAbsolute($hash, $targetVolume);
   
   DLNARenderer_upnpSetVolume($hash, $targetVolume);
-  readingsSingleUpdate($hash, "volume", $targetVolume, 1);
+}
+
+sub DLNARenderer_mute {
+  my ($hash, $muteState) = @_;
+  
+  if($muteState eq "on") {
+    $muteState = 1;
+  } else {
+    $muteState = 0;
+  }
+  
+  DLNARenderer_upnpSetMute($hash, $muteState);
 }
 
 sub DLNARenderer_removeUnit {
   my ($hash, $unitToRemove) = @_;
-  DLNARenderer_removeUnitToPlay($hash, $hash->{helper}{device}, $unitToRemove);
+  DLNARenderer_removeUnitToPlay($hash, $unitToRemove);
+
   my $multiRoomUnitsReading = "";
   my @multiRoomUnits = split(",", ReadingsVal($hash->{NAME}, "multiRoomUnits", ""));
+  
   foreach my $unit (@multiRoomUnits) {
     $multiRoomUnitsReading .= ",".$unit if($unit ne $unitToRemove);
   }
   $multiRoomUnitsReading = substr($multiRoomUnitsReading, 1) if($multiRoomUnitsReading ne "");
   readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnitsReading, 1);
+  
+  return undef;
 }
 
 sub DLNARenderer_loadGroup {
   my ($hash, $groupName) = @_;
   my $groupMembers = DLNARenderer_getGroupDefinition($hash, $groupName);
   return "DLNARenderer: Group $groupName not defined." if(!defined($groupMembers));
-  
-  #create new session and add each group member
+  DLNARenderer_destroyCurrentSession($hash);
+
+  my $leftSpeaker = "";
+  my $rightSpeaker = "";
   my @groupMembersArray = split(",", $groupMembers);
-  DLNARenderer_destroyCurrentSession($hash, $hash->{helper}{device});
-  my $leftSpeaker;
-  my $rightSpeaker;
+  
   foreach my $member (@groupMembersArray) {
     if($member =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
       $rightSpeaker = $1;
@@ -335,7 +384,17 @@ sub DLNARenderer_loadGroup {
       DLNARenderer_addUnit($hash, $member);
     }
   }
-  DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
+  
+  if($leftSpeaker ne "" && $rightSpeaker ne "") {
+    DLNARenderer_setStereoMode($hash, $leftSpeaker, $rightSpeaker, $groupName);
+  }
+}
+
+sub DLNARenderer_stopPlayEverywhere {
+  my ($hash) = @_;
+  DLNARenderer_destroyCurrentSession($hash);
+  readingsSingleUpdate($hash, "multiRoomUnits", "", 1);
+  return undef;
 }
 
 sub DLNARenderer_playEverywhere {
@@ -344,49 +403,39 @@ sub DLNARenderer_playEverywhere {
   my @caskeidClients = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
   foreach my $client (@caskeidClients) {
     if($client->{UDN} ne $hash->{UDN}) {
-      DLNARenderer_addUnitToPlay($hash, $hash->{helper}{device}, substr($client->{UDN},5));
-      $multiRoomUnits .= ",".ReadingsVal($client->{NAME}, "friendlyName", "");
+      DLNARenderer_addUnitToPlay($hash, substr($client->{UDN},5));
+      
+      my $multiRoomUnits = ReadingsVal($hash->{NAME}, "multiRoomUnits", "");
+      
+      $multiRoomUnits .= "," if($multiRoomUnits ne "");
+      $multiRoomUnits .= ReadingsVal($client->{NAME}, "friendlyName", "");
+      readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
     }
   }
-  #remove first comma
-  $multiRoomUnits = substr($multiRoomUnits, 1);
-  readingsSingleUpdate($hash, "multiRoomUnits", $multiRoomUnits, 1);
   return undef;
 }
 
 sub DLNARenderer_setMultiRoomVolume {
   my ($hash, $targetVolume) = @_;
-  #TODO
+  
+  #change volume of this device
+  DLNARenderer_volume($hash, $targetVolume);
+  
   #handle volume for all devices in the current group
-  #iterate through group and change volume relative to the current volume
-  my $volumeDiff = ReadingsVal($hash->{NAME}, "volume", 0) - $targetVolume;
-  #get grouped devices
-    #set volume for each device
-  #$render_service->controlProxy()->SetVolume(0, "Master", $params[0]);
-  #readingsSingleUpdate($hash, "volume", $params[1], 1);
-  return undef;
-}
-
-sub DLNARenderer_setAVTransportURIBlocking($) {
-  my ($string) = @_;
-  my ($name, $streamURI) = split("\\|", $string);
-  my $hash = $main::defs{$name};
-  my $return = "$name|$streamURI";
-  
-  DLNARenderer_upnpSetAVTransportURI($hash, $streamURI);
-
-  return $return;
-}
-
-sub DLNARenderer_finishedSetAVTransportURIBlocking($) {
-  my ($string) = @_;
-  my @params = split("\\|", $string);
-  my $name = $params[0];
-  my $hash = $defs{$name};
-  
-  readingsSingleUpdate($hash,"stream",$params[1],1);
-  
-  DLNARenderer_play($hash);
+  #iterate through group and change volume relative to the current volume of this device
+  my $mainVolumeDiff = DLNARenderer_convertVolumeToAbsolute($hash, $targetVolume) - ReadingsVal($hash->{NAME}, "volume", 0);
+  my $multiRoomUnits = ReadingsVal($hash->{NAME}, "multiRoomUnits", "");
+  my @multiRoomUnitsArray = split(",", $multiRoomUnits);
+  foreach my $unit (@multiRoomUnitsArray) {
+    my $devHash = DLNARenderer_getHashByFriendlyName($hash, $unit);
+    my $newVolume = ReadingsVal($devHash->{NAME}, "volume", 0) + $mainVolumeDiff;
+    if($newVolume > 100) {
+      $newVolume = 100;
+    } elsif($newVolume < 0) {
+      $newVolume = 0;
+    }
+    DLNARenderer_volume($devHash, $newVolume);
+  }
   
   return undef;
 }
@@ -400,12 +449,12 @@ sub DLNARenderer_pauseToggle {
   }
 }
 
-sub DLNARenderer_play($) {
+sub DLNARenderer_play {
   my ($hash) = @_;
   
   #start play
   if($hash->{helper}{caskeid}) {
-    DLNARenderer_upnpSyncPlay($hash, $hash->{helper}{device});
+    DLNARenderer_upnpSyncPlay($hash);
   } else {
     DLNARenderer_upnpPlay($hash);
   }
@@ -418,35 +467,91 @@ sub DLNARenderer_play($) {
 ###########################
 # BTCaskeid
 sub DLNARenderer_enableBTCaskeid {
-  my ($hash, $dev) = @_;
-  DLNARenderer_upnpAddUnitToGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth");
+  my ($hash) = @_;
+  DLNARenderer_upnpAddToGroup($hash, "4DAA44C0-8291-11E3-BAA7-0800200C9A66", "Bluetooth");
 }
 
 sub DLNARenderer_disableBTCaskeid {
-  my ($hash, $dev) = @_;
-  DLNARenderer_upnpRemoveUnitFromGroup($hash, $dev, "4DAA44C0-8291-11E3-BAA7-0800200C9A66");
+  my ($hash) = @_;
+  DLNARenderer_upnpRemoveFromGroup($hash, "4DAA44C0-8291-11E3-BAA7-0800200C9A66");
 }
 
 # Stereo Mode
 sub DLNARenderer_setStereoMode {
   my ($hash, $leftSpeaker, $rightSpeaker, $name) = @_;
   
+  DLNARenderer_destroyCurrentSession($hash);
+
   my @multiRoomDevices = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
   my $uuid = DLNARenderer_createUuid($hash);
   
-  DLNARenderer_destroyCurrentSession($hash, $hash->{helper}{device});
-  
   foreach my $device (@multiRoomDevices) {
     if(ReadingsVal($device->{NAME}, "friendlyName", "") eq $leftSpeaker) {
-      DLNARenderer_setMultiChannelSpeaker($device, "left", $uuid, $name);
+      DLNARenderer_setMultiChannelSpeaker($device, "left", $uuid, $leftSpeaker);
+      readingsSingleUpdate($hash, "stereoLeft", $leftSpeaker, 1);
     } elsif(ReadingsVal($device->{NAME}, "friendlyName", "") eq $rightSpeaker) {
-      DLNARenderer_setMultiChannelSpeaker($device, "right", $uuid, $name);
+      DLNARenderer_setMultiChannelSpeaker($device, "right", $uuid, $rightSpeaker);
+      readingsSingleUpdate($hash, "stereoRight", $rightSpeaker, 1);
     }
   }
+}
+
+sub DLNARenderer_updateStereoMode {
+  my ($hash) = @_;
   
-  readingsSingleUpdate($hash, "stereoDevices", "R:$rightSpeaker,L:$leftSpeaker", 1);
+  InternalTimer(gettimeofday() + 300, 'DLNARenderer_updateStereoMode', $hash, 0);
   
-  return undef;
+  return undef if(!defined($hash->{helper}{device}) || $hash->{helper}{caskeid} == 0);
+  
+  #get stereo mode information
+  my $result = DLNARenderer_upnpGetMultiChannelSpeaker($hash);
+  
+  my $mcsType = $result->getValue("CurrentMCSType");
+  my $mcsId = $result->getValue("CurrentMCSID");
+  my $mcsFriendlyName = $result->getValue("CurrentMCSFriendlyName");
+  my $mcsSpeakerChannel = $result->getValue("CurrentSpeakerChannel");
+  
+  DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoId", $mcsId, 1);
+  
+  if($mcsId eq "") {
+    DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoLeft", "", 1);
+    DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoRight", "", 1);
+  } else {
+    #THIS speaker is the left or right speaker
+    DLNARenderer_setStereoSpeakerReading($hash, $hash, $mcsType, $mcsId, $mcsFriendlyName, $mcsSpeakerChannel);
+    #set left/right speaker for OTHER speaker if OTHER speaker has same mcsId
+    my @allHashes = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
+    foreach my $hash2 (@allHashes) {
+      my $result2 = DLNARenderer_upnpGetMultiChannelSpeaker($hash2);
+      my $mcsType2 = $result2->getValue("CurrentMCSType");
+      my $mcsId2 = $result2->getValue("CurrentMCSID");
+      my $mcsFriendlyName2 = $result2->getValue("CurrentMCSFriendlyName");
+      my $mcsSpeakerChannel2 = $result2->getValue("CurrentSpeakerChannel");
+      
+      if($mcsId2 eq $mcsId) {
+        DLNARenderer_setStereoSpeakerReading($hash, $hash2, $mcsType2, $mcsId2, $mcsFriendlyName2, $mcsSpeakerChannel2);
+      }
+    }
+  }
+}
+
+sub DLNARenderer_setStereoSpeakerReading {
+  my ($hash, $speakerHash, $mcsType, $mcsId, $mcsFriendlyName, $mcsSpeakerChannel) = @_;
+  DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoId", $mcsId, 1);
+  if($mcsSpeakerChannel eq "STEREO_LEFT") {
+    DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoLeft", ReadingsVal($speakerHash->{NAME}, "friendlyName", ""), 1);
+  } elsif($mcsSpeakerChannel eq "STEREO_RIGHT") {
+    DLNARenderer_readingsSingleUpdateIfChanged($hash, "stereoRight", ReadingsVal($speakerHash->{NAME}, "friendlyName", ""), 1);
+  }
+}
+
+sub DLNARenderer_readingsSingleUpdateIfChanged {
+  my ($hash, $reading, $value, $trigger) = @_;
+  my $curVal = ReadingsVal($hash->{NAME}, $reading, "");
+  
+  if($curVal ne $value) {
+    readingsSingleUpdate($hash, $reading, $value, $trigger);
+  }
 }
 
 sub DLNARenderer_setMultiChannelSpeaker {
@@ -461,23 +566,14 @@ sub DLNARenderer_setMultiChannelSpeaker {
     DLNARenderer_upnpSetMultiChannelSpeaker($hash, "STEREO", $uuid, $name, "RIGHT_FRONT");
   }
   
-  return undef;  
+  return undef;
 }
 
 sub DLNARenderer_setStandaloneMode {
   my ($hash) = @_;
   my @multiRoomDevices = DLNARenderer_getAllDLNARenderersWithCaskeid($hash);
-  my @stereoDevices = split(",", ReadingsVal($hash->{NAME}, "stereoDevices", ""));
-  my $rightSpeaker;
-  my $leftSpeaker;
-  
-  foreach my $device (@stereoDevices) {
-    if($device =~ /^R:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-      $rightSpeaker = $1;
-    } elsif($device =~ /^L:([a-zA-Z0-9äöüßÄÜÖ_]+)/) {
-      $leftSpeaker = $1;
-    }
-  }
+  my $rightSpeaker = ReadingsVal($hash->{NAME}, "stereoRight", "");
+  my $leftSpeaker = ReadingsVal($hash->{NAME}, "stereoLeft", "");
   
   foreach my $device (@multiRoomDevices) {
     if(ReadingsVal($device->{NAME}, "friendlyName", "") eq $leftSpeaker or
@@ -486,7 +582,9 @@ sub DLNARenderer_setStandaloneMode {
     }
   }
   
-  readingsSingleUpdate($hash, "stereoDevices", "", 1);
+  readingsSingleUpdate($hash, "stereoLeft", "", 1);
+  readingsSingleUpdate($hash, "stereoRight", "", 1);
+  readingsSingleUpdate($hash, "stereoId", "", 1);
   
   return undef;
 }
@@ -502,61 +600,60 @@ sub DLNARenderer_createUuid {
 
 # SessionManagement
 sub DLNARenderer_createSession {
-  my ($hash, $dev) = @_;
-  return DLNARenderer_upnpCreateSession($hash, "FHEM_Session")->getValue("SessionID");
+  my ($hash) = @_;
+  return DLNARenderer_upnpCreateSession($hash, "FHEM_Session");
 }
 
 sub DLNARenderer_getSession {
-  my ($hash, $dev) = @_;
-  return DLNARenderer_upnpGetSession($hash)->getValue("SessionID");
+  my ($hash) = @_;
+  return DLNARenderer_upnpGetSession($hash);
 }
 
 sub DLNARenderer_destroySession {
-  my ($hash, $dev, $session) = @_;
+  my ($hash, $session) = @_;
   
   return DLNARenderer_upnpDestroySession($hash, $session);
 }
 
 sub DLNARenderer_destroyCurrentSession {
-  my ($hash, $dev) = @_;
+  my ($hash) = @_;
   
-  my $session = DLNARenderer_getSession($hash, $dev);
-  
-  if($session ne "") {
-    DLNARenderer_destroySession($hash, $dev, $session);
+  my $result = DLNARenderer_getSession($hash);
+  if($result->getValue("SessionID") ne "") {
+    DLNARenderer_destroySession($hash, $result->getValue("SessionID"));
   }
 }
 
 sub DLNARenderer_addUnitToPlay {
-  my ($hash, $dev, $unit) = @_;
+  my ($hash, $unit) = @_;
   
-  my $session = DLNARenderer_getSession($hash, $dev);
+  my $session = DLNARenderer_getSession($hash)->getValue("SessionID");
   
   if($session eq "") {
-    $session = DLNARenderer_createSession($hash, $dev);
+    $session = DLNARenderer_createSession($hash)->getValue("SessionID");
   }
   
-  DLNARenderer_addUnitToSession($hash, $dev, $unit, $session);
+  DLNARenderer_addUnitToSession($hash, $unit, $session);
 }
 
 sub DLNARenderer_removeUnitToPlay {
-  my ($hash, $dev, $unit) = @_;
+  my ($hash, $unit) = @_;
   
-  my $session = DLNARenderer_getSession($hash, $dev);
+  my $session = DLNARenderer_getSession($hash)->getValue("SessionID");
   
   if($session ne "") {
-    DLNARenderer_removeUnitFromSession($hash, $dev, $unit, $session);
+    DLNARenderer_removeUnitFromSession($hash, $unit, $session);
   }
 }
 
 sub DLNARenderer_addUnitToSession {
-  my ($hash, $dev, $uuid, $session) = @_;
+  my ($hash, $uuid, $session) = @_;
   
   return DLNARenderer_upnpAddUnitToSession($hash, $session, $uuid);
 }
 
 sub DLNARenderer_removeUnitFromSession {
-  my ($hash, $dev, $uuid, $session) = @_;
+  my ($hash, $uuid, $session) = @_;
   
   return DLNARenderer_upnpRemoveUnitFromSession($hash, $session, $uuid);
 }
@@ -583,16 +680,19 @@ sub DLNARenderer_getGroupDefinition {
 }
 
 sub DLNARenderer_saveGroupAs {
-  my ($hash, $dev, $groupName) = @_;  
+  my ($hash, $groupName) = @_;
   my $currentGroupSettings = AttrVal($hash->{NAME}, "multiRoomGroups", "");
   $currentGroupSettings .= "," if($currentGroupSettings ne "");
   
   #session details
   my $currentSession = ReadingsVal($hash->{NAME}, "multiRoomUnits", "");
   #stereo mode
-  my $stereoDevices = ReadingsVal($hash->{NAME}, "stereoDevices", "");
-  return undef if($currentSession eq "" && $stereoDevices eq "");
-  $stereoDevices .= "," if($stereoDevices ne "" && $currentSession ne "");
+  my $stereoLeft = ReadingsVal($hash->{NAME}, "stereoLeft", "");
+  my $stereoRight = ReadingsVal($hash->{NAME}, "stereoRight", "");
+  my $stereoDevices = "L:$stereoLeft,R:$stereoRight" if($stereoLeft ne "" && $stereoRight ne "");
+  
+  return undef if($currentSession eq "" && $stereoLeft eq "" && $stereoRight eq "");
+  $stereoDevices .= "," if($currentSession ne "" && $stereoDevices ne "");
   
   my $groupDefinition = $currentGroupSettings.$groupName."[".$stereoDevices.$currentSession."]";
     
@@ -614,13 +714,7 @@ sub DLNARenderer_addUnit {
         return undef if($unit eq $unitName);
       }
       #add unit to session
-      DLNARenderer_addUnitToPlay($hash, $hash->{helper}{device}, substr($client->{UDN},5));
-      my $currMultiRoomUnits = ReadingsVal($hash->{NAME}, "multiRoomUnits","");
-      if($currMultiRoomUnits ne "") {
-        readingsSingleUpdate($hash, "multiRoomUnits", $currMultiRoomUnits.",".$unitName, 1);
-      } else {
-        readingsSingleUpdate($hash, "multiRoomUnits", $unitName, 1);
-      }
+      DLNARenderer_addUnitToPlay($hash, substr($client->{UDN},5));
       return undef;
     }
   }
@@ -665,14 +759,19 @@ sub DLNARenderer_upnpPlay {
   return DLNARenderer_upnpCallAVTransport($hash, "Play", 0, 1);
 }
 
-sub DLNARenderer_upnpSyncPlay($$) {
-  my ($hash, $dev) = @_;
+sub DLNARenderer_upnpSyncPlay {
+  my ($hash) = @_;
   return DLNARenderer_upnpCallAVTransport($hash, "SyncPlay", 0, 1, "REL_TIME", "", "", "", "DeviceClockId");
 }
 
 sub DLNARenderer_upnpCallAVTransport {
   my ($hash, $method, @args) = @_;
   return DLNARenderer_upnpCall($hash, 'urn:upnp-org:serviceId:AVTransport', $method, @args);
+}
+
+sub DLNARenderer_upnpGetMultiChannelSpeaker {
+  my ($hash) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "GetMultiChannelSpeaker");
 }
 
 sub DLNARenderer_upnpSetMultiChannelSpeaker {
@@ -690,9 +789,9 @@ sub DLNARenderer_upnpAddUnitToSession {
   return DLNARenderer_upnpCallSessionManagement($hash, "AddUnitToSession", $session, $uuid);
 }
 
-sub DLNARenderer_upnpRemoveUnitToSession {
+sub DLNARenderer_upnpRemoveUnitFromSession {
   my ($hash, $session, $uuid) = @_;
-  return DLNARenderer_upnpCallSessionManagement($hash, "RemoveUnitToSession", $session, $uuid);
+  return DLNARenderer_upnpCallSessionManagement($hash, "RemoveUnitFromSession", $session, $uuid);
 }
 
 sub DLNARenderer_upnpDestroySession {
@@ -710,14 +809,14 @@ sub DLNARenderer_upnpGetSession {
   return DLNARenderer_upnpCallSessionManagement($hash, "GetSession");
 }
 
-sub DLNARenderer_upnpAddUnitToGroup {
-  my ($hash, $dev, $unit, $name) = @_;
-  return DLNARenderer_upnpCallSpeakerManagement($hash, "AddUnitToGroup", $unit, $name, "");
+sub DLNARenderer_upnpAddToGroup {
+  my ($hash, $unit, $name) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "AddToGroup", $unit, $name, "");
 }
 
-sub DLNARenderer_upnpRemoveUnitFromGroup {
-  my ($hash, $dev, $unit) = @_;
-  return DLNARenderer_upnpCallSpeakerManagement($hash, "RemoveUnitToGroup", $unit);
+sub DLNARenderer_upnpRemoveFromGroup {
+  my ($hash, $unit) = @_;
+  return DLNARenderer_upnpCallSpeakerManagement($hash, "RemoveFromGroup", $unit);
 }
 
 sub DLNARenderer_upnpCallSessionManagement {
@@ -728,6 +827,11 @@ sub DLNARenderer_upnpCallSessionManagement {
 sub DLNARenderer_upnpSetVolume {
   my ($hash, $targetVolume) = @_;
   return DLNARenderer_upnpCallRenderingControl($hash, "SetVolume", 0, "Master", $targetVolume);
+}
+
+sub DLNARenderer_upnpSetMute {
+  my ($hash, $muteState) = @_;
+  return DLNARenderer_upnpCallRenderingControl($hash, "SetMute", 0, "Master", $muteState);
 }
 
 sub DLNARenderer_upnpCallRenderingControl {
@@ -815,6 +919,7 @@ sub DLNARenderer_processEventXml {
         my $e = $xml->{Event}{InstanceID};
         DLNARenderer_updateVolumeByEvent($hash, "mute", $e->{Mute});
         DLNARenderer_updateVolumeByEvent($hash, "volume", $e->{Volume});
+        readingsSingleUpdate($hash, "multiRoomVolume", ReadingsVal($hash->{NAME}, "volume", 0), 1);
       } elsif ($xml->{Event}{xmlns} eq "FIXME SpeakerManagement") {
         #process SpeakerManagement
       }
@@ -1029,6 +1134,16 @@ sub DLNARenderer_renewSubscriptions {
   
   return undef if(!defined($dev));
   
+  BlockingCall('DLNARenderer_renewSubscriptionBlocking', $hash->{NAME});
+  
+  return undef;
+}
+
+sub DLNARenderer_renewSubscriptionBlocking {
+  my ($string) = @_;
+  my ($name) = split("\\|", $string);
+  my $hash = $main::defs{$name};
+  
   #register callbacks
   #urn:upnp-org:serviceId:AVTransport
   eval {
@@ -1050,8 +1165,6 @@ sub DLNARenderer_renewSubscriptions {
       $hash->{helper}{speakerManagementSubscription}->renew();
     }
   };
-  
-  return undef;
 }
 
 sub DLNARenderer_addedDevice {
@@ -1074,6 +1187,10 @@ sub DLNARenderer_addedDevice {
 
   if(!$foundDevice) {
     my $uniqueDeviceName = "DLNA_".substr($dev->UDN(),29,12);
+    if(length($uniqueDeviceName) < 17) {
+      $uniqueDeviceName = "DLNA_".substr($dev->UDN(),5);
+      $uniqueDeviceName =~ tr/-/_/;
+    }
     CommandDefine(undef, "$uniqueDeviceName DLNARenderer ".$dev->UDN());
     CommandAttr(undef,"$uniqueDeviceName alias ".$dev->friendlyName());
     CommandAttr(undef,"$uniqueDeviceName webCmd volume");
@@ -1157,7 +1274,7 @@ sub DLNARenderer_removedDevice($$) {
 sub DLNARenderer_getMainDLNARenderer($) {
   my ($hash) = @_;
     
-  foreach my $fhem_dev (sort keys %main::defs) { 
+  foreach my $fhem_dev (sort keys %main::defs) {
     return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq "0");
   }
 		
@@ -1167,8 +1284,19 @@ sub DLNARenderer_getMainDLNARenderer($) {
 sub DLNARenderer_getHashByUDN($$) {
   my ($hash, $udn) = @_;
   
-  foreach my $fhem_dev (sort keys %main::defs) { 
+  foreach my $fhem_dev (sort keys %main::defs) {
     return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} eq $udn);
+  }
+		
+  return undef;
+}
+
+sub DLNARenderer_getHashByFriendlyName {
+  my ($hash, $friendlyName) = @_;
+  
+  foreach my $fhem_dev (sort keys %main::defs) {
+    my $devHash = $main::defs{$fhem_dev};
+    return $devHash if($devHash->{TYPE} eq 'DLNARenderer' && ReadingsVal($devHash->{NAME}, "friendlyName", "") eq $friendlyName);
   }
 		
   return undef;
@@ -1178,7 +1306,7 @@ sub DLNARenderer_getAllDLNARenderers($) {
   my ($hash) = @_;
   my @DLNARenderers = ();
     
-  foreach my $fhem_dev (sort keys %main::defs) { 
+  foreach my $fhem_dev (sort keys %main::defs) {
     push @DLNARenderers, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'DLNARenderer' && $main::defs{$fhem_dev}{UDN} ne "0" && $main::defs{$fhem_dev}{UDN} ne "-1");
   }
 		

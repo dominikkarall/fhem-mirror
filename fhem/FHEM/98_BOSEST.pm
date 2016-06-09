@@ -1177,6 +1177,7 @@ sub BOSEST_checkDoubleTap($$) {
         
         if($hash->{helper}{dt_counter} == 2) {
             if(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq $hash->{DEVICEID}) {
+                #TODO retrieve current zone info and check based on that one?
                 BOSEST_stopPlayEverywhere($hash);
                 $hash->{helper}{dt_lastChange} = gettimeofday();
             } elsif(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq "") {
@@ -1361,15 +1362,6 @@ sub BOSEST_parseAndUpdateChannel($$) {
 
 sub BOSEST_parseAndUpdateZone($$) {
     my ($hash, $zone) = @_;
-    
-    #check if zone master is still active
-    if(defined($zone->{master})) {
-        my $masterHash = BOSEST_getBosePlayerByDeviceId($hash, $zone->{master});
-        my $masterZoneMaster = ReadingsVal($masterHash->{NAME}, "zoneMaster", "");
-        if($masterZoneMaster eq "") {
-            return undef;
-        }
-    }
     
     my $i = 1;
     readingsBeginUpdate($hash);
