@@ -6,9 +6,23 @@
 # FHEM module to communicate with BOSE SoundTouch system
 # API as defined in BOSE SoundTouchAPI_WebServices_v1.0.1.pdf
 #
-# Version: 1.5.5
+# Version: 1.5.7
 #
 #############################################################
+#
+# v1.5.7 - 201606XX
+# - BUGFIX: fix off command if zone-play is active
+# - BUGFIX: fix auto-zone if zone-play is already active
+# - BUGFIX: do not create auto-zone if both players play nothing
+#
+# v1.5.6 - 20160611
+# - FEATURE: auto-zone, start zone-play if speakers are playing the same (contentItemLocation)
+#             attr <name> autoZone on (default: off)
+# - BUGFIX: set zone only from master device as slave devices might not always report the truth (known bug at BOSE)
+# - CHANGE: set zonemember_X to UDN instead of player name
+# - CHANGE: delete TTS files after 30 days
+# - CHANGE: reduce number of http calls after each discovery process
+# - CHANGE: reduce number of http calls for key presses
 #
 # v1.5.5 - 20160510
 # - BUGFIX: fix unitiliazed value in handleDeviceByIp
@@ -56,7 +70,7 @@
 #  - FEATURE: speak "not available" text on Google Captcha
 #             can be disabled by ttsSpeakOnError = 0
 #  - FEATURE: set default TTS language via ttsLanguage attribute
-#  - FEATURE: automatically add DLNA server running on the same 
+#  - FEATURE: automatically add DLNA server running on the same
 #             server as FHEM to the BOSE library
 #  - FEATURE: automatically add all DLNA servers to BOSE library
 #             requires autoAddDLNAServers = 1 attribute for "main" (not players!)
@@ -174,21 +188,18 @@
 #  - change preset via /key
 #
 # TODO
-#  - support multiroom volume
-#  - support http://... for streaming via DLNA (.m3u file?)
-#  - TTS code cleanup (group functions logically)
-#  - delete TTS files after 30 days (http://www.fhemwiki.de/wiki/DevelopmentModuleAPI#setKeyValue)
-#  - define own groups of players
-#  - update readings only on change
-#  - fix usage of bulkupdate vs. singleupdate
-#  - check if Mojolicious::Lite can be used
-#  - check if Mojolicious should be used for HTTPGET/HTTPPOST
-#  - use frame ping to keep connection alive
-#  - ramp up/down volume support
-#  - "auto-zone" if 2 or more speakers play the same station
+# - redesign multiroom functionality (virtual devices: represent the readings of master device
+#    and send the commands only to the master device (except volume?)
+#    automatically create group before playing
+# - support multiroom volume (check with SoundTouch app to see commands)
+# - use websocket frame ping (WS_PING) instead of websocket XML ping
+# - TTS code cleanup (group functions logically)
+# - update readings only on change
+# - fix usage of bulkupdate vs. singleupdate
+# - check if Mojolicious should be used for HTTPGET/HTTPPOST
+# - ramp up/down volume support in SetExtensions
 #
 #############################################################
-
 
 BEGIN {
     $ENV{MOJO_REACTOR} = "Mojo::Reactor::Poll";
@@ -219,11 +230,11 @@ my $BOSEST_GOOGLE_NOT_AVAILABLE_LANG = "en";
 sub BOSEST_Initialize($) {
     my ($hash) = @_;
     
-    $hash->{DefFn} = 'BOSEST_Define';
-    $hash->{UndefFn} = 'BOSEST_Undef';
-    $hash->{GetFn} = 'BOSEST_Get';
-    $hash->{SetFn} = 'BOSEST_Set';
-    $hash->{AttrFn} = 'BOSEST_Attribute';
+    $hash->{DefFn}    = 'BOSEST_Define';
+    $hash->{UndefFn}  = 'BOSEST_Undef';
+    $hash->{GetFn}    = 'BOSEST_Get';
+    $hash->{SetFn}    = 'BOSEST_Set';
+    $hash->{AttrFn}   = 'BOSEST_Attribute';
     
     return undef;
 }
@@ -238,7 +249,7 @@ sub BOSEST_Define($$) {
     
     if (int(@a) > 3) {
         return 'BOSEST: Wrong syntax, must be define <name> BOSEST [<deviceID>]';
-    } elsif(int(@a) == 3) {    
+    } elsif(int(@a) == 3) {
         my $param = $a[2];
         #set device id from parameter
         $hash->{DEVICEID} = $param;
@@ -246,8 +257,6 @@ sub BOSEST_Define($$) {
         #set IP to unknown
         $hash->{helper}{IP} = "unknown";
         readingsSingleUpdate($hash, "IP", "unknown", 1);
-        
-        #TODO cleanup all readings on startup (updateIP?)
         
         #allow on/off commands (updateIP?)
         $hash->{helper}{sent_on} = 0;
@@ -271,9 +280,11 @@ sub BOSEST_Define($$) {
                                 channel_12 channel_13 channel_14 channel_15 channel_16
                                 channel_17 channel_18 channel_19 channel_20 ignoreDeviceIDs
                                 ttsDirectory ttsLanguage ttsSpeakOnError ttsDLNAServer ttsVolume
-                                autoAddDLNAServers speakChannel)) {
+                                autoAddDLNAServers speakChannel autoZone)) {
           addToDevAttrList($name, $attrname);
         }
+        
+        BOSEST_deleteOldTTSFiles($hash);
         
         #FIXME reset all recent_$i entries on startup (must be done here, otherwise readings are displayed when player wasn't found)
     }
@@ -286,7 +297,7 @@ sub BOSEST_Define($$) {
     $hash->{helper}{supportedBassCmds} = "";
     
     if (int(@a) < 3) {
-        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.5";
+        Log3 $hash, 3, "BOSEST: BOSE SoundTouch v1.5.7";
         #start discovery process 30s delayed
         InternalTimer(gettimeofday()+30, "BOSEST_startDiscoveryProcess", $hash, 0);
         
@@ -333,15 +344,15 @@ sub BOSEST_Set($@) {
     }
     @params = @params2;
 
-    my $list = "on:noArg off:noArg power:noArg play:noArg 
-                mute:on,off,toggle recent source:".$hash->{helper}{supportedSourcesCmds}." 
-                nextTrack:noArg prevTrack:noArg playTrack speak speakOff 
-                playEverywhere:noArg stopPlayEverywhere:noArg createZone addToZone removeFromZone 
-                clock:enable,disable 
-                stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 
-                volume:slider,0,1,100 ".$hash->{helper}{supportedBassCmds}." 
-                saveChannel:07,08,09,10,11,12,13,14,15,16,17,18,19,20 
-                addDLNAServer:".$hash->{helper}{dlnaServers}." 
+    my $list = "on:noArg off:noArg power:noArg play:noArg
+                mute:on,off,toggle recent source:".$hash->{helper}{supportedSourcesCmds}."
+                nextTrack:noArg prevTrack:noArg playTrack speak speakOff
+                playEverywhere:noArg stopPlayEverywhere:noArg createZone addToZone removeFromZone
+                clock:enable,disable
+                stop:noArg pause:noArg channel:1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20
+                volume:slider,0,1,100 ".$hash->{helper}{supportedBassCmds}."
+                saveChannel:07,08,09,10,11,12,13,14,15,16,17,18,19,20
+                addDLNAServer:".$hash->{helper}{dlnaServers}."
                 removeDLNAServer:".ReadingsVal($hash->{NAME}, "connectedDLNAServers", "noArg");
 
     # check parameters for set function
@@ -362,6 +373,8 @@ sub BOSEST_Set($@) {
         return "BOSEST: volume requires volume as additional parameter" if(int(@params) < 1);
         #params[0] = volume value
         BOSEST_setVolume($hash, $params[0]);
+    } elsif($workType eq "zoneVolume") {
+        BOSEST_setZoneVolume($hash, $params[0]);
     } elsif($workType eq "channel") {
         return "BOSEST: channel requires preset id as additional parameter" if(int(@params) < 1);
         #params[0] = preset channel
@@ -415,6 +428,7 @@ sub BOSEST_Set($@) {
     } elsif($workType eq "off") {
         if(!$hash->{helper}{sent_off}) {
             BOSEST_off($hash);
+            InternalTimer(gettimeofday()+2, "BOSEST_off", $hash, 0);
             $hash->{helper}{sent_off} = 1;
         }
     } elsif($workType eq "nextTrack") {
@@ -477,6 +491,31 @@ sub BOSEST_Set($@) {
 }
 
 #DEVELOPNEWFUNCTION-2 (create own function)
+sub BOSEST_setZoneVolume {
+  my ($hash, $targetVolume) = @_;
+  #FIXME
+  # #change volume of this device
+  # DLNARenderer_volume($hash, $targetVolume);
+  
+  # #handle volume for all devices in the current group
+  # #iterate through group and change volume relative to the current volume of this device
+  # my $mainVolumeDiff = DLNARenderer_convertVolumeToAbsolute($hash, $targetVolume) - ReadingsVal($hash->{NAME}, "volume", 0);
+  # my $multiRoomUnits = ReadingsVal($hash->{NAME}, "multiRoomUnits", "");
+  # my @multiRoomUnitsArray = split("," $multiRoomUnits);
+  # foreach my $unit (@multiRoomUnitsArray) {
+  #   my $devHash = DLNARenderer_getHashByFriendlyName($hash, $unit);
+  #   my $newVolume = ReadingsVal($devHash->{NAME}, "volume", 0) + $mainVolumeDiff);
+  #   if($newVolume > 100) {
+  #     $newVolume = 100;
+  #   } elsif($newVolume < 0) {
+  #     $newVolume = 0;
+  #   }
+  #   DLNARenderer_volume($devHash, $newVolume);
+  # }
+  
+  return undef;
+}
+
 sub BOSEST_clockSettings($$) {
     my ($hash, $val) = @_;
     
@@ -744,7 +783,7 @@ sub BOSEST_setVolume($$) {
 sub BOSEST_setMute($$) {
     my ($hash, $mute) = @_;
     
-    if(($mute eq "on" && $hash->{READINGS}{mute}{VAL} eq "false") or 
+    if(($mute eq "on" && $hash->{READINGS}{mute}{VAL} eq "false") or
        ($mute eq "off" && $hash->{READINGS}{mute}{VAL} eq "true") or
        ($mute eq "toggle")) {
         BOSEST_sendKey($hash, "MUTE");
@@ -993,6 +1032,32 @@ sub BOSEST_playMessage($$$$) {
     return undef;
 }
 
+sub BOSEST_deleteOldTTSFiles {
+    my ($hash) = @_;
+    my ($err, $val) = getKeyValue("BOSEST_tts_files");
+    my @ttsFiles = split(",", $val);
+    my $ttsDir = AttrVal($hash->{NAME}, "ttsDirectory", "");
+    
+    return undef if($ttsDir eq "");
+    
+    InternalTimer(gettimeofday()+86500, "BOSEST_deleteOldTTSFiles", $hash, 0);
+    
+    foreach my $ttsFile (@ttsFiles) {
+        ($err, $val) = getKeyValue($ttsFile);
+        my $now = gettimeofday();
+        if($now - $val > 2592000) {
+            #delete file
+            unlink $ttsDir."/".$ttsFile.".mp3";;
+            #remove $ttsFile from BOSEST_tts_files array
+            @ttsFiles = grep { $_ != $ttsFile } @ttsFiles;
+            #remove key
+            $err = setKeyValue($ttsFile, undef);
+        }
+    }
+    
+    $err = setKeyValue("BOSEST_tts_files", join(",", @ttsFiles));
+}
+
 sub BOSEST_playGoogleTTS($$$$$$) {
     my ($hash, $ttsDir, $text, $volume, $lang, $stopAfterSpeak) = @_;
     
@@ -1016,6 +1081,14 @@ sub BOSEST_playGoogleTTS($$$$$$) {
             my ($hash, $filename, $md5, $downloadOk) = @_;
             
             if($downloadOk) {
+                my ($err, $val) = getKeyValue("BOSEST_tts_files");
+                if(!defined($val)) {
+                    $val = "";
+                } else {
+                    $val .= ",";
+                }
+                $err = setKeyValue("BOSEST_tts_files", $val.$md5);
+                $err = setKeyValue($md5, gettimeofday());
                 BOSEST_playMessage($hash, $md5, $volume, $stopAfterSpeak);
             } else {
                 if(AttrVal($hash->{NAME}, "ttsSpeakOnError", "1") eq "1") {
@@ -1127,21 +1200,21 @@ sub BOSEST_updatePresets($$) {
     my ($hash, $deviceId) = @_;
     my $presets = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/presets");
     BOSEST_processXml($hash, $presets);
-    return undef;    
+    return undef;
 }
 
 sub BOSEST_updateZone($$) {
     my ($hash, $deviceId) = @_;
     my $zone = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/getZone");
     BOSEST_processXml($hash, $zone);
-    return undef;    
+    return undef;
 }
 
 sub BOSEST_updateVolume($$) {
     my ($hash, $deviceId) = @_;
     my $volume = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/volume");
     BOSEST_processXml($hash, $volume);
-    return undef;    
+    return undef;
 }
 
 sub BOSEST_updateBass($$) {
@@ -1156,6 +1229,38 @@ sub BOSEST_updateNowPlaying($$) {
     my $nowPlaying = BOSEST_HTTPGET($hash, $hash->{helper}{IP}, "/now_playing");
     BOSEST_processXml($hash, $nowPlaying);
     return undef;
+}
+
+sub BOSEST_updateAutoZone {
+  my ($hash, $location) = @_;
+  
+  return undef if($location eq "");
+  return undef if(AttrVal($hash->{NAME}, "autoZone", "off") eq "off");
+  
+  my @allPlayers = BOSEST_getAllBosePlayers($hash);
+  my $newZoneMaster;
+  my $createZone = 0;
+  foreach my $playerHash (@allPlayers) {
+    next if($playerHash->{DEVICEID} eq $hash->{DEVICEID});
+    
+    my $playerLocation = ReadingsVal($playerHash->{NAME}, "contentItemLocation", "");
+    my $playerZoneMaster = ReadingsVal($playerHash->{NAME}, "zoneMaster", "");
+    Log3 $hash, 5, "BOSEST: auto-zone $hash->{NAME}: $location = $playerHash->{NAME}: $playerLocation?";
+    #make sure that $playerHash is master device
+    if($playerLocation eq $location && ($playerZoneMaster eq "" or $playerZoneMaster eq $playerHash->{DEVICEID})) {
+      #TODO: check if createZone is needed
+      $newZoneMaster = $playerHash;
+      $createZone = 1 if($playerZoneMaster eq "");
+    }
+  }
+  
+  if($newZoneMaster) {
+    if($createZone) {
+        BOSEST_createZone($newZoneMaster, $hash->{DEVICEID});
+    } else {
+        BOSEST_addToZone($newZoneMaster, $hash->{DEVICEID});
+    }
+  }
 }
 
 sub BOSEST_checkDoubleTap($$) {
@@ -1177,7 +1282,6 @@ sub BOSEST_checkDoubleTap($$) {
         
         if($hash->{helper}{dt_counter} == 2) {
             if(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq $hash->{DEVICEID}) {
-                #TODO retrieve current zone info and check based on that one?
                 BOSEST_stopPlayEverywhere($hash);
                 $hash->{helper}{dt_lastChange} = gettimeofday();
             } elsif(ReadingsVal($hash->{NAME}, "zoneMaster", "") eq "") {
@@ -1363,23 +1467,48 @@ sub BOSEST_parseAndUpdateChannel($$) {
 sub BOSEST_parseAndUpdateZone($$) {
     my ($hash, $zone) = @_;
     
+    #only update zone from master
+    if(defined($zone->{master})) {
+        my $masterHash = BOSEST_getBosePlayerByDeviceId($hash, $zone->{master});
+        if($masterHash->{DEVICEID} ne $hash->{DEVICEID}) {
+            return undef;
+        }
+    }
+    
     my $i = 1;
     readingsBeginUpdate($hash);
     BOSEST_XMLUpdate($hash, "zoneMaster", $zone->{master});
+    readingsEndUpdate($hash, 1);
+    
     if($zone->{member}) {
         foreach my $member (@{$zone->{member}}) {
             my $player = BOSEST_getBosePlayerByDeviceId($hash, $member->{content});
-            BOSEST_XMLUpdate($hash, "zoneMember_$i", $player->{NAME});
+            readingsBeginUpdate($hash);
+            BOSEST_XMLUpdate($hash, "zoneMember_$i", $player->{DEVICEID});
+            readingsEndUpdate($hash, 1);
+            
+            readingsBeginUpdate($player);
+            BOSEST_XMLUpdate($player, "zoneMaster", $zone->{master});
+            readingsEndUpdate($player, 1);
             $i++;
         }
+        
+        my $memberCnt = $i - 1;
+        foreach my $member (@{$zone->{member}}) {
+            my $player = BOSEST_getBosePlayerByDeviceId($hash, $member->{content});
+            readingsBeginUpdate($player);
+            foreach my $cnt ($memberCnt..1) {
+                BOSEST_XMLUpdate($player, "zoneMember_$cnt", ReadingsVal($hash->{NAME}, "zoneMember_$cnt", ""));
+            }
+            readingsEndUpdate($player, 1);
+        }
     }
-    readingsEndUpdate($hash, 1);
     
     while ($i < 20) {
         if(defined($hash->{READINGS}{"zoneMember_$i"})) {
-            my $zoneMemberName = ReadingsVal($hash->{NAME}, "zoneMember_$i", "");
-            if($zoneMemberName ne "") {
-                my $memberHash = $main::defs{$zoneMemberName};
+            my $zoneMemberUdn = ReadingsVal($hash->{NAME}, "zoneMember_$i", "");
+            if($zoneMemberUdn ne "") {
+                my $memberHash = BOSEST_getBosePlayerByDeviceId($hash, $zoneMemberUdn);
                 readingsBeginUpdate($memberHash);
                 BOSEST_XMLUpdate($memberHash, "zoneMaster", "");
                 my $j = 1;
@@ -1513,6 +1642,9 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
         BOSEST_XMLUpdate($hash, "contentItemSource", $nowPlaying->{ContentItem}->{source});
         BOSEST_XMLUpdate($hash, "contentItemIsPresetable", $nowPlaying->{ContentItem}->{isPresetable});
         BOSEST_XMLUpdate($hash, "contentItemType", $nowPlaying->{ContentItem}->{type});
+        #TODO
+        #if location is the same as on other speaker, start auto-zone
+        BOSEST_updateAutoZone($hash, ReadingsVal($hash->{NAME}, "contentItemLocation", 1));
     } else {
         BOSEST_XMLUpdate($hash, "contentItemItemName", "");
         BOSEST_XMLUpdate($hash, "contentItemLocation", "");
@@ -1552,7 +1684,7 @@ sub BOSEST_parseAndUpdateNowPlaying($$) {
     $hash->{helper}{sent_off} = 0;
     $hash->{helper}{sent_on} = 0;
     
-    readingsEndUpdate($hash, 1);   
+    readingsEndUpdate($hash, 1);
     
     return undef;
 }
@@ -1575,8 +1707,6 @@ sub BOSEST_handleDeviceByIp {
     my ($hash, $ip) = @_;
     my $return = "";
     
-    #TODO check if device exists by IP
-    
     my $info = BOSEST_HTTPGET($hash, $ip, "/info");
     #remove info tag to reduce line length
     $info = $info->{info} if (defined($info->{info}));
@@ -1591,37 +1721,36 @@ sub BOSEST_handleDeviceByIp {
         $info->{name} = Encode::encode('UTF-8',$info->{name});
         Log3 $hash, 3, "BOSEST: Device $info->{name} ($info->{deviceID}) found.";
         $return = $return."|commandDefineBOSE|$info->{deviceID},$info->{name}";
+        
+        #set supported capabilities
+        my $capabilities = BOSEST_HTTPGET($hash, $ip, "/capabilities");
+        $return .= "|capabilities|$info->{deviceID}";
+        if($capabilities->{capabilities}->{clockDisplay}) {
+            $return .= ",".$capabilities->{capabilities}->{clockDisplay};
+        } else {
+            $return .= ",false";
+        }
+    
+        #set supported bass capabilities
+        my $bassCapabilities = BOSEST_HTTPGET($hash, $ip, "/bassCapabilities");
+        $return .= "|bassCapabilities|$info->{deviceID}";
+        if($bassCapabilities->{bassCapabilities}) {
+            my $bassCap = $bassCapabilities->{bassCapabilities};
+            $return .= ",".$bassCap->{bassAvailable}.",".$bassCap->{bassMin}.",".
+                       $bassCap->{bassMax}.",".$bassCap->{bassDefault};
+        }
     }
 
-    #MOVE THIS PART INTO THE IF ABOVE FOR NEXT VERSION
+    #TODO create own function (add own DLNA server)
+    my $myIp = BOSEST_getMyIp($hash);
+    my $listMediaServers = BOSEST_HTTPGET($hash, $ip, "/listMediaServers");
+    
     #set supported sources
     my $sources = BOSEST_HTTPGET($hash, $ip, "/sources");
     $return .= "|supportedSources|$info->{deviceID}";
     foreach my $source (@{ $sources->{sources}->{sourceItem} }) {
         $return .= ",".$source->{source};
     }
-
-    #set supported capabilities
-    my $capabilities = BOSEST_HTTPGET($hash, $ip, "/capabilities");
-    $return .= "|capabilities|$info->{deviceID}";
-    if($capabilities->{capabilities}->{clockDisplay}) {
-        $return .= ",".$capabilities->{capabilities}->{clockDisplay};
-    } else {
-        $return .= ",false";
-    }
-
-    #set supported bass capabilities
-    my $bassCapabilities = BOSEST_HTTPGET($hash, $ip, "/bassCapabilities");
-    $return .= "|bassCapabilities|$info->{deviceID}";
-    if($bassCapabilities->{bassCapabilities}) {
-        my $bassCap = $bassCapabilities->{bassCapabilities};
-        $return .= ",".$bassCap->{bassAvailable}.",".$bassCap->{bassMin}.",".
-                   $bassCap->{bassMax}.",".$bassCap->{bassDefault};
-    }
-
-    #TODO create own function (add own DLNA server)
-    my $myIp = BOSEST_getMyIp($hash);
-    my $listMediaServers = BOSEST_HTTPGET($hash, $ip, "/listMediaServers");
 
     my $returnListMediaServers = "|listMediaServers|".$info->{deviceID};
     foreach my $mediaServer (@{ $listMediaServers->{ListMediaServersResponse}->{media_server} }) {
@@ -1695,8 +1824,8 @@ sub BOSEST_finishedDiscovery($) {
     
     delete($hash->{helper}{DISCOVERY_PID});
     
-    #start discovery again after 60s
-    InternalTimer(gettimeofday()+60, "BOSEST_startDiscoveryProcess", $hash, 1);
+    #start discovery again after 67s
+    InternalTimer(gettimeofday()+67, "BOSEST_startDiscoveryProcess", $hash, 1);
 
     for($i = 1; $i < @commands; $i = $i+2) {
         my $command = $commands[$i];
@@ -1750,7 +1879,7 @@ sub BOSEST_finishedDiscovery($) {
                     $deviceHash->{helper}{airplaySupport} = 1;
                     $deviceHash->{helper}{supportedSourcesCmds} .= "airplay,";
                 }
-            } 
+            }
             $deviceHash->{helper}{supportedSourcesCmds} = substr($deviceHash->{helper}{supportedSourcesCmds}, 0, length($deviceHash->{helper}{supportedSourcesCmds})-1);
         } elsif($command eq "capabilities") {
             my $deviceHash = BOSEST_getBosePlayerByDeviceId($hash, $deviceId);
@@ -1872,6 +2001,7 @@ sub BOSEST_webSocketPing($$) {
               '" url="webserver/pingRequest" method="GET"><request requestID="'.
               $hash->{helper}{requestId}.
               '"><info type="new"/></request></header></msg>');
+    #$tx->send([1, 0, 0, 0, WS_PING, 'Hello World!']);
     return undef;
 }
 
@@ -1976,7 +2106,7 @@ sub BOSEST_getBosePlayerByDeviceId($$) {
     my ($hash, $deviceId) = @_;
     
     if (defined($deviceId)) {
-        foreach my $fhem_dev (sort keys %main::defs) { 
+        foreach my $fhem_dev (sort keys %main::defs) {
           return $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'BOSEST' && $main::defs{$fhem_dev}{DEVICEID} eq $deviceId);
         }
     } else {
@@ -1990,7 +2120,7 @@ sub BOSEST_getAllBosePlayers($) {
     my ($hash) = @_;
     my @players = ();
     
-		foreach my $fhem_dev (sort keys %main::defs) { 
+		foreach my $fhem_dev (sort keys %main::defs) {
 			push @players, $main::defs{$fhem_dev} if($main::defs{$fhem_dev}{TYPE} eq 'BOSEST' && $main::defs{$fhem_dev}{DEVICEID} ne "0");
 		}
 		
@@ -2001,10 +2131,9 @@ sub BOSEST_sendKey($$) {
     my ($hash, $key) = @_;
     my $postXml = '<key state="press" sender="Gabbo">'.$key.'</key>';
     if(BOSEST_HTTPPOST($hash, '/key', $postXml)) {
-        select(undef, undef, undef, .05); #sleep 50ms
         $postXml = '<key state="release" sender="Gabbo">'.$key.'</key>';
         if(BOSEST_HTTPPOST($hash, '/key', $postXml)) {
-            #FIXME success
+            return undef;
         }
     }
     #FIXME error handling
@@ -2100,7 +2229,7 @@ sub BOSEST_XMLUpdate($$$) {
   BOSEST is used to control a BOSE SoundTouch system (one or more SoundTouch 10, 20 or 30 devices)<br><br>
 	<b>Note:</b> The followig libraries  are required for this module:
 		<ul><li>libwww-perl <li>libmojolicious-perl <li>libxml-simple-perl <li>libnet-bonjour-perl <li>libev-perl</li><br>
-		Use <b>sudo apt-get install libwww-perl libmojolicious-perl libxml-simple-perl libnet-bonjour-perl libev-perl</b> to install this libraries.<br>Please note: 
+		Use <b>sudo apt-get install libwww-perl libmojolicious-perl libxml-simple-perl libnet-bonjour-perl libev-perl</b> to install this libraries.<br>Please note:
 		libmojolicious-perl must be >=5.54, but under wheezy is only 2.x avaible.<br>
 		Use <b>sudo apt-get install cpanminus</b> and <b>sudo cpanm Mojolicious</b> to update to the newest version</ul><br>
 
@@ -2125,7 +2254,7 @@ sub BOSEST_XMLUpdate($$$) {
                The following commands are defined for the devices/speakers (execpt <b>autoAddDLNAServers</b> is for the "main" BOSEST) :<br><br>
         <ul><u>General commands</u>
           <li><code><b>on</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device</li>
-          <li><code><b>off</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off</li>          
+          <li><code><b>off</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off</li>
           <li><code><b>power</b></code> &nbsp;&nbsp;-&nbsp;&nbsp; toggle on/off</li>
           <li><code><b>volume</b> [0...100] [+x|-x]</code> &nbsp;&nbsp;-&nbsp;&nbsp; set the volume level in percentage or change volume by ±x from current level</li>
           <li><code><b>channel</b> 0...20</code> &nbsp;&nbsp;-&nbsp;&nbsp; select present to play</li>
@@ -2141,9 +2270,9 @@ sub BOSEST_XMLUpdate($$$) {
           <li><code><b>source</b> bluetooth,bt-discover,aux mode, airplay</code> &nbsp;&nbsp;-&nbsp;&nbsp; select a local source</li><br>
           <li><code><b>addDLNAServer</b> Name1 [Name2] [Namex]</code> &nbsp;&nbsp;-&nbsp;&nbsp; add DLNA servers Name1 (and Name2 to Namex) to the BOSE library</li>
           <li><code><b>removeDLNAServer</b> Name1 [Name2] [Namex]</code> &nbsp;&nbsp;-&nbsp;&nbsp; remove DLNA servers Name1 (and Name2 to Namex) to the BOSE library</li>
-         </ul><br>Example: <code>set BOSE_1234567890AB volume 25</code>&nbsp;&nbsp;Set volume on device with the name BOSE_1234567890AB <br><br><br>  
+         </ul><br>Example: <code>set BOSE_1234567890AB volume 25</code>&nbsp;&nbsp;Set volume on device with the name BOSE_1234567890AB <br><br><br>
          	
-         <ul><u>Timer commands:</u>        
+         <ul><u>Timer commands:</u>
           <li><code><b>on-for-timer</b> 1...x</code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device for x seconds</li>
           <li><code><b>off-for-timer</b> 1...x</code> &nbsp;&nbsp;-&nbsp;&nbsp; turn the device off and power on again after x seconds</li>
           <li><code><b>on-till</b> hh:mm:ss</code> &nbsp;&nbsp;-&nbsp;&nbsp; power on the device until defined time</li>
@@ -2153,7 +2282,7 @@ sub BOSEST_XMLUpdate($$$) {
          </ul><br>Example: <code>set BOSE_1234567890AB on-till 23:00:00</code>&nbsp;&nbsp;Switches device with the name BOSE_1234567890AB now on and at 23:00:00 off<br><br><br>
          	
          <ul><u>Multiroom commands:</u>
-          <li><code><b>createZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; create multiroom zone (defines <code>&lt;name&gt;</code> as zoneMaster) </li>          
+          <li><code><b>createZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; create multiroom zone (defines <code>&lt;name&gt;</code> as zoneMaster) </li>
           <li><code><b>addToZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; add device <code>&lt;name&gt;</code> to multiroom zone</li>
           <li><code><b>removeFromZone</b> deviceID</code> &nbsp;&nbsp;-&nbsp;&nbsp; remove device <code>&lt;name&gt;</code> from multiroom zone</li>
           <li><code><b>playEverywhere</b></code>  &nbsp;&nbsp;-&nbsp;&nbsp; play sound of  device <code>&lt;name&gt;</code> on all others devices</li>
@@ -2164,10 +2293,10 @@ sub BOSEST_XMLUpdate($$$) {
          <li><code><b>speak</b> "message" [0...100] [+x|-x] [en|de|xx]</code> &nbsp;&nbsp;-&nbsp;&nbsp; Text to speak, optional with volume adjustment and language to use. The message to speak may have up to 100 letters</li>
          <li><code><b>speakOff</b> "message" [0...100] [+x|-x] [en|de|xx]</code> &nbsp;&nbsp;-&nbsp;&nbsp; Text to speak, optional with volume adjustment and language to use. The message to speak may have up to 100 letters. Device is switched off after speak</li>
          <li><code><b>ttsVolume</b> [0...100] [+x|-x]</code> &nbsp;&nbsp;-&nbsp;&nbsp; set the TTS volume level in percentage or change volume by ±x from current level</li>
-         <li><code><b>ttsDLNAServer</b> "DLNA Server"</code> &nbsp;&nbsp;-&nbsp;&nbsp;  set DLNA TTS server, only needed if the DLNA server is not the FHEM server, a DLNA server running on the same server as FHEM is automatically added to the BOSE library</li>            
-         <li><code><b>ttsDirectory</b> "directory"</code> &nbsp;&nbsp;-&nbsp;&nbsp; set DLNA TTS directory. FHEM user needs permissions to write to that directory. </li>  
-         <li><code><b>ttsLanguage </b> en|de|xx</code> &nbsp;&nbsp;-&nbsp;&nbsp; set default TTS language (default: en)</li> 
-         <li><code><b>ttsSpeakOnError</b> 0|1</code> &nbsp;&nbsp;-&nbsp;&nbsp; 0=disable to speak "not available" text</li> 
+         <li><code><b>ttsDLNAServer</b> "DLNA Server"</code> &nbsp;&nbsp;-&nbsp;&nbsp;  set DLNA TTS server, only needed if the DLNA server is not the FHEM server, a DLNA server running on the same server as FHEM is automatically added to the BOSE library</li>
+         <li><code><b>ttsDirectory</b> "directory"</code> &nbsp;&nbsp;-&nbsp;&nbsp; set DLNA TTS directory. FHEM user needs permissions to write to that directory. </li>
+         <li><code><b>ttsLanguage </b> en|de|xx</code> &nbsp;&nbsp;-&nbsp;&nbsp; set default TTS language (default: en)</li>
+         <li><code><b>ttsSpeakOnError</b> 0|1</code> &nbsp;&nbsp;-&nbsp;&nbsp; 0=disable to speak "not available" text</li>
          <li><code><b>autoAddDLNAServers</b> 0|1</code> &nbsp;&nbsp;-&nbsp;&nbsp; 1=automatically add all DLNA servers to BOSE library. This command is only for "main" BOSEST, not for devices/speakers!</li> <br>
         </ul><br> Example: <code>set BOSE_1234567890AB speakOff "Music is going to switch off now. Good night." 30 en</code>&nbsp;&nbsp;Speaks message at volume 30 and then switches off device.<br><br> <br>
       </ul><br>
@@ -2181,7 +2310,7 @@ sub BOSEST_XMLUpdate($$$) {
 
   </ul>
   
-</ul> 
+</ul>
 </ul>
 
 =end html
